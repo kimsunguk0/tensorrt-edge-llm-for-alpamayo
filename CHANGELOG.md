@@ -1,4 +1,16 @@
 # Release Notes
+
+## 0.5.0
+- Implemented and used standalone embedding processing module to reduce multi-modal modeling complexity and reduce Eagle inference memory footprint
+- Added FP8 KV Cache support
+- Unified TensorRT execution context for prefill and decode to reduce memory footprint
+- Supported vanilla decoding for speculative decoding runtime
+- Used collision resistant hashing for CUDA graphs
+- Updated int4GroupwiseGemmPlugin to TensorRT Plugin-v3 interface
+- Refactored documentations
+- Added ViT attention mask and RoPE parameter caching to reduce recomputation for Qwen
+- Added Jetpack 6.2 compatibility 
+
 ## 0.4.0
 - Refactored AttentionPlugin to use Tensor class and clearer shape checks
 - Added support for multi-batch EAGLE3

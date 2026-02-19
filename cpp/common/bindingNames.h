@@ -37,11 +37,11 @@ namespace binding_names
  */
 
 /*!
- * @brief Input token IDs tensor - contains the tokenized input sequence
+ * @brief Input embeddings tensor - contains the embedded input sequence
  *
- * Shape: [batch_size, sequence_length] (INT32)
+ * Shape: [batch_size, sequence_length, hidden_size] (FLOAT16)
  */
-inline constexpr char const* kInputIds = "input_ids";
+inline constexpr char const* kInputsEmbeds = "inputs_embeds";
 
 /*!
  * @brief Context lengths tensor - specifies the actual length of each sequence in the batch
@@ -100,7 +100,7 @@ inline constexpr char const* kKVCacheStartIndex = "kvcache_start_index";
 /*!
  * @brief Past key-value cache tensor template - use with layer index formatting
  *
- * Template: "past_key_values.{layer_idx}"
+ * Template: "past_key_values_{layer_idx}"
  * Shape: [batch_size, 2, num_kv_heads, seq_len, head_dim] (FLOAT16)
  */
 inline constexpr char const* kPastKeyValuesTemplate = "past_key_values";
@@ -108,7 +108,7 @@ inline constexpr char const* kPastKeyValuesTemplate = "past_key_values";
 /*!
  * @brief Present key-value cache tensor template - use with layer index formatting
  *
- * Template: "present_key_values.{layer_idx}"
+ * Template: "present_key_values_{layer_idx}"
  * Shape: [batch_size, 2, num_kv_heads, seq_len, head_dim] (FLOAT16)
  */
 inline constexpr char const* kPresentKeyValuesTemplate = "present_key_values";
@@ -146,19 +146,6 @@ inline constexpr char const* kAttentionMask = "attention_mask";
  * Shape: [batch_size, tree_size] (INT32)
  */
 inline constexpr char const* kAttentionPosId = "attention_pos_id";
-
-/*! @} */
-
-/*! @name Vision-Language Model (VLM) Bindings
- * @{
- */
-
-/*!
- * @brief Multimodal image embeddings tensor
- *
- * Shape: [num_image_tokens, hidden_size] (FLOAT16)
- */
-inline constexpr char const* kImageEmbeds = "image_embeds";
 
 /*! @} */
 
@@ -223,11 +210,19 @@ inline constexpr char const* kFastPosEmbIdx = "fast_pos_embed_idx";
 inline constexpr char const* kFastPosEmbWeight = "fast_pos_embed_weight";
 
 /*!
- * @brief Deepstack features tensor for Qwen3-VL vision model
+ * @brief Deepstack features tensor for Qwen3-VL vision model (visual encoder output)
  *
  * Shape: [num_image_tokens, hidden_size] (FLOAT16)
  */
 inline constexpr char const* kDeepstackFeaturesTemplate = "deepstack_features";
+
+/*!
+ * @brief Deepstack embeddings tensor template for Qwen3-VL text model (LLM input)
+ *
+ * Template: "deepstack_embeds_{layer_idx}" where layer_idx is 0, 1, or 2
+ * Shape: [batch_size, sequence_length, hidden_size] (FLOAT16)
+ */
+inline constexpr char const* kDeepstackEmbedsTemplate = "deepstack_embeds";
 
 /*! @} */
 
@@ -275,7 +270,7 @@ inline constexpr char const* kLoraBPrefix = "lora_B";
  * @brief EDGELLM version
  *
  * Value: "major.minor.patch.build"
- * Example: "0.4.0.0"
+ * Example: "0.5.0.0"
  */
 inline constexpr char const* kEdgellmVersion = "edgellm_version";
 
@@ -290,11 +285,11 @@ inline constexpr char const* kEdgellmVersion = "edgellm_version";
  *
  * @param layerIdx The decoder layer index
  * @param isPast Whether this is past (true) or present (false) key-values
- * @return Formatted binding name like "past_key_values.0" or "present_key_values.0"
+ * @return Formatted binding name like "past_key_values_0" or "present_key_values_0"
  */
 inline std::string formatKVCacheName(int32_t layerIdx, bool isPast = true)
 {
-    return std::string(isPast ? kPastKeyValuesTemplate : kPresentKeyValuesTemplate) + "." + std::to_string(layerIdx);
+    return std::string(isPast ? kPastKeyValuesTemplate : kPresentKeyValuesTemplate) + "_" + std::to_string(layerIdx);
 }
 
 /*!
@@ -324,11 +319,22 @@ inline bool isKVCacheBinding(std::string const& bindingName)
  * @brief Format deepstack features binding name for a specific layer
  *
  * @param layerIdx The layer index
- * @return Formatted binding name like "deepstack_features.0"
+ * @return Formatted binding name like "deepstack_features_0"
  */
 inline std::string formatDeepstackFeaturesName(int32_t layerIdx)
 {
-    return std::string(kDeepstackFeaturesTemplate) + "." + std::to_string(layerIdx);
+    return std::string(kDeepstackFeaturesTemplate) + "_" + std::to_string(layerIdx);
+}
+
+/*!
+ * @brief Format deepstack embeddings binding name for a specific index
+ *
+ * @param embedIdx The embedding index (0, 1, or 2 for Qwen3VL)
+ * @return Formatted binding name like "deepstack_embeds_0"
+ */
+inline std::string formatDeepstackEmbedsName(int32_t embedIdx)
+{
+    return std::string(kDeepstackEmbedsTemplate) + "_" + std::to_string(embedIdx);
 }
 
 /*! @} */

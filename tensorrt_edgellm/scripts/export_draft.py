@@ -18,7 +18,7 @@ with support for EAGLE draft models.
 
 Usage:
     # EAGLE draft model export
-    python export_draft.py --draft_model_dir /path/to/draft_model --base_model_dir /path/to/base_model --output_dir /path/to/output (--use_prompt_tuning)
+    python export_draft.py --draft_model_dir /path/to/draft_model --base_model_dir /path/to/base_model --output_dir /path/to/output
 """
 
 import argparse
@@ -46,9 +46,6 @@ def main() -> None:
                         type=str,
                         required=True,
                         help="Path to save the exported ONNX model")
-    parser.add_argument("--use_prompt_tuning",
-                        action="store_true",
-                        help="Whether to use prompt tuning")
     parser.add_argument(
         "--base_model_dir",
         type=str,
@@ -71,7 +68,6 @@ def main() -> None:
         # Export model(s)
         export_draft_model(draft_model_dir=args.draft_model_dir,
                            output_dir=args.output_dir,
-                           use_prompt_tuning=args.use_prompt_tuning,
                            base_model_dir=args.base_model_dir,
                            device=args.device)
 

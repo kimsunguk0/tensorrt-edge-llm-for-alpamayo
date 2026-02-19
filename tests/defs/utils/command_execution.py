@@ -39,15 +39,6 @@ def execute_build_test(
         env_config: Optional[EnvironmentConfig]) -> Dict[str, Any]:
     """Execute build test for any model type"""
 
-    # Create engine directories
-    llm_engine_dir = config.get_llm_engine_dir()
-    run_command(['mkdir', '-p', llm_engine_dir], remote_config, 30, logger)
-
-    if config.model_type == ModelType.VLM:
-        visual_engine_dir = config.get_visual_engine_dir()
-        run_command(['mkdir', '-p', visual_engine_dir], remote_config, 30,
-                    logger)
-
     # Generate all build commands
     commands = generate_build_commands(config, executable_files)
 
@@ -186,10 +177,13 @@ def execute_inference_test(
     }
 
     try:
+        # Use model-specific reference if available, fallback to generic test case file
+        reference_file = config.get_reference_json_file(
+        ) or config.get_test_case_file()
         # Pass file paths directly to the accuracy checker (runs on host only)
         metrics_result = check_accuracy_with_dataset(
-            config.get_output_json_file(), config.get_test_case_file(),
-            config.test_case, logger)
+            config.get_output_json_file(), reference_file, config.test_case,
+            logger)
 
         # Merge metrics result into final result
         final_result.update(metrics_result)

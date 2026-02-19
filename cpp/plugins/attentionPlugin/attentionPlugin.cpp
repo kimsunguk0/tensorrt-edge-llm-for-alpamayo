@@ -28,6 +28,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -53,6 +54,12 @@ void applyThorSMRenumberWAR(int32_t& smVersion)
     }
 }
 
+// Select KV cache storage datatype based on FP8 enablement
+static inline DataType selectKvCacheDataType(bool enableFp8KVCache)
+{
+    return enableFp8KVCache ? DataType::kFP8 : DataType::kHALF;
+}
+
 // Define the mapping of input and output indices of the AttentionPlugin.
 constexpr int32_t kIN_QKV_IDX{0};
 constexpr int32_t kIN_KV_CACHE_IDX{1};
@@ -67,7 +74,8 @@ constexpr int32_t kOUT_KV_CACHE_IDX{1};
 // Reflect the count of Inputs and Outputs of the AttentionPlugin,
 // these definitions shall be consistent.
 constexpr int32_t kNUM_REQUIRED_INPUTS{5};
-constexpr int32_t kNUM_OPTIONAL_INPUTS{2};
+constexpr int32_t kNUM_TREE_ATTN_OPTIONAL_INPUTS{2};
+constexpr int32_t kNUM_FP8_KVCACHE_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
 
 // Support Tree Attention decoding schema up to 128 tokens in the draft tree per batch.
@@ -121,7 +129,12 @@ AttentionExecutionMode deduceModeTreeAttention(
     int64_t const runtimeSeqLen = qkvInputTensor.getShape()[1];
     int64_t const positionIdLen = attentionPosIdTensor.getShape()[1];
 
-    if (positionIdLen == runtimeSeqLen)
+    if (runtimeSeqLen == 1)
+    {
+        // Also supports single token decoding mode when tree attention is enabled.
+        return AttentionExecutionMode::kVANILLA_DECODING;
+    }
+    else if (positionIdLen == runtimeSeqLen)
     {
         return AttentionExecutionMode::kTREE_DECODING;
     }
@@ -141,19 +154,21 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
-AttentionPlugin::AttentionPlugin(
-    std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t enableTreeAttention)
+AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+    int32_t enableTreeAttention, int32_t enableFp8KVCache)
     : mLayerName(name)
     , mNumQHeads(numQHeads)
     , mNumKVHeads(numKVHeads)
     , mHeadSize(headSize)
     , mEnableTreeAttention(enableTreeAttention)
+    , mEnableFp8KVCache(enableFp8KVCache)
 {
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
     bool canImplementFMHA = ContextFMHARunner::canImplement(mHeadSize, mSMVersion, mDataType);
-    bool canImplementXQA = DecoderXQARunner::canImplement(mNumQHeads, mNumKVHeads, mSMVersion, mDataType);
+    bool canImplementXQA = DecoderXQARunner::canImplement(
+        mNumQHeads, mNumKVHeads, mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache));
 
     if (!canImplementFMHA || !canImplementXQA)
     {
@@ -170,16 +185,18 @@ AttentionPlugin::AttentionPlugin(
     // TODO: Fix me to pass spec-decode support through plugin attributes.
     bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
     ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
-    DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType, useSpecDecode);
+    DecoderXQARunner::loadDecodeXQAKernels(
+        mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode);
 }
 
-AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size_t length)
+AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data, size_t length)
     : mLayerName(name)
 {
     deserializeValue(&data, &length, &mNumQHeads);
     deserializeValue(&data, &length, &mNumKVHeads);
     deserializeValue(&data, &length, &mHeadSize);
     deserializeValue(&data, &length, &mEnableTreeAttention);
+    deserializeValue(&data, &length, &mEnableFp8KVCache);
 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -187,14 +204,16 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
     ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
     // TODO: Fix me too pass spec-deocde support through plugin attributes.
     bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
-    DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType, useSpecDecode);
+    DecoderXQARunner::loadDecodeXQAKernels(
+        mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode);
 }
 
 AttentionPlugin::~AttentionPlugin() {}
 
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention);
+    AttentionPlugin* plugin
+        = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention, mEnableFp8KVCache);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -230,13 +249,17 @@ bool AttentionPlugin::supportsFormatCombination(
 {
     // Support context/generation phase inputs:
     //      GEMM-QKV tensor (linear FP16) with shape [B, S, Hq+Hk+Hv, D]
-    //      KV-cache tensor (linear FP16) with shape [B, 2, Hkv, Smax, D], here Smax is the kvcache capacity
+    //      KV-cache tensor (linear FP16/FP8) with shape [B, 2, Hkv, Smax, D], here Smax is the kvcache capacity
     //      buffer.
     //      Real context length: [B] (a vector of scalars) with type int32_t.
     //      RoPE cos/sin cache: [B or 1, Smax, D] (a tensor of scalars) with type float.
     //            Rope CosSin can be ND vector depending on rope type.
     //      Start index of the KVCache [B, 0~1] (a vector of scalars) with type int32_t.
     //            0 length indicates there is no existing KVCache for inference.
+    //      Optional tree attention mask: [B, S, S] (a tensor of scalars) with type int32_t.
+    //      Optional tree attention position ids: [B, S] (a tensor of scalars) with type int32_t.
+    //      Optional packed FP8 KV-cache dequant scales (K/V quant->orig): [2] (a tensor of scalars) with type float.
+    //            Layout: [k_scale_quant_orig, v_scale_quant_orig].
 
     // Support context/generation phase outputs:
     //      attention result (linear FP16) with shape [B, S, Hq, D]
@@ -256,7 +279,15 @@ bool AttentionPlugin::supportsFormatCombination(
 
     auto checkKVCache = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        status &= tensorDesc.type == DataType::kHALF;
+        // Support FP16 or FP8 storage;
+        if (mEnableFp8KVCache)
+        {
+            status &= (tensorDesc.type == DataType::kFP8);
+        }
+        else
+        {
+            status &= (tensorDesc.type == DataType::kHALF);
+        }
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 5;
         if (status)
@@ -307,6 +338,16 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
+    auto checkKVScale = [](nvinfer1::PluginTensorDesc const& tensorDesc) {
+        bool status{true};
+        status &= tensorDesc.type == DataType::kFLOAT;
+        status &= tensorDesc.format == TensorFormat::kLINEAR;
+        // Packed FP8 KV cache scales: [k_scale_quant_orig, v_scale_quant_orig]
+        status &= tensorDesc.dims.nbDims == 1;
+        status &= tensorDesc.dims.d[0] == 2;
+        return status;
+    };
+
     // Output tensor checks
     auto checkAttentionOutput = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
@@ -322,8 +363,8 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    int32_t const expectedNbInputs
-        = mEnableTreeAttention ? kNUM_REQUIRED_INPUTS + kNUM_OPTIONAL_INPUTS : kNUM_REQUIRED_INPUTS;
+    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
+        + (mEnableFp8KVCache ? kNUM_FP8_KVCACHE_OPTIONAL_INPUTS : 0);
     bool const checkNumIOs = nbInputs == expectedNbInputs && nbOutputs == kNUM_REQUIRED_OUTPUTS;
     if (!checkNumIOs)
     {
@@ -345,9 +386,34 @@ bool AttentionPlugin::supportsFormatCombination(
         case kIN_CONTEXT_LENGTH_IDX: result = checkSequenceLen(inOut[2]); break;
         case kIN_ROPE_COS_SIN_IDX: result = checkPosEncodingCosSin(inOut[3]); break;
         case kIN_KV_CACHE_START_IDX: result = checkKVCacheStartIdx(inOut[4]); break;
-        case kIN_OPTIONAL_ATTN_MASK_IDX: result = checkAttentionMask(inOut[5]); break;
-        case kIN_OPTIONAL_ATTN_POS_ID_IDX: result = checkAttentionPosId(inOut[6]); break;
         default: break;
+        }
+
+        // Handle optional inputs (tree attention mask/pos and FP8 scales) with dynamic ordering
+        if (result && pos > kIN_KV_CACHE_START_IDX)
+        {
+            int32_t currentOptionalInputIdx = kIN_KV_CACHE_START_IDX + 1;
+            if (mEnableTreeAttention)
+            {
+                if (pos == currentOptionalInputIdx)
+                {
+                    result = checkAttentionMask(inOut[pos]);
+                }
+                currentOptionalInputIdx++;
+                if (pos == currentOptionalInputIdx)
+                {
+                    result = checkAttentionPosId(inOut[pos]);
+                }
+                currentOptionalInputIdx++;
+            }
+            if (mEnableFp8KVCache)
+            {
+                if (pos == currentOptionalInputIdx)
+                {
+                    result = checkKVScale(inOut[pos]);
+                }
+                currentOptionalInputIdx++;
+            }
         }
     }
     else
@@ -368,7 +434,8 @@ bool AttentionPlugin::supportsFormatCombination(
 DataType AttentionPlugin::getOutputDataType([[maybe_unused]] int32_t index,
     [[maybe_unused]] nvinfer1::DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
-    return DataType::kHALF;
+    // Output[0] (attention) follows QKV input dtype (HALF). Output[1] (KV cache) follows KV input dtype (HALF or FP8)
+    return inputTypes[index];
 }
 
 DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs,
@@ -422,8 +489,6 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     PluginTensorDesc const& kvCacheDesc = inputs[kIN_KV_CACHE_IDX];
     int64_t const maxKVCacheCapacity = kvCacheDesc.dims.d[3];
 
-    // We use half precisions for now.
-    int32_t const nbBytesPerData{2};
     size_t workspaceSize = 0;
 
     // CuQSeqLens for FMHA.
@@ -526,9 +591,37 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         return 1;
     }
 
+    // Optional packed FP8 KV cache scales: [k_scale_quant_orig, v_scale_quant_orig]
+    // When FP8 KV cache is disabled, this tensor stays empty and downstream kernels ignore it.
+    rt::Tensor kvScaleQuantOrigTensor{};
+    if (mEnableFp8KVCache)
+    {
+        // Optional inputs begin after kIN_KV_CACHE_START_IDX; tree attention contributes two inputs if enabled.
+        int32_t const kvScaleQuantOrigInputIdx
+            = kIN_KV_CACHE_START_IDX + 1 + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0);
+        PluginTensorDesc const& kvScaleQuantOrigDesc = inputDesc[kvScaleQuantOrigInputIdx];
+        kvScaleQuantOrigTensor = rt::Tensor(const_cast<void*>(inputs[kvScaleQuantOrigInputIdx]),
+            rt::Coords{kvScaleQuantOrigDesc.dims}, rt::DeviceType::kGPU, kvScaleQuantOrigDesc.type);
+        // Runtime validation (in addition to supportsFormatCombination)
+        check::check(
+            kvScaleQuantOrigTensor.getDataType() == nvinfer1::DataType::kFLOAT, "kvScaleQuantOrig must be FP32.");
+        check::check(kvScaleQuantOrigTensor.getShape().getNumDims() == 1 && kvScaleQuantOrigTensor.getShape()[0] == 2,
+            "kvScaleQuantOrig shall have shape [2] with layout [kScaleQuantOrig, vScaleQuantOrig].");
+    }
+
     // Align the workspace pointer so that each tensor assigned from the workspace will align to the device alignment
     // granularity.
-    void* alignedWorkspacePtr = alignDevicePtr(workspace);
+    auto const nbInputs = kNUM_REQUIRED_INPUTS + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
+        + (mEnableFp8KVCache ? kNUM_FP8_KVCACHE_OPTIONAL_INPUTS : 0);
+    auto const nbOutputs = kNUM_REQUIRED_OUTPUTS;
+    size_t space = getWorkspaceSize(inputDesc, nbInputs, outputDesc, nbOutputs);
+    std::byte* alignedWorkspacePtr
+        = static_cast<std::byte*>(std::align(kDEVICE_ALIGNMENT, space - kDEVICE_ALIGNMENT, workspace, space));
+    if (alignedWorkspacePtr == nullptr)
+    {
+        LOG_ERROR("Workspace size is too small to hold all data structures with correct alignment");
+        return 1;
+    }
 
     if (executionMode == AttentionExecutionMode::kNORMAL_PREFILL
         || executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
@@ -562,13 +655,14 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             rt::Tensor qOutTensor = assignTensorFromWorkspace(
                 alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
             // q: [b, s, hq+hk+hv, d] -> [b, s, hq, d]
-            kernel::launchApplyRopeWriteKVContinuousQAndKVCache(
-                ropeCosSinTensor, kvCacheEndIdxsTensor, qkvInputTensor, kvCacheTensor, qOutTensor, stream);
+            kernel::launchApplyRopeWriteKVContinuousQAndKVCache(ropeCosSinTensor, kvCacheEndIdxsTensor, qkvInputTensor,
+                kvCacheTensor, qOutTensor, kvScaleQuantOrigTensor, stream);
 
+            // FMHA kernel with CONTIGUOUS_Q_KV input layout currently only supports FP16 KV cache.
             rt::Tensor transposedKVTensor = assignTensorFromWorkspace(
                 alignedWorkspacePtr, {runtimeBatchSize, kvCacheCapacity, 2, mNumKVHeads, mHeadSize}, DataType::kHALF);
             // kvCache: [b, 2, hkv, s, d] -> [b, s, 2, hkv, d]
-            kernel::cvtKVLayoutBHSDToBSHD(kvCacheTensor, transposedKVTensor, stream);
+            kernel::cvtKVLayoutBHSDToBSHD(kvCacheTensor, transposedKVTensor, kvScaleQuantOrigTensor, stream);
 
             // Set device ptr for FMHA kernel.
             params.s_kv = kvCacheCapacity;
@@ -579,7 +673,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         }
         else
         { // PACKED_QKV
-            kernel::launchApplyRopeWriteKVPackedQKV(ropeCosSinTensor, qkvInputTensor, kvCacheTensor, stream);
+            kernel::launchApplyRopeWriteKVPackedQKV(
+                ropeCosSinTensor, qkvInputTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream);
 
             params.qkv_ptr = qkvInputTensor.dataPointer<half>();
             params.cu_kv_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
@@ -596,19 +691,27 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         if (executionMode == AttentionExecutionMode::kTREE_DECODING)
         {
             kernel::launchApplyRopeWriteKVTreeDecoding(ropeCosSinTensor, contextLengthTensor, attentionPosIdTensor,
-                qkvInputTensor, kvCacheTensor, qOutTensor, stream);
+                qkvInputTensor, kvCacheTensor, qOutTensor, kvScaleQuantOrigTensor, stream);
         }
         else
         {
-            kernel::launchApplyRopeWriteKVContinuousQAndKVCache(
-                ropeCosSinTensor, contextLengthTensor, qkvInputTensor, kvCacheTensor, qOutTensor, stream);
+            kernel::launchApplyRopeWriteKVContinuousQAndKVCache(ropeCosSinTensor, contextLengthTensor, qkvInputTensor,
+                kvCacheTensor, qOutTensor, kvScaleQuantOrigTensor, stream);
         }
         // Prepare Decoding attention runner parameter to dispatch kernel
-        auto xqaRunner = DecoderXQARunner(mDataType, runtimeBatchSize, mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion);
+        auto xqaRunner = DecoderXQARunner(mDataType, selectKvCacheDataType(mEnableFp8KVCache), runtimeBatchSize,
+            mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion);
         XQALaunchParams params = xqaRunner.initXQAParams();
+        float const* const kvScales = mEnableFp8KVCache ? kvScaleQuantOrigTensor.dataPointer<float>() : nullptr;
+        if (mEnableFp8KVCache)
+        {
+            float const* const kvScales = kvScaleQuantOrigTensor.dataPointer<float>();
+            params.kScale = (kvScales + 0);
+            params.vScale = (kvScales + 1);
+        }
         params.output = attentionOutputTensor.dataPointer<half>();
         params.qInputPtr = qOutTensor.dataPointer<half>();
-        params.kvCache.data = kvCacheTensor.dataPointer<half>();
+        params.kvCache.data = kvCacheTensor.rawPointer();
         params.kvCache.sequence_lengths = contextLengthTensor.dataPointer<int32_t>();
         params.kvCache.capacity = kvCacheCapacity;
         if (executionMode == AttentionExecutionMode::kTREE_DECODING)
@@ -629,15 +732,18 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
 size_t AttentionPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mNumQHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mEnableTreeAttention);
+    return sizeof(mNumQHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mEnableTreeAttention)
+        + sizeof(mEnableFp8KVCache);
 }
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
 {
-    serializeValue(&buffer, mNumQHeads);
-    serializeValue(&buffer, mNumKVHeads);
-    serializeValue(&buffer, mHeadSize);
-    serializeValue(&buffer, mEnableTreeAttention);
+    std::byte* byteBuffer = static_cast<std::byte*>(buffer);
+    serializeValue(&byteBuffer, mNumQHeads);
+    serializeValue(&byteBuffer, mNumKVHeads);
+    serializeValue(&byteBuffer, mHeadSize);
+    serializeValue(&byteBuffer, mEnableTreeAttention);
+    serializeValue(&byteBuffer, mEnableFp8KVCache);
 }
 
 int32_t AttentionPlugin::initialize() noexcept
@@ -662,6 +768,7 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("enable_tree_attention", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("enable_fp8_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
 }
@@ -700,6 +807,9 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
         std::optional<int32_t> numKVHeads = parsePluginScalarField<int32_t>("num_kv_heads", fc);
         std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
         std::optional<int32_t> enableTreeAttention = parsePluginScalarField<int32_t>("enable_tree_attention", fc);
+        // Make enable_fp8_kv_cache optional with default value 0 (disable by default)
+        std::optional<int32_t> enableFp8KVCache = parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc);
+        int32_t enableFp8KVCacheValue = enableFp8KVCache.value_or(0);
 
         // Enforce Core parameters are specified.
         bool checkRequiredFields = numQHeads.has_value() && headSize.has_value() && numKVHeads.has_value()
@@ -710,8 +820,8 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
             return nullptr;
         }
 
-        AttentionPlugin* plugin = new AttentionPlugin(
-            std::string(name), numQHeads.value(), numKVHeads.value(), headSize.value(), enableTreeAttention.value());
+        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(),
+            headSize.value(), enableTreeAttention.value(), enableFp8KVCacheValue);
 
         return plugin;
     }
@@ -727,7 +837,7 @@ nvinfer1::IPluginV2* AttentionPluginCreator::deserializePlugin(
 {
     try
     {
-        return new AttentionPlugin(name, serialData, serialLength);
+        return new AttentionPlugin(name, static_cast<std::byte const*>(serialData), serialLength);
     }
     catch (std::exception const& e)
     {

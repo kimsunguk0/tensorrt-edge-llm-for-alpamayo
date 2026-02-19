@@ -265,6 +265,7 @@ def pytest_addoption(parser):
     """Add custom command line options"""
     parser.addoption("--priority",
                      action="store",
+                     default=None,
                      help="Test priority level (l0, l1, etc.)")
     parser.addoption("--execution-mode",
                      action="store",
@@ -310,6 +311,8 @@ _test_config_cache = {}
 
 def _get_test_list_file(priority):
     """Get test configuration with caching"""
+    if priority is None:
+        return None
     if priority not in _test_config_cache:
         if priority.endswith(('.yml', '.yaml')):
             config_file = priority
@@ -371,4 +374,19 @@ def pytest_collection_modifyitems(config, items):
             test_name = test_case.split('::')[-1]
             configured_tests.add(test_name)
 
-    items[:] = [item for item in items if item.name in configured_tests]
+    def matches_configured_test(item_name, configured_tests):
+        """Check if item name matches any configured test, handling parameterized tests"""
+        # Check exact match first
+        if item_name in configured_tests:
+            return True
+        # For parameterized tests, check if base name (without [param]) matches
+        if '[' in item_name:
+            base_name = item_name.split('[')[0]
+            if base_name in configured_tests:
+                return True
+        return False
+
+    items[:] = [
+        item for item in items
+        if matches_configured_test(item.name, configured_tests)
+    ]

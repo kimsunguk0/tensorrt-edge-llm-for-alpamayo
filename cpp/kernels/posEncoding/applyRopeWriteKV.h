@@ -36,8 +36,8 @@ namespace kernel
 //! @param[out] kvCache FP16 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim], write KVCache
 //! from the start positions.
 //! @param[in] stream CUDA stream to launch the kernel
-void launchApplyRopeWriteKVPackedQKV(
-    rt::Tensor const& cosSinCache, rt::Tensor& qkv, rt::Tensor& kvCache, cudaStream_t stream);
+void launchApplyRopeWriteKVPackedQKV(rt::Tensor const& cosSinCache, rt::Tensor& qkv, rt::Tensor& kvCache,
+    rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
 
 //! @brief Launch the kernel to handle case where KVCache is not empty. We will write to a dedicated Q tensor and
 //! KVCache.
@@ -50,7 +50,7 @@ void launchApplyRopeWriteKVPackedQKV(
 //! @param[in] stream CUDA stream to launch the kernel
 //! @note We won't overwrite QKV tensor in this case but we use Tensor& signature to reduce duplicate code.
 void launchApplyRopeWriteKVContinuousQAndKVCache(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
-    rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, cudaStream_t stream);
+    rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
 
 //! @brief Launch the kernel when we are performing tree attention for speculative decoding.
 //! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
@@ -64,7 +64,8 @@ void launchApplyRopeWriteKVContinuousQAndKVCache(rt::Tensor const& cosSinCache, 
 //! @param[in] stream CUDA stream to launch the kernel
 //! @note We won't overwrite QKV tensor in this case but we use Tensor& signature to reduce duplicate code.
 void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
-    rt::Tensor const& tokenPosIds, rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, cudaStream_t stream);
+    rt::Tensor const& tokenPosIds, rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut,
+    rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

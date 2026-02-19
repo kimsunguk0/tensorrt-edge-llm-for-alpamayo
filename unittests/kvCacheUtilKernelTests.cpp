@@ -36,8 +36,9 @@ struct KVCacheParameters
 void TestKVCacheCopyWithTensor(KVCacheParameters const& cacheParams, int32_t copyBatchIdx, int32_t copySequenceLen)
 {
     cudaStream_t stream{nullptr};
-    rt::LinearKVCache kvCache(rt::LinearKVCache::CacheConfig{cacheParams.numDecoderLayers, cacheParams.maxBatchSize,
-                                  cacheParams.maxSequenceLength, cacheParams.numKVHead, cacheParams.headDim},
+    rt::LinearKVCache kvCache(
+        rt::LinearKVCache::CacheConfig{cacheParams.numDecoderLayers, cacheParams.maxBatchSize,
+            cacheParams.maxSequenceLength, cacheParams.numKVHead, cacheParams.headDim, DataType::kHALF},
         stream);
     rt::Tensor cacheTensor
         = rt::Tensor({cacheParams.numDecoderLayers, 2, cacheParams.numKVHead, copySequenceLen, cacheParams.headDim},

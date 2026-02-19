@@ -78,7 +78,7 @@ public:
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
     //! \brief Encode the system prompt and generate ND-RoPE parameters for the system prompt for KVCache saving.
     //! \param[in] systemPrompt System prompt string
@@ -86,7 +86,7 @@ public:
     //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
-    bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
+    bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
         rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
     //! \brief Run inference on the vision encoder
@@ -103,9 +103,9 @@ public:
     //! \return True if allocation succeeded, false otherwise
     bool allocateBuffer(cudaStream_t stream) override;
 
-    //! \brief Get extra visual features
-    //! \return Optional input tensors vector (e.g. deepstack features for Qwen3-VL)
-    rt::OptionalInputTensors getExtraVisualFeatures() override;
+    //! \brief Get deepstack features for Qwen3-VL
+    //! \return Optional input tensors vector containing deepstack features
+    rt::OptionalInputTensors getDeepstackFeatures() override;
 
 private:
     //! \brief Calculate resized image dimensions based on dynamic resolution constraints
@@ -124,7 +124,7 @@ private:
     //! \param[in] tokenizer Tokenizer for text processing
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
-        trt_edgellm::tokenizer::Tokenizer* tokenizer);
+        trt_edgellm::tokenizer::Tokenizer const* tokenizer);
 
     //! \brief Compute window indices for window attention (Qwen2.5-VL)
     //! \param[in] imageGridTHWs Image grid dimensions (Temporal, Height, Width)
@@ -196,6 +196,8 @@ private:
 
     int32_t mLLMMaxBatchSize{0};      //!< Maximum batch size from LLM engine
     int32_t mLLMMaxSequenceLength{0}; //!< Maximum sequence length from LLM engine
+
+    std::vector<std::vector<int64_t>> mLastImageGridTHWs; //!< Used to determine whether RoPE can be reused.
 };
 
 } // namespace rt

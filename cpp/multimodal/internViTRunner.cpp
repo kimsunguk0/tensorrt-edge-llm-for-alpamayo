@@ -17,6 +17,7 @@
 
 #include "internViTRunner.h"
 #include "common/bindingNames.h"
+#include "common/checkMacros.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
 #include "multimodal/imageUtils.h"
 #include "profiling/metrics.h"
@@ -275,7 +276,7 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
 
 void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int64_t> const& numImages,
-    std::vector<int64_t> const& imageTokenLengths, trt_edgellm::tokenizer::Tokenizer* tokenizer)
+    std::vector<int64_t> const& imageTokenLengths, trt_edgellm::tokenizer::Tokenizer const* tokenizer)
 {
     if (numImages.size() != request.requests.size())
     {
@@ -293,6 +294,7 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     {
         // Use the formatted complete request
         std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
+        check::check(!ids.empty(), "InternViTRunner::textPreprocess() Failed to encode text");
 
         // replace vis tokens
         std::vector<int32_t> newIds;
@@ -324,7 +326,7 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 }
 
 bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
-    std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer* tokenizer,
+    std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
     rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
     std::vector<int64_t> imageTokenLengths;

@@ -1,0 +1,23 @@
+# L0 Python Unit Tests - Low-level component tests
+#
+# These tests verify individual components and kernels at a low level.
+# They require:
+#   - TensorRT >= 10.15 (for OOTB attention tests)
+#   - CUDA-capable GPU
+#   - Built plugin library (for plugin tests)
+
+tests:
+  # OOTB Attention Tests
+  # Tests TensorRT's out-of-the-box attention layers against numpy reference
+  - tests/defs/test_common.py::test_build_project
+  - tests/python-unittests/test_attention_native.py::TestTRTNativeAttentionVsNumpy::test_tensorrt_vs_numpy_prefill
+  - tests/python-unittests/test_attention_native.py::TestTRTNativeAttentionVsNumpy::test_tensorrt_vs_numpy_decode
+  - tests/python-unittests/test_attention_native.py::TestTRTNativeAttentionVsNumpy::test_tensorrt_vs_numpy_tree_attention
+
+  # Plugin Attention Tests
+  # Tests custom attention plugin against numpy reference
+  # Requires: build/libNvInfer_edgellm_plugin.so
+  - tests/python-unittests/test_attention_plugin.py::TestAttentionPluginVsNumpy::test_plugin_vs_numpy_prefill
+  - tests/python-unittests/test_attention_plugin.py::TestAttentionPluginVsNumpy::test_plugin_vs_numpy_decode
+  - tests/python-unittests/test_attention_plugin.py::TestAttentionPluginVsNumpy::test_plugin_vs_numpy_tree_attention
+

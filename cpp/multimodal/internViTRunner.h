@@ -71,7 +71,7 @@ public:
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
     //! \brief Run inference on the vision encoder
     //! \param[in] stream CUDA stream for execution
@@ -96,7 +96,7 @@ private:
     //! \param[in] tokenizer Tokenizer for text processing
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
-        trt_edgellm::tokenizer::Tokenizer* tokenizer);
+        trt_edgellm::tokenizer::Tokenizer const* tokenizer);
 
     //! \brief Format and process a single image patch
     //! \param[in] image Input image data

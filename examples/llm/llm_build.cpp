@@ -42,10 +42,7 @@ enum LLMBuildOptionId : int
     EAGLE_DRAFT = 709,
     EAGLE_BASE = 710,
     MAX_VERIFY_TREE_SIZE = 711,
-    MAX_DRAFT_TREE_SIZE = 712,
-    VLM = 713,
-    MIN_IMAGE_TOKENS = 714,
-    MAX_IMAGE_TOKENS = 715
+    MAX_DRAFT_TREE_SIZE = 712
 };
 
 struct LLMBuildArgs
@@ -62,9 +59,6 @@ struct LLMBuildArgs
     bool eagleBase{false};
     int64_t maxVerifyTreeSize{60};
     int64_t maxDraftTreeSize{60};
-    bool isVlm{false};
-    int64_t minImageTokens{4};
-    int64_t maxImageTokens{1024};
 };
 
 void printUsage(char const* programName)
@@ -73,14 +67,14 @@ void printUsage(char const* programName)
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
                  "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
                  "[--eagleDraft] [--eagleBase] [--maxVerifyTreeSize <int>] "
-                 "[--maxDraftTreeSize <int>] [--vlm] [--minImageTokens <int>] [--maxImageTokens <int>]"
+                 "[--maxDraftTreeSize <int>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
     std::cerr << "  --onnxDir                 Provide the input ONNX directory path. Required. " << std::endl;
     std::cerr << "  --engineDir               Provide the output TensorRT engine directory path. Required. "
               << std::endl;
-    std::cerr << "  --maxInputLen             Provide the maximum input length for the model. Default = 128"
+    std::cerr << "  --maxInputLen             Provide the maximum input length for the model. Default = 1024"
               << std::endl;
     std::cerr << "  --maxKVCacheCapacity      Provide the maximum KV cache capacity (sequence length). "
                  "Default = 4096"
@@ -96,10 +90,8 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --maxDraftTreeSize        Maximum input_ids tokens passed into Eagle draft model for draft "
                  "generation. Default = 60"
+              << std::endl
               << std::endl;
-    std::cerr << "  --vlm                     Enable VLM mode" << std::endl;
-    std::cerr << "  --minImageTokens          Minimum image tokens for VLM. Default = 4" << std::endl;
-    std::cerr << "  --maxImageTokens          Maximum image tokens for VLM. Default = 1024" << std::endl << std::endl;
 }
 
 bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
@@ -115,10 +107,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"eagleDraft", no_argument, 0, LLMBuildOptionId::EAGLE_DRAFT},
         {"eagleBase", no_argument, 0, LLMBuildOptionId::EAGLE_BASE},
         {"maxVerifyTreeSize", required_argument, 0, LLMBuildOptionId::MAX_VERIFY_TREE_SIZE},
-        {"maxDraftTreeSize", required_argument, 0, LLMBuildOptionId::MAX_DRAFT_TREE_SIZE},
-        {"vlm", no_argument, 0, LLMBuildOptionId::VLM},
-        {"minImageTokens", required_argument, 0, LLMBuildOptionId::MIN_IMAGE_TOKENS},
-        {"maxImageTokens", required_argument, 0, LLMBuildOptionId::MAX_IMAGE_TOKENS}, {0, 0, 0, 0}};
+        {"maxDraftTreeSize", required_argument, 0, LLMBuildOptionId::MAX_DRAFT_TREE_SIZE}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", buildOptions, nullptr)) != -1)
@@ -187,19 +176,6 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.maxDraftTreeSize = std::stoi(optarg);
             }
             break;
-        case LLMBuildOptionId::VLM: args.isVlm = true; break;
-        case LLMBuildOptionId::MIN_IMAGE_TOKENS:
-            if (optarg)
-            {
-                args.minImageTokens = std::stoi(optarg);
-            }
-            break;
-        case LLMBuildOptionId::MAX_IMAGE_TOKENS:
-            if (optarg)
-            {
-                args.maxImageTokens = std::stoi(optarg);
-            }
-            break;
         default: LOG_ERROR("Invalid Argument %c is %s.", opt, optarg); return false;
         }
     }
@@ -250,9 +226,6 @@ int main(int argc, char** argv)
     config.eagleBase = args.eagleBase;
     config.maxVerifyTreeSize = args.maxVerifyTreeSize;
     config.maxDraftTreeSize = args.maxDraftTreeSize;
-    config.isVlm = args.isVlm;
-    config.minImageTokens = args.minImageTokens;
-    config.maxImageTokens = args.maxImageTokens;
 
     // Create and run the builder
     builder::LLMBuilder llmBuilder(args.onnxDir, args.engineDir, config);

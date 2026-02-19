@@ -16,6 +16,7 @@
  */
 
 #include "tokenEncoder.h"
+#include "common/inputLimits.h"
 #include "tokenizerUtils.h"
 #include <cassert>
 #include <limits>
@@ -27,8 +28,7 @@ namespace tokenizer
 {
 
 // Size limits for token encoder processing
-constexpr size_t MAX_PIECE_SIZE_BYTES = 1024 * 1024; // 1MB limit
-constexpr size_t LARGE_PIECE_WARNING_BYTES = 65536;  // 64KB warning threshold
+constexpr size_t LARGE_PIECE_WARNING_BYTES = 65536; // 64KB warning threshold
 
 TokenEncoder::TokenEncoder(Type type)
     : mType(type)
@@ -62,7 +62,7 @@ bool TokenEncoder::encode(std::string const& piece, std::vector<Rank>& output) c
         return true;
     }
 
-    if (piece.size() > MAX_PIECE_SIZE_BYTES) // 1MB limit
+    if (piece.size() > limits::tokenizer::kMaxTokenPieceSizeBytes)
     {
         LOG_ERROR("Input text piece too large: %zu bytes", piece.size());
         return false;

@@ -17,7 +17,11 @@
 
 #pragma once
 
-#include <functional>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <tuple>
+#include <unordered_map>
 
 namespace trt_edgellm
 {
@@ -34,10 +38,42 @@ namespace hash_utils
  * @param value Value to hash and combine
  */
 template <typename T>
-inline void hashCombine(size_t& seed, T const& value)
+inline void hashCombine(size_t& seed, T const& value) noexcept
 {
     constexpr size_t kDELTA = 0x9e3779b9;
     seed ^= std::hash<T>()(value) + kDELTA + (seed << 6) + (seed >> 2);
 }
+
+/*!
+ * @brief Hash a tuple by successively applying hashCombine to each element
+ * @tparam Args the tuple element types
+ */
+template <typename T>
+struct Hash
+{
+};
+
+template <typename... Args>
+struct Hash<std::tuple<Args...>>
+{
+    size_t operator()(std::tuple<Args...> const& x) const noexcept
+    {
+        size_t seed = 0x12345678;
+        std::apply([&seed](Args const&... args) { (hashCombine(seed, args), ...); }, x);
+        return seed;
+    }
+};
+
+/*!
+ * @brief Map a collection of keys to a value
+ *
+ * @detail Use a hash table with the hashCombine algorithm for bucket lookup.
+ *         Note that a match requires an equality check for every element of the tuple; hence
+ *         the quality of the hashing function is not crucial for correctness and only affects
+ *         performance.
+ */
+template <typename K, typename V>
+using HashMap = std::unordered_map<K, V, Hash<K>>;
+
 } // namespace hash_utils
 } // namespace trt_edgellm

@@ -1431,8 +1431,8 @@ CUBIN_EXPORT __global__
 #endif
 #endif
         uint32_t const batchSize,
-        float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
-                                                // int8/fp8 KV cache.
+        float const* __restrict__ kCacheScale, // Device memory scalar for K cache. Used only for int8/fp8 KV cache.
+        float const* __restrict__ vCacheScale, // Device memory scalar for V cache. Used only for int8/fp8 KV cache.
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr)
 {
     assert(allowMultiBlockMode || gridDim.x == 1);
@@ -1641,7 +1641,8 @@ CUBIN_EXPORT __global__
     };
     if (warpIdx.z == 0)
     {
-        float const qkScale = qScale * (isKVCacheQuantized ? kvCacheScale[0] : 1.f)
+        float const kScale = (isKVCacheQuantized ? kCacheScale[0] : 1.f);
+        float const qkScale = qScale * kScale
             * rsqrtf(validElemsPerHead); // qkScale is applied onto Q*K.T before softmax.
         CircIdx<nbKBuffers> idxCurrSMemKBuf{nbKBuffers - 1};
         auto const getSMemKTile = [&](uint32_t idx) -> SharedMem::KSmemBuffer& { return smem.k[warpIdx.x][idx]; };
@@ -2382,7 +2383,8 @@ CUBIN_EXPORT __global__
             }
         }
 
-        float voScale = (isKVCacheQuantized ? kvCacheScale[0] : 1.F);
+        float const vScale = (isKVCacheQuantized ? vCacheScale[0] : 1.f);
+        float voScale = vScale;
         if (seqIterInit < nbSeqIters)
         { // otherwise rcpRowSum will be NAN.
             // The attention sinks are moved to the multi-block reduction part if the multi-block is enabled.
@@ -2646,8 +2648,8 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
     BeamSearchParams const beamSearchParams,
 #endif
     uint32_t const batchSize,
-    float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
-                                            // int8/fp8 KV cache.
+    float const* __restrict__ kCacheScale, // Device memory scalar for K cache. Used only for int8/fp8 KV cache.
+    float const* __restrict__ vCacheScale, // Device memory scalar for V cache. Used only for int8/fp8 KV cache.
     uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr)
 {
 #if SPEC_DEC
@@ -2670,7 +2672,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
-        batchSize, kvCacheScale, semaphores, scratch);
+        batchSize, kCacheScale, vCacheScale, semaphores, scratch);
 }
 #else
 static constexpr auto kernel_mha = kernel_mha_impl;
@@ -2710,8 +2712,8 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     BeamSearchParams const& beamSearchParams,
 #endif
     uint32_t batchSize,
-    float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
-                                            // int8/fp8 KV cache.
+    float const* __restrict__ kCacheScale, // Device memory scalar for K cache. Used only for int8/fp8 KV cache.
+    float const* __restrict__ vCacheScale, // Device memory scalar for V cache. Used only for int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
@@ -2791,7 +2793,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
-        batchSize, kvCacheScale, semaphores, scratch);
+        batchSize, kCacheScale, vCacheScale, semaphores, scratch);
 #else
     KVCacheList<false> const cacheList{kvCacheData, seqLen, maxSeqLen};
 #ifndef NDEBUG
@@ -2819,7 +2821,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
-        batchSize, kvCacheScale, semaphores, scratch);
+        batchSize, kCacheScale, vCacheScale, semaphores, scratch);
 #endif
     checkCuda(cudaPeekAtLastError());
 #endif // USE_INPUT_KV

@@ -15,7 +15,7 @@
 """
 Defines the version string for TensorRT Edge-LLM. Update the PATCH number when new features are added.
 
-Format: MAJOR.MINOR.PATCH (e.g., 0.4.0)
+Format: MAJOR.MINOR.PATCH (e.g., 0.5.0)
 """
 
-__version__: str = "0.4.0"
+__version__: str = "0.5.0"

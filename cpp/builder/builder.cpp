@@ -270,7 +270,9 @@ bool LLMBuilder::build()
 
     // Create builder config
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
+#if NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
+#endif
     if (!config)
     {
         LOG_ERROR("Failed to create builder config.");
@@ -327,6 +329,21 @@ bool LLMBuilder::build()
     ofs.close();
     LOG_INFO("Engine saved to %s", engineFilePath.c_str());
 
+    // Detect number of deepstack embeds from network (for Qwen3VL models)
+    mNumDeepstackFeatures = 0;
+    for (int32_t idx = 0; idx < network->getNbInputs(); idx++)
+    {
+        std::string const inputName = network->getInput(idx)->getName();
+        if (inputName.find(binding_names::kDeepstackEmbedsTemplate) != std::string::npos)
+        {
+            mNumDeepstackFeatures++;
+        }
+    }
+    if (mNumDeepstackFeatures > 0)
+    {
+        LOG_INFO("Detected %d deepstack embedding inputs in network (Qwen3VL model)", mNumDeepstackFeatures);
+    }
+
     // Copy files and save builder config
     // Copy config.json with builder config
     if (!copyConfig())
@@ -348,6 +365,12 @@ bool LLMBuilder::build()
 
     // Copy vocabulary mapping files
     if (!copyVocabMappingFiles())
+    {
+        return false;
+    }
+
+    // Copy embedding file for eagleBase and vanilla LLM models
+    if (!copyEmbeddingFile())
     {
         return false;
     }
@@ -428,10 +451,8 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         result &= setupVanillaProfiles(contextProfile, generationProfile);
     }
 
-    if (mBuilderConfig.isVlm)
-    {
-        result &= setupVLMProfiles(contextProfile, generationProfile, network);
-    }
+    // Setup Deepstack profiles for Qwen3VL models
+    result &= setupDeepstackProfiles(contextProfile, generationProfile, network);
 
     if (mBuilderConfig.maxLoraRank > 0)
     {
@@ -492,12 +513,13 @@ bool LLMBuilder::setupVanillaProfiles(
 {
     bool result = true;
 
-    // Input IDs - always dynamic
-    result &= setOptimizationProfile(contextProfile, binding_names::kInputIds, createDims({1, 1}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
-    result &= setOptimizationProfile(generationProfile, binding_names::kInputIds, createDims({1, 1}),
-        createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+    // Input embeddings - always dynamic
+    result &= setOptimizationProfile(contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+    result &= setOptimizationProfile(generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
 
     // Last token IDs
     result &= setOptimizationProfile(contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
@@ -516,12 +538,13 @@ bool LLMBuilder::setupEagleProfiles(
     int const maxTokens
         = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
 
-    // Input IDs
-    result &= setOptimizationProfile(contextProfile, binding_names::kInputIds, createDims({1, 1}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
-    result &= setOptimizationProfile(generationProfile, binding_names::kInputIds, createDims({1, 1}),
-        createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
+    // Input embeddings
+    result &= setOptimizationProfile(contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+    result &= setOptimizationProfile(generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
 
     // Last token IDs - 2D shape [batch_size, num_selected_tokens]
     result &= setOptimizationProfile(contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
@@ -573,56 +596,60 @@ bool LLMBuilder::setupEagleProfiles(
     return result;
 }
 
-bool LLMBuilder::setupVLMProfiles(nvinfer1::IOptimizationProfile* contextProfile,
+bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile* contextProfile,
     nvinfer1::IOptimizationProfile* generationProfile, nvinfer1::INetworkDefinition const* network)
 {
     bool result = true;
 
-    // Find image_embeds input
-    int32_t imageHiddenSize = 0;
+    // Dynamically detect all deepstack_embeds inputs in the network
+    std::vector<std::string> deepstackInputs;
     for (int32_t idx = 0; idx < network->getNbInputs(); idx++)
     {
-        if (strcmp(network->getInput(idx)->getName(), binding_names::kImageEmbeds) == 0)
+        std::string const inputName = network->getInput(idx)->getName();
+        if (inputName.find(binding_names::kDeepstackEmbedsTemplate) != std::string::npos)
         {
-            imageHiddenSize = network->getInput(idx)->getDimensions().d[1];
-            break;
+            deepstackInputs.push_back(inputName);
         }
     }
 
-    if (imageHiddenSize == 0)
+    // If no deepstack embeds found, return early (not a Qwen3VL model)
+    if (deepstackInputs.empty())
     {
-        LOG_ERROR("Please add image_embeds as inputs for VLM.");
-        return false;
+        return true;
     }
 
-    int64_t optImageTokens = (mBuilderConfig.maxImageTokens + mBuilderConfig.minImageTokens) / 2;
+    LOG_INFO("Detected %zu deepstack embedding inputs", deepstackInputs.size());
 
-    result &= setOptimizationProfile(contextProfile, binding_names::kImageEmbeds,
-        createDims({mBuilderConfig.minImageTokens, imageHiddenSize}), createDims({optImageTokens, imageHiddenSize}),
-        createDims({mBuilderConfig.maxImageTokens, imageHiddenSize}));
-    result &= setOptimizationProfile(generationProfile, binding_names::kImageEmbeds, createDims({1, imageHiddenSize}),
-        createDims({1, imageHiddenSize}), createDims({1, imageHiddenSize}));
-
-    if (mModelConfig["model"].get<std::string>() == "qwen3vltext")
+    // Setup profiles for all detected deepstack_embeds inputs
+    // These have the same shape as inputs_embeds: [batch_size, seq_len, hidden_size]
+    for (auto const& deepstackInputName : deepstackInputs)
     {
-        for (int32_t idx = 0; idx < network->getNbInputs(); idx++)
+        LOG_INFO("Setting up optimization profile for %s", deepstackInputName.c_str());
+
+        // Same profile as inputs_embeds
+        result &= setOptimizationProfile(contextProfile, deepstackInputName.c_str(), createDims({1, 1, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+
+        if (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft)
         {
-            std::string const inputName = network->getInput(idx)->getName();
-            if (inputName.find(binding_names::kDeepstackFeaturesTemplate) != std::string::npos)
-            {
-                result &= setOptimizationProfile(contextProfile, inputName.c_str(),
-                    createDims({mBuilderConfig.minImageTokens, imageHiddenSize}),
-                    createDims({optImageTokens, imageHiddenSize}),
-                    createDims({mBuilderConfig.maxImageTokens, imageHiddenSize}));
-                result &= setOptimizationProfile(generationProfile, inputName.c_str(), createDims({1, imageHiddenSize}),
-                    createDims({1, imageHiddenSize}), createDims({1, imageHiddenSize}));
-            }
+            int const maxTokens
+                = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+            result &= setOptimizationProfile(generationProfile, deepstackInputName.c_str(),
+                createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
+                createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
+        }
+        else
+        {
+            result &= setOptimizationProfile(generationProfile, deepstackInputName.c_str(),
+                createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
+                createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
         }
     }
 
     if (!result)
     {
-        LOG_ERROR("Failed to setup optimization profiles at setupVLMProfiles().");
+        LOG_ERROR("Failed to setup optimization profiles at setupDeepstackProfiles().");
     }
 
     return result;
@@ -750,6 +777,9 @@ bool LLMBuilder::copyConfig()
     Json configWithBuilder = mModelConfig;
     configWithBuilder["builder_config"] = mBuilderConfig.toJson();
 
+    // Add detected num_deepstack_features if present (Qwen3VL models)
+    configWithBuilder["num_deepstack_features"] = mNumDeepstackFeatures;
+
     // Write updated config
     std::ofstream targetConfigFile(targetConfigPath);
     if (!targetConfigFile.is_open())
@@ -840,6 +870,32 @@ bool LLMBuilder::copyVocabMappingFiles()
     return true;
 }
 
+bool LLMBuilder::copyEmbeddingFile()
+{
+    // Eagle draft model uses shared embedding table from base model, so skip copying
+    if (mBuilderConfig.eagleDraft)
+    {
+        return true;
+    }
+
+    // Copy embedding.safetensors for eagleBase and vanilla LLM models
+    std::string embeddingPath = mOnnxDir.string() + "/embedding.safetensors";
+    std::string targetEmbeddingPath = mEngineDir.string() + "/embedding.safetensors";
+
+    if (file_io::copyFile(embeddingPath, targetEmbeddingPath))
+    {
+        LOG_INFO("Copied embedding.safetensors to %s", targetEmbeddingPath.c_str());
+    }
+    else
+    {
+        LOG_ERROR(
+            "Failed to copy embedding.safetensors from %s to %s", embeddingPath.c_str(), targetEmbeddingPath.c_str());
+        return false;
+    }
+
+    return true;
+}
+
 // VisualBuilder implementation
 
 VisualBuilder::VisualBuilder(
@@ -899,7 +955,9 @@ bool VisualBuilder::build()
 
     // Create builder config
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
+#if NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
+#endif
     if (!config)
     {
         LOG_ERROR("Failed to create builder config.");

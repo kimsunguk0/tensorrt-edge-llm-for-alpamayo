@@ -36,7 +36,7 @@ from transformers.models.llama.modeling_llama import (LlamaRMSNorm,
                                                       LlamaRotaryEmbedding)
 
 from ..layers.gather_nd import custom_gather_nd
-from ..layers.layers import EdgeLLMDecoderLayer, PromptTuningEmbedding
+from ..layers.layers import EdgeLLMDecoderLayer
 
 
 class Eagle3DraftModel(nn.Module):
@@ -64,20 +64,17 @@ class Eagle3DraftModel(nn.Module):
     def __init__(
         self,
         config: Any,
-        use_prompt_tuning: bool = False,
     ) -> None:
         """
         Initialize the EAGLE3 draft model.
         
         Args:
             config: Model configuration object containing model parameters
-            use_prompt_tuning: Whether to enable prompt tuning support
         """
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.use_prompt_tuning = use_prompt_tuning
         self.draft_vocab_size = getattr(config, "draft_vocab_size",
                                         config.vocab_size)
         self.register_buffer(
@@ -142,53 +139,35 @@ class Eagle3DraftModel(nn.Module):
 
     def forward(
         self,
+        inputs_embeds: torch.Tensor,
         past_key_values: List[torch.FloatTensor],
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         last_token_ids: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
         hidden_states_from_base: torch.Tensor,
         hidden_states_from_draft: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        kvcache_start_index: Optional[torch.Tensor] = None,
-        input_ids: Optional[torch.Tensor] = None,
-        image_embeds: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Forward pass of the EAGLE3 draft model.
         
         Args:
-            past_key_values: Past key-value cache for efficient decoding
-                           List of tensors, each with shape (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
-            rope_rotary_cos_sin: RoPE rotary embeddings, shape (batch_size, seq_len, rotary_dim)
-            context_lengths: Context length tensor indicating current position in cache, shape (batch_size,)
-            last_token_ids: Indices of the last tokens to extract, shape (batch_size,)
-            hidden_states_from_base: Hidden states from the base model, shape (batch_size, seq_len, target_hidden_size * 3)
-            hidden_states_from_draft: Hidden states from previous draft predictions, shape (batch_size, seq_len, hidden_size)
-            position_ids: Position IDs for positional encoding, shape (batch_size, seq_len)
-            attention_mask: Attention mask for the decoder layers, shape (batch_size, seq_len, seq_len + past_len)
-            kvcache_start_index: Start index of KV cache of shape (batch_size), optional
-            input_ids: Input token IDs of shape (batch_size, seq_len), optional (used for standard models and prompt tuning)
-            image_embeds: Image embeddings tensor of shape (image_token_len, hidden_size), optional (used with prompt tuning)
-            inputs_embeds: Input embeddings tensor of shape (batch_size, seq_len, hidden_size), optional (legacy support)
+            inputs_embeds: Input embeddings (batch_size, seq_len, hidden_size)
+            past_key_values: Past KV cache, list of (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
+            rope_rotary_cos_sin: RoPE embeddings (batch_size, seq_len, head_dim)
+            context_lengths: Current position in cache (batch_size,)
+            last_token_ids: Indices of last tokens to extract (batch_size,)
+            kvcache_start_index: Start index of KV cache (batch_size,)
+            hidden_states_from_base: Hidden states from base model (batch_size, seq_len, target_hidden_size * 3)
+            hidden_states_from_draft: Hidden states from draft (batch_size, seq_len, hidden_size)
+            position_ids: Position IDs (batch_size, seq_len)
+            attention_mask: Attention mask (batch_size, seq_len, seq_len + past_len)
             
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, ...]]: (logits, hidden_states, present_key_values)
-                - logits: Predicted token logits, shape (batch_size, num_tokens, draft_vocab_size)
-                - hidden_states: Final hidden states, shape (batch_size, num_tokens, hidden_size)
-                - present_key_values: Updated key-value cache, tuple of tensors
+            (logits, hidden_states, present_key_values)
         """
-
-        # Handle input embeddings
-        if inputs_embeds is None:
-            if self.use_prompt_tuning:
-                # For prompt tuning models, use prompt_tuning_embedding
-                inputs_embeds = PromptTuningEmbedding(self.embed_tokens)(
-                    input_ids, image_embeds)
-            else:
-                # For standard models, use embed_tokens
-                inputs_embeds = self.embed_tokens(input_ids)
 
         # Fuse hidden states and combine with draft hidden states
         hidden_states = self.fc(hidden_states_from_base)
@@ -229,26 +208,20 @@ class Eagle3DraftModel(nn.Module):
 
     def quant_forward(
         self,
-        hidden_states,
-        hidden_states_from_draft,
-        input_ids: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_states_from_draft: torch.Tensor,
     ):
         """
         Forward pass for quantization of the EAGLE3 draft model.
         
         Args:
+            input_ids: Input token IDs of shape (batch_size, seq_len), required
             hidden_states: Concatenated hidden states from three selected layers of the base model of shape (batch_size, seq_len, hidden_size * 3)
             hidden_states_from_draft: Hidden states from previous draft predictions of shape (batch_size, seq_len, hidden_size)
-            input_ids: Input token IDs of shape (batch_size, seq_len), optional
-            inputs_embeds: Input embeddings tensor of shape (batch_size, seq_len, hidden_size), optional (legacy support)
         """
-        assert (input_ids is not None) ^ (inputs_embeds is not None), \
-            "Exactly one of input_ids or input_embeds must be specified."
-
-        # Handle input embeddings
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+        # Get input embeddings from input_ids
+        inputs_embeds = self.embed_tokens(input_ids)
 
         # Fuse hidden states and combine with draft hidden states
         hidden_states = self.fc(hidden_states)
@@ -279,7 +252,6 @@ class Eagle3DraftModel(nn.Module):
         cls,
         draft_model_dir: str,
         base_model_dir: Optional[str] = None,
-        use_prompt_tuning: bool = False,
         device: str = "cuda",
     ) -> "Eagle3DraftModel":
         """
@@ -288,7 +260,6 @@ class Eagle3DraftModel(nn.Module):
         Args:
             draft_model_dir: Path to the draft model directory
             base_model: Base model to copy weights from if needed
-            use_prompt_tuning: Whether to enable prompt tuning support
             device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
 
         Returns:
@@ -299,11 +270,12 @@ class Eagle3DraftModel(nn.Module):
         """
 
         # Load configuration
-        config = AutoConfig.from_pretrained(draft_model_dir)
+        config = AutoConfig.from_pretrained(draft_model_dir,
+                                            trust_remote_code=True)
 
-        if use_prompt_tuning:
-            if hasattr(config, 'text_config'):
-                config = config.text_config
+        # Auto-detect VLM models and extract text config
+        if hasattr(config, 'text_config'):
+            config = config.text_config
 
         pytorch_bin_path = os.path.join(draft_model_dir, "pytorch_model.bin")
         safetensors_path = os.path.join(draft_model_dir, "model.safetensors")
@@ -316,7 +288,7 @@ class Eagle3DraftModel(nn.Module):
             safetensors_path
         ), f"Model file not found at {pytorch_bin_path} or {safetensors_path} or {quantized_model_path}"
 
-        model = cls(config, use_prompt_tuning=use_prompt_tuning)
+        model = cls(config)
 
         if os.path.exists(quantized_model_path):
             # Load quantized model from modelopt

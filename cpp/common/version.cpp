@@ -20,6 +20,7 @@
 #include "logger.h"
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 
 namespace trt_edgellm
 {
@@ -28,7 +29,9 @@ namespace version
 
 namespace
 {
-bool isValidVersionFormat(std::string const& version)
+//! Parse version string into major, minor, patch components
+//! @return true if parsing was successful, false otherwise
+bool parseVersion(std::string const& version, int& major, int& minor, int& patch)
 {
     if (version.empty())
     {
@@ -36,7 +39,6 @@ bool isValidVersionFormat(std::string const& version)
     }
 
     std::stringstream ss(version);
-    int major, minor, patch;
     char dot1, dot2;
 
     // Try to parse: major.minor.patch
@@ -77,10 +79,19 @@ bool checkVersion(std::string const& modelVersion)
         return false;
     }
 
-    if (!isValidVersionFormat(modelVersion))
+    int major, minor, patch;
+    if (!parseVersion(modelVersion, major, minor, patch))
     {
         LOG_ERROR("Invalid model version format: %s. Expected major.minor.patch", modelVersion.c_str());
         return false;
+    }
+
+    // Reject versions <= 0.4.0
+    if (major == 0 && minor <= 4)
+    {
+        throw std::runtime_error("ONNX model version " + modelVersion
+            + " is no longer supported. Minimum supported version is 0.5.0. "
+              "Please re-export your model with the latest tensorrt-edgellm.");
     }
 
     if (modelVersion != std::string(kRUNTIME_VERSION))

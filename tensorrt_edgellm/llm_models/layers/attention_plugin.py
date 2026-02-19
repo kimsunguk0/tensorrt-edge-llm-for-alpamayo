@@ -50,7 +50,7 @@ attention_plugin_schema = OpSchema(
         OpSchema.FormalParameter(
             name="past_key_value",
             description="KV cache tensor",
-            type_str="T",
+            type_str="T_KV",
         ),
         OpSchema.FormalParameter(
             name="context_lengths",
@@ -80,6 +80,13 @@ attention_plugin_schema = OpSchema(
             type_str="tensor(int32)",
             param_option=OpSchema.FormalParameterOption.Optional,
         ),
+        OpSchema.FormalParameter(
+            name="k_v_scale_quant_orig",
+            description=
+            "Packed KV dequant scales for FP8 KV cache. Shape [2] float: [k_scale_quant_orig, v_scale_quant_orig] (optional)",
+            type_str="tensor(float)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
     ],
     outputs=[
         OpSchema.FormalParameter(
@@ -91,14 +98,19 @@ attention_plugin_schema = OpSchema(
             name="present_key_value",
             description=
             "Updated KV cache tensor with dynamic shape [batch_size, 2, num_kv_heads, present_kv_cache_len, head_size]",
-            type_str="T",
+            type_str="T_KV",
         ),
     ],
     type_constraints=[
         (
             "T",
-            ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
-            "Input and output data type.",
+            ["tensor(float16)"],
+            "Input QKV data type.",
+        ),
+        (
+            "T_KV",
+            ["tensor(float16)", "tensor(float8e4m3fn)"],
+            "KV cache data type.",
         ),
     ],
     attributes=[
@@ -123,16 +135,23 @@ attention_plugin_schema = OpSchema(
         OpSchema.Attribute(
             name="enable_tree_attention",
             type=OpSchema.AttrType.INT,
-            description="Whether to enable tree attention (0 or 1)",
+            description="Whether to enable tree attention (0(false), 1(true))",
             required=True,
+        ),
+        OpSchema.Attribute(
+            name="enable_fp8_kv_cache",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether to use FP8 KV cache (0(false), 1(true)). Optional.",
+            required=False,
         ),
     ],
 )
 onnx.defs.register_schema(attention_plugin_schema)
 
 
-@symbolic_helper.parse_args("v", "v", "v", "v", "v", "i", "i", "b", "i", "v",
-                            "v")
+@symbolic_helper.parse_args("v", "v", "v", "v", "v", "i", "i", "b", "i", "b",
+                            "v", "v", "v")
 def symbolic_attention_plugin(
     g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
     qkv: torch._C.Value,
@@ -144,8 +163,10 @@ def symbolic_attention_plugin(
     num_kv_heads: torch._C.Value,
     enable_tree_attention: torch._C.Value,
     head_size: torch._C.Value,
+    enable_fp8_kv_cache: torch._C.Value,
     attention_mask: Optional[torch._C.Value] = None,
     position_ids: Optional[torch._C.Value] = None,
+    k_v_scale_quant_orig: Optional[torch._C.Value] = None,
 ):
     """Custom attention plugin operation for ONNX export."""
 
@@ -162,6 +183,13 @@ def symbolic_attention_plugin(
         inputs.append(attention_mask)
         inputs.append(position_ids)
 
+    # append the scale inputs (they can be constant tensors)
+    if enable_fp8_kv_cache:
+        assert k_v_scale_quant_orig is not None and k_v_scale_quant_orig.type(
+        ).kind(
+        ) != "NoneType", "k_v_scale_quant_orig should be provided for FP8 KV cache"
+        inputs.append(k_v_scale_quant_orig)
+
     qkv_type = qkv.type()
     past_key_value_type = past_key_value.type()
     attn_output, present_key_value = g.op(
@@ -171,6 +199,7 @@ def symbolic_attention_plugin(
         num_kv_heads_i=num_kv_heads,
         head_size_i=head_size,
         enable_tree_attention_i=1 if enable_tree_attention else 0,
+        enable_fp8_kv_cache_i=1 if enable_fp8_kv_cache else 0,
         outputs=2)
 
     qkv_sizes = _get_tensor_sizes(qkv)
@@ -196,8 +225,10 @@ def attention_plugin(
     num_kv_heads: int,
     enable_tree_attention: bool,
     head_size: int,
+    enable_fp8_kv_cache: bool,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
+    k_v_scale_quant_orig: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Dummy TensorRT operation for attention computation, this is not used in the actual inference.
@@ -216,8 +247,11 @@ def attention_plugin(
         num_kv_heads: Number of key-value heads
         enable_tree_attention: Whether to enable tree attention
         head_size: Size of each attention head
+        enable_fp8_kv_cache: Whether to use FP8 KV cache
         attention_mask: Attention mask of shape (batch_size, seq_len, seq_len + past_len), optional
         position_ids: Position IDs tensor of shape (batch_size, seq_len), optional
+        k_v_scale_quant_orig: Packed KV dequant scales for FP8 KV cache, shape (2), optional.
+            Layout: [k_scale_quant_orig, v_scale_quant_orig]
         
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Attention output tensor and updated KV cache
@@ -230,6 +264,10 @@ def attention_plugin(
     if enable_tree_attention:
         assert attention_mask is not None, "attention_mask should be provided for tree attention"
         assert position_ids is not None, "position_ids should be provided for tree attention"
+    if enable_fp8_kv_cache:
+        assert k_v_scale_quant_orig is not None, "k_v_scale_quant_orig should be provided for FP8 KV cache"
+        assert k_v_scale_quant_orig.numel(
+        ) == 2, "k_v_scale_quant_orig must have 2 elements: [k_scale_quant_orig, v_scale_quant_orig]"
 
     batch_size, seq_len, qkv_size = qkv.shape
     assert head_size * (
@@ -245,7 +283,7 @@ def attention_plugin(
         4] == head_size, f"head_size of kv_cache {past_key_value.shape[4]} should be equal to head_size of qkv {head_size}"
 
     assert qkv.dtype == torch.float16, f"qkv {qkv.dtype} should be in float16"
-    assert past_key_value.dtype == torch.float16, f"past_key_value {past_key_value.dtype} should be in float16"
+    assert past_key_value.dtype == torch.float16 or past_key_value.dtype == torch.float8_e4m3fn, f"past_key_value {past_key_value.dtype} should be in float16, float8_e4m3fn"
 
     # Dummy implementation for ONNX export, this is not used in the actual inference
     attn_output = torch.zeros(batch_size,

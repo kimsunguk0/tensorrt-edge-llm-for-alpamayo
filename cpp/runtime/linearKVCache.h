@@ -20,7 +20,6 @@
 #include <common/tensor.h>
 #include <cstdint>
 #include <cuda_fp16.h>
-
 namespace trt_edgellm
 {
 namespace rt
@@ -43,16 +42,14 @@ public:
      */
     struct CacheConfig
     {
-        int64_t numDecoderLayers{};  //!< Number of decoder layers
-        int64_t maxBatchSize{};      //!< Maximum batch size
-        int64_t maxSequenceLength{}; //!< Maximum sequence length
-        int64_t numKVHeads{};        //!< Number of key-value heads
-        int64_t headDim{};           //!< Head dimension
+        int64_t numDecoderLayers{};          //!< Number of decoder layers
+        int64_t maxBatchSize{};              //!< Maximum batch size
+        int64_t maxSequenceLength{};         //!< Maximum sequence length
+        int64_t numKVHeads{};                //!< Number of key-value heads
+        int64_t headDim{};                   //!< Head dimension
+        nvinfer1::DataType kvCacheTypeTRT{}; //!< Storage dtype for KV cache (kHALF or kFP8)
     };
     //! \endcond
-
-    using KVCacheType = half; //!< KV cache data type (half precision)
-    static constexpr nvinfer1::DataType KVCacheTypeTRT{nvinfer1::DataType::kHALF}; //!< TensorRT data type
 
     //! @brief Default constructor
     LinearKVCache() = default;
@@ -128,11 +125,11 @@ public:
     void setActiveBatchSize(int32_t newActiveBatchSize);
 
 private:
-    CacheConfig mConfig{};                //!< Cache configuration
-    int32_t mActiveBatchSize{};           //!< Active batch size
-    bool mKVCacheAllEmpty{};              //!< Flag to indicate if KVCache for all sequences are empty.
-    rt::Tensor mDeviceKVCacheLengths{};   //!< KV cache lengths on device
-    KVCacheType* mDeviceKVCache{nullptr}; //!< KV cache memory buffer
+    CacheConfig mConfig{};              //!< Cache configuration
+    int32_t mActiveBatchSize{};         //!< Active batch size
+    bool mKVCacheAllEmpty{};            //!< Flag to indicate if KVCache for all sequences are empty.
+    rt::Tensor mDeviceKVCacheLengths{}; //!< KV cache lengths on device
+    rt::Tensor mDeviceKVCache{};        //!< KV cache memory buffer on device
 };
 
 } // namespace rt

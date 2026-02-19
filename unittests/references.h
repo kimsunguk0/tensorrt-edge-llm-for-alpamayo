@@ -23,9 +23,11 @@
 #include <set>
 #include <vector>
 
-std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<half> const& k, std::vector<half> const& v,
+template <typename T>
+std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> const& k, std::vector<T> const& v,
     int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    std::optional<std::vector<int32_t>> const& treeAttnMask = std::nullopt);
+    std::optional<std::vector<int32_t>> const& treeAttnMask = std::nullopt, float const kScaleQuantOrig = 1.0f,
+    float const vScaleQuantOrig = 1.0f);
 
 std::vector<half> ropeRef(std::vector<half> const& input, int32_t const numHeads, int32_t const headSize,
     int32_t const rotaryDim, int32_t const seqIdx, float const ropeScale, float const ropeTheta, bool const permute);
@@ -61,6 +63,15 @@ void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<in
 std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::vector<half> const& embeddingTable,
     int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
     std::optional<std::vector<half>> const& imageEmbeds = std::nullopt, int64_t imageTokenLen = 0);
+
+std::vector<half> embeddingLookupMultimodalRef(std::vector<int32_t> const& inputIds,
+    std::vector<half> const& embeddingTable, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
+    std::vector<int32_t> const& multimodalIndices, int32_t imageTokenId, std::vector<half> const& imageEmbeds,
+    int64_t imageTokenLen, int32_t audioTokenId, std::vector<half> const& audioEmbeds, int64_t audioTokenLen);
+
+std::vector<half> assembleDeepstackEmbeddingRef(std::vector<int32_t> const& inputIds,
+    std::vector<half> const& deepstackFeatures, int64_t batchSize, int64_t seqLen, int32_t vocabSize,
+    int64_t hiddenSize, int64_t numImageTokens);
 
 // Eagle reference functions
 void assembleDraftTreeDescReference(std::vector<int8_t> const& draftTreeMask,

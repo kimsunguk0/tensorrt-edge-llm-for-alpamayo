@@ -150,9 +150,8 @@ def quantize_draft_model(
             hidden_states = torch.cat(
                 [hidden_states_0, hidden_states_1, hidden_states_2], dim=-1)
             hidden_states_from_draft = torch.zeros_like(hidden_states_0)
-            draft_model.quant_forward(hidden_states,
-                                      hidden_states_from_draft,
-                                      input_ids=data)
+            draft_model.quant_forward(data, hidden_states,
+                                      hidden_states_from_draft)
 
     # Get quantization config and perform quantization
     mtq.quantize(draft_model, quant_config, forward_loop=calibrate_loop)

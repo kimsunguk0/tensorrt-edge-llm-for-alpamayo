@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
 project(
   tensorrt_edgellm_sdk
-  VERSION 0.4.0
+  VERSION 0.5.0
   LANGUAGES CXX CUDA)
 
 # Specify the C++ standard and flags
@@ -81,6 +81,32 @@ set(CUDA_INCLUDE_DIR ${CUDA_RUNTIME_API_INCLUDE_DIR}
 
 set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
 
+# NVTX profiling support option (default: OFF)
+option(ENABLE_NVTX_PROFILING "Enable NVTX profiling support" OFF)
+
+if(ENABLE_NVTX_PROFILING)
+  # Use bundled NVTX3 headers (v3.4.0-c-cpp) for consistency across all
+  # platforms This ensures profiling support works on all targets
+  # (GPU/Thor/Orin) with CUDA 11/12/13
+  set(NVTX_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/3rdParty/NVTX/include/nvtx3")
+
+  if(EXISTS "${NVTX_INCLUDE_DIR}/nvtx3.hpp")
+    message(STATUS "NVTX profiling ENABLED: ${NVTX_INCLUDE_DIR}")
+    # Define preprocessor macro for conditional compilation
+    add_compile_definitions(ENABLE_NVTX_PROFILING)
+  else()
+    message(
+      FATAL_ERROR
+        "NVTX3 headers not found at ${NVTX_INCLUDE_DIR}. "
+        "Please ensure 3rdParty/NVTX is initialized: git submodule update --init 3rdParty/NVTX"
+    )
+  endif()
+else()
+  message(
+    STATUS "NVTX profiling DISABLED (use -DENABLE_NVTX_PROFILING=ON to enable)")
+  set(NVTX_INCLUDE_DIR "")
+endif()
+
 # Set TensorRT header includes and library dependencies.
 if(NOT DEFINED TRT_PACKAGE_DIR)
   message(
@@ -111,6 +137,7 @@ find_library(
 set(COMMON_INCLUDE_DIRS
     ${CUDA_INCLUDE_DIR}
     ${TRT_INCLUDE_DIR}
+    ${NVTX_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/cpp
     ${CMAKE_SOURCE_DIR}/examples/multimodal
     ${CMAKE_SOURCE_DIR}/3rdParty/nlohmannJson/include

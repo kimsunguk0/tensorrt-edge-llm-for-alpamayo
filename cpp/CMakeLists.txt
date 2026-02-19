@@ -18,8 +18,8 @@ set(CUDA_PTXAS_FLAGS "-warn-lmem-usage -warn-double-usage -warn-spills")
 set(CMAKE_CUDA_FLAGS_RELEASE
     "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo -res-usage --use_fast_math -Xptxas='${CUDA_PTXAS_FLAGS}'"
 )
-set(CMAKE_CUDA_FLAGS_DEBUG "")
 
+set(CMAKE_CUDA_FLAGS_DEBUG "")
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
@@ -44,6 +44,7 @@ add_library(
   ${RUNTIME_CPP_SRCS}
   ${PROFILER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
+target_link_libraries(edgellmCore PRIVATE dl)
 
 # Generate tokenizer C++ static library
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
@@ -55,7 +56,7 @@ file(GLOB_RECURSE BUILDER_CPP_SRCS "builder/*.cpp")
 add_library(edgellmBuilder STATIC ${BUILDER_CPP_SRCS} ${COMMON_CPP_SRCS})
 target_include_directories(edgellmBuilder PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
                                                   ${COMMON_INCLUDE_DIRS})
-target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB})
+target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB} dl)
 
 # Generate the TensorRT plugin shared libraries
 file(GLOB_RECURSE PLUGIN_CPP_SRCS "plugins/*.cpp")

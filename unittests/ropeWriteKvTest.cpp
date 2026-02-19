@@ -24,6 +24,8 @@
 #include "references.h"
 #include "testUtils.h"
 
+#include "common/cudaMacros.h"
+
 using namespace trt_edgellm;
 using namespace trt_edgellm::kernel;
 
@@ -36,7 +38,8 @@ struct AttnParams
 };
 
 void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnParams, int32_t const kvCacheCapacity,
-    int32_t const qSeqLen, float ropeTheta = 10000.0f, int32_t cosSinCacheBatchSize = 1, int32_t cosSinCacheSeqLen = 0)
+    int32_t const qSeqLen, float ropeTheta = 10000.0f, int32_t cosSinCacheBatchSize = 1, int32_t cosSinCacheSeqLen = 0,
+    bool const enableFp8Check = false)
 {
     cudaStream_t stream{nullptr};
 
@@ -127,8 +130,9 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
     rt::Tensor kvCacheTensor(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kHALF);
 
-    // Set qOut, kvCacheStartIds, tokenPosIds to nullptr since they are not used in prefill case.
-    launchApplyRopeWriteKVPackedQKV(cosSinCacheTensor, qkvTensor, kvCacheTensor, stream);
+    // Empty scale tensor (ignored for FP16 KV cache).
+    rt::Tensor kvScaleQuantOrigTensor{};
+    launchApplyRopeWriteKVPackedQKV(cosSinCacheTensor, qkvTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::vector<half> qkvOut(qkvTensor.getShape().volume());
@@ -177,16 +181,108 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
         }
     }
 
-    std::cout << "TestRopeWriteKvPrefill "
+    std::cout << "TestRopeWriteKvPrefill [FP16 KV cache] "
               << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
               << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " KVCacheCapacity: " << kvCacheCapacity
               << " qSeqLen: " << qSeqLen << " cosSinCacheBatchSize: " << cosSinCacheBatchSize
               << " cosSinCacheSeqLen: " << cosSinCacheSeqLen << std::endl;
+
+#if SUPPORTS_FP8
+    if (enableFp8Check)
+    {
+        // Re-create a fresh QKV tensor for the FP8 path so that RoPE is applied starting
+        // from the original (unmodified) QKV input, matching the FP16 reference setup.
+        rt::Tensor qkvTensorForFP8(rt::Coords{batchSize, qSeqLen, numQHeads + numKVHeads * 2, headDim},
+            rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        CUDA_CHECK(cudaMemcpy(
+            qkvTensorForFP8.rawPointer(), qkvInput.data(), qkvInput.size() * sizeof(half), cudaMemcpyHostToDevice));
+
+        // FP8 KV cache path: reuse same QKV input and CosSin cache, compare KV FP8 vs FP16 (after dequant)
+        rt::Tensor kvFp8(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kFP8);
+        // Derive a realistic FP8 scale from the *written* FP16 KV cache region (qSeqLen tokens).
+        // NOTE: KV cache capacity is larger than qSeqLen; elements outside [0, qSeqLen) are not written by the kernel
+        // and may be uninitialized, so we must not include them in amax/accuracy checks.
+        // We map max(|K|) and max(|V|) into FP8 E4M3 finite range (separately).
+        float kAmax = 0.0F;
+        float vAmax = 0.0F;
+        for (int32_t b = 0; b < batchSize; ++b)
+        {
+            for (int32_t j = 0; j < qSeqLen; ++j)
+            {
+                for (int32_t hkv = 0; hkv < static_cast<int32_t>(numKVHeads); ++hkv)
+                {
+                    for (uint32_t d = 0; d < headDim; ++d)
+                    {
+                        float const fk = std::fabs(__half2float(kvCacheOut[kvIndexer.indexK(b, hkv, j, d)]));
+                        float const fv = std::fabs(__half2float(kvCacheOut[kvIndexer.indexV(b, hkv, j, d)]));
+                        kAmax = std::max(kAmax, fk);
+                        vAmax = std::max(vAmax, fv);
+                    }
+                }
+            }
+        }
+        // FP8 E4M3 max finite value
+        constexpr float FP8_E4M3_MAX = 448.0F;
+        assert(kAmax > 0.0F && vAmax > 0.0F);
+        // To avoid large scale value to cause intermittent ref check failure, limit the range of kAmax and vAmax
+        // to be larger than 64.0F.
+        kAmax = std::max(kAmax, 64.0F);
+        vAmax = std::max(vAmax, 64.0F);
+        float const kScaleQuantOrig = kAmax / FP8_E4M3_MAX;
+        float const vScaleQuantOrig = vAmax / FP8_E4M3_MAX;
+        float const kScaleOrigQuant = 1.0F / kScaleQuantOrig;
+        float const vScaleOrigQuant = 1.0F / vScaleQuantOrig;
+
+        rt::Tensor kvScaleQuantOrigTensor(rt::Coords{2}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+        float const hostScales[2] = {kScaleQuantOrig, vScaleQuantOrig};
+        CUDA_CHECK(
+            cudaMemcpy(kvScaleQuantOrigTensor.rawPointer(), hostScales, sizeof(hostScales), cudaMemcpyHostToDevice));
+
+        launchApplyRopeWriteKVPackedQKV(cosSinCacheTensor, qkvTensorForFP8, kvFp8, kvScaleQuantOrigTensor, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        std::vector<__nv_fp8_e4m3> kvOutFp8(kvFp8.getShape().volume());
+        CUDA_CHECK(cudaMemcpy(
+            kvOutFp8.data(), kvFp8.rawPointer(), kvOutFp8.size() * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost));
+
+        for (int32_t b = 0; b < batchSize; ++b)
+        {
+            for (int32_t j = 0; j < qSeqLen; ++j)
+            {
+                for (int32_t hkv = 0; hkv < static_cast<int32_t>(numKVHeads); ++hkv)
+                {
+                    for (uint32_t d = 0; d < headDim; ++d)
+                    {
+                        size_t const kIdx = kvIndexer.indexK(b, hkv, j, d);
+                        size_t const vIdx = kvIndexer.indexV(b, hkv, j, d);
+                        float const kRefFp8QuantizedFp16
+                            = static_cast<float>(__nv_fp8_e4m3(__half2float(kvCacheOut[kIdx]) * kScaleOrigQuant));
+                        float const vRefFp8QuantizedFp16
+                            = static_cast<float>(__nv_fp8_e4m3(__half2float(kvCacheOut[vIdx]) * vScaleOrigQuant));
+                        float const k8 = static_cast<float>(kvOutFp8[kIdx]);
+                        float const v8 = static_cast<float>(kvOutFp8[vIdx]);
+                        ASSERT_TRUE(isclose(k8, kRefFp8QuantizedFp16, 1e-3, 1e-3));
+                        ASSERT_TRUE(isclose(v8, vRefFp8QuantizedFp16, 1e-3, 1e-3));
+                    }
+                }
+            }
+        }
+
+        std::cout << "TestRopeWriteKvPrefill [FP8 KV cache] "
+                  << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
+                  << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " KVCacheCapacity: " << kvCacheCapacity
+                  << " qSeqLen: " << qSeqLen << " cosSinCacheBatchSize: " << cosSinCacheBatchSize
+                  << " cosSinCacheSeqLen: " << cosSinCacheSeqLen << std::endl;
+    }
+#else
+    (void) enableFp8Check;
+#endif
 }
 
 void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams, int32_t const kvCacheCapacity,
     int32_t const qLen, float ropeTheta = 10000.0f, bool const isTreeAttention = false,
-    int32_t cosSinCacheBatchSize = 1)
+    int32_t cosSinCacheBatchSize = 1, bool const enableFp8Check = false)
 {
     // Not tested for MROPE which supply positional encoding coefficients as input tensor.
     EXPECT_TRUE(qLen == 1 || isTreeAttention);
@@ -312,15 +408,17 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     rt::Tensor qOutTensor(
         rt::Coords{batchSize, qLen, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
+    // Empty scale tensor (ignored for FP16 KV cache).
+    rt::Tensor kvScaleQuantOrigTensor{};
     if (!isTreeAttention)
     {
         launchApplyRopeWriteKVContinuousQAndKVCache(
-            cosSinCacheTensor, seqLensTensor, qkvTensor, kvCacheTensor, qOutTensor, stream);
+            cosSinCacheTensor, seqLensTensor, qkvTensor, kvCacheTensor, qOutTensor, kvScaleQuantOrigTensor, stream);
     }
     else
     {
-        launchApplyRopeWriteKVTreeDecoding(
-            cosSinCacheTensor, seqLensTensor, customSeqLensTensor, qkvTensor, kvCacheTensor, qOutTensor, stream);
+        launchApplyRopeWriteKVTreeDecoding(cosSinCacheTensor, seqLensTensor, customSeqLensTensor, qkvTensor,
+            kvCacheTensor, qOutTensor, kvScaleQuantOrigTensor, stream);
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -362,17 +460,112 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
         }
     }
 
-    std::cout << "TestRopeWriteKvDecode "
+    std::cout << "TestRopeWriteKvDecode [FP16 KV cache] "
               << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
               << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " KVCacheCapacity: " << kvCacheCapacity
               << " QLength: " << qLen << " Total Sequence Lengths (including past KVcache): " << fullSeqLens
               << " RopeScale: " << ropeScale << " RopeTheta: " << ropeTheta
               << " cosSinCacheBatchSize: " << cosSinCacheBatchSize << " cosSinCacheSeqLen: " << cosSinCacheSeqLen
               << std::endl;
+
+#if SUPPORTS_FP8
+    if (enableFp8Check)
+    {
+        // FP8 KV cache path: reuse same QKV input and CosSin cache, compare KV FP8 vs FP16 (after dequant)
+        float kAmax = 0.0F;
+        float vAmax = 0.0F;
+        for (int32_t b = 0; b < batchSize; ++b)
+        {
+            int32_t const qStartIdx = fullSeqLens[b] - qLen;
+            for (int32_t s = 0; s < qLen; ++s)
+            {
+                int32_t const inCacheIdx = qStartIdx + s;
+                for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
+                {
+                    for (uint32_t d = 0; d < headDim; ++d)
+                    {
+                        float const fk = std::fabs(__half2float(kvCacheOut[kvIndexer.indexK(b, hkv, inCacheIdx, d)]));
+                        float const fv = std::fabs(__half2float(kvCacheOut[kvIndexer.indexV(b, hkv, inCacheIdx, d)]));
+                        kAmax = std::max(kAmax, fk);
+                        vAmax = std::max(vAmax, fv);
+                    }
+                }
+            }
+        }
+
+        // FP8 E4M3 max finite value
+        constexpr float FP8_E4M3_MAX = 448.0F;
+        assert(kAmax > 0.0F && vAmax > 0.0F);
+        float const kScaleQuantOrig = kAmax / FP8_E4M3_MAX;
+        float const vScaleQuantOrig = vAmax / FP8_E4M3_MAX;
+        float const kScaleOrigQuant = 1.0F / kScaleQuantOrig;
+        float const vScaleOrigQuant = 1.0F / vScaleQuantOrig;
+
+        rt::Tensor kvScaleQuantOrigTensor(rt::Coords{2}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+        float const hostScales[2] = {kScaleQuantOrig, vScaleQuantOrig};
+        CUDA_CHECK(
+            cudaMemcpy(kvScaleQuantOrigTensor.rawPointer(), hostScales, sizeof(hostScales), cudaMemcpyHostToDevice));
+
+        rt::Tensor kvFp8(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kFP8);
+
+        if (!isTreeAttention)
+        {
+            launchApplyRopeWriteKVContinuousQAndKVCache(
+                cosSinCacheTensor, seqLensTensor, qkvTensor, kvFp8, qOutTensor, kvScaleQuantOrigTensor, stream);
+        }
+        else
+        {
+            launchApplyRopeWriteKVTreeDecoding(cosSinCacheTensor, seqLensTensor, customSeqLensTensor, qkvTensor, kvFp8,
+                qOutTensor, kvScaleQuantOrigTensor, stream);
+        }
+
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        std::vector<__nv_fp8_e4m3> kvOutFp8(kvFp8.getShape().volume());
+        CUDA_CHECK(cudaMemcpy(
+            kvOutFp8.data(), kvFp8.rawPointer(), kvOutFp8.size() * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost));
+
+        for (int32_t b = 0; b < batchSize; ++b)
+        {
+            int32_t const qStartIdx = fullSeqLens[b] - qLen;
+            for (int32_t s = 0; s < qLen; ++s)
+            {
+                int32_t const inCacheIdx = qStartIdx + s;
+                for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
+                {
+                    for (uint32_t d = 0; d < headDim; ++d)
+                    {
+                        size_t const kIdx = kvIndexer.indexK(b, hkv, inCacheIdx, d);
+                        size_t const vIdx = kvIndexer.indexV(b, hkv, inCacheIdx, d);
+                        float const kRefFp8QuantizedFp16
+                            = static_cast<float>(__nv_fp8_e4m3(__half2float(kvCacheOut[kIdx]) * kScaleOrigQuant));
+                        float const vRefFp8QuantizedFp16
+                            = static_cast<float>(__nv_fp8_e4m3(__half2float(kvCacheOut[vIdx]) * vScaleOrigQuant));
+                        float const k8 = static_cast<float>(kvOutFp8[kIdx]);
+                        float const v8 = static_cast<float>(kvOutFp8[vIdx]);
+                        EXPECT_TRUE(isclose(k8, kRefFp8QuantizedFp16, 1e-3, 1e-3));
+                        EXPECT_TRUE(isclose(v8, vRefFp8QuantizedFp16, 1e-3, 1e-3));
+                    }
+                }
+            }
+        }
+
+        std::cout << "TestRopeWriteKvDecode [FP8 KV cache] "
+                  << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
+                  << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " KVCacheCapacity: " << kvCacheCapacity
+                  << " QLength: " << qLen << " Total Sequence Lengths (including past KVcache): " << fullSeqLens
+                  << " RopeScale: " << ropeScale << " RopeTheta: " << ropeTheta
+                  << " cosSinCacheBatchSize: " << cosSinCacheBatchSize << " cosSinCacheSeqLen: " << cosSinCacheSeqLen
+                  << std::endl;
+    }
+#else
+    (void) enableFp8Check;
+#endif
 }
 
-void BenchmarkRopeWriteKv(
-    uint32_t const batchSize, AttnParams const& attnParams, int32_t const qSeqLen, int32_t cosSinCacheBatchSize = 1)
+void BenchmarkRopeWriteKv(uint32_t const batchSize, AttnParams const& attnParams, int32_t const qSeqLen,
+    int32_t cosSinCacheBatchSize = 1, bool const enableFp8Check = false)
 {
     uint32_t const headDim = attnParams.headDim;
     uint32_t const rotaryDim = attnParams.rotaryDim;
@@ -402,8 +595,11 @@ void BenchmarkRopeWriteKv(
     cudaStream_t stream{nullptr};
     int32_t const tokenToProcess = batchSize * qSeqLen;
 
-    auto launchPrefill
-        = [&]() { launchApplyRopeWriteKVPackedQKV(cosSinCacheTensor, qkvTensor, kvCacheTensor, stream); };
+    // Empty scale tensor (ignored for FP16 KV cache).
+    rt::Tensor kvScaleQuantOrigTensor{};
+    auto launchPrefill = [&]() {
+        launchApplyRopeWriteKVPackedQKV(cosSinCacheTensor, qkvTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream);
+    };
 
     constexpr int32_t numWarmup = 10;
     for (int32_t i = 0; i < numWarmup; i++)
@@ -429,7 +625,47 @@ void BenchmarkRopeWriteKv(
     std::cout << "Bench Perf: BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
               << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " qSeqLen: " << qSeqLen
               << " cosSinCacheBatchSize: " << cosSinCacheBatchSize << std::endl;
-    std::cout << "RopeWriteKv(non-interleave) time: " << elapsedTime / numBenchIter << " ms" << std::endl;
+    std::cout << "RopeWriteKv(non-interleave, FP16 KV cache) time: " << elapsedTime / numBenchIter << " ms"
+              << std::endl;
+
+#if SUPPORTS_FP8
+    if (enableFp8Check)
+    {
+        // FP8 KV cache benchmark: reuse same QKV and CosSin cache, but write KV cache in FP8 with a fixed scale of 1.0.
+        rt::Tensor kvCacheTensorFp8(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim},
+            rt::DeviceType::kGPU, nvinfer1::DataType::kFP8);
+        // Use dequant scales = 1.0 (so quantization uses invScale = 1.0 as well).
+        rt::Tensor kvScaleQuantOrigTensor(rt::Coords{2}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+        float const hostScales[2] = {1.0F, 1.0F};
+        CUDA_CHECK(
+            cudaMemcpy(kvScaleQuantOrigTensor.rawPointer(), hostScales, sizeof(hostScales), cudaMemcpyHostToDevice));
+
+        auto launchPrefillFp8 = [&]() {
+            launchApplyRopeWriteKVPackedQKV(
+                cosSinCacheTensor, qkvTensor, kvCacheTensorFp8, kvScaleQuantOrigTensor, stream);
+        };
+
+        for (int32_t i = 0; i < numWarmup; i++)
+        {
+            launchPrefillFp8();
+        }
+
+        cudaEventRecord(start, stream);
+        for (int32_t i = 0; i < numBenchIter; i++)
+        {
+            launchPrefillFp8();
+        }
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+
+        elapsedTime = 0.0f;
+        cudaEventElapsedTime(&elapsedTime, start, stop);
+        std::cout << "RopeWriteKv(non-interleave, FP8 KV cache) time: " << elapsedTime / numBenchIter << " ms"
+                  << std::endl;
+    }
+#else
+    (void) enableFp8Check;
+#endif
 }
 
 TEST(RopeWriteKvPrefill, Accuracy)
@@ -448,6 +684,25 @@ TEST(RopeWriteKvPrefill, Accuracy)
     // cosSinCacheBatchSize = 2, cosSinCacheSeqLen = 8192
     TestRopeWriteKvPrefill(2, {24, 8, 128, 96}, 4096, 512, 10000.0f, 2, 8192);
 }
+
+#if SUPPORTS_FP8
+TEST(RopeWriteKvPrefillFp8KVCache, AccuracyFP8)
+{
+    // QheadNum = 32, kvHeadNum = 8, headSize = 128, rotaryDim = 128, kvCacheCapacity = 2048, qLen = 512
+    TestRopeWriteKvPrefill(1, {32, 8, 128, 128}, 2048, 512, 10000.0f, 1, 0, true);
+    // QheadNum = 24, kvHeadNum = 3, headSize = 128, rotaryDim = 128, kvCacheCapacity = 4096, qLen = 512
+    TestRopeWriteKvPrefill(2, {24, 3, 128, 128}, 4096, 512, 10000.0f, 1, 0, true);
+    // QheadNum = 28, kvHeadNum = 7, headSize = 128, rotaryDim = 128, kvCacheCapacity = 2048, qLen = 512
+    TestRopeWriteKvPrefill(1, {28, 7, 128, 128}, 2048, 512, 10000.0f, 1, 0, true);
+    // QheadNum = 16, kvHeadNum = 4, headSize = 64, rotaryDim = 64, kvCacheCapacity = 2048, qLen = 512
+    TestRopeWriteKvPrefill(4, {16, 4, 64, 64}, 2048, 512, 10000.0f, 1, 0, true);
+    // QheadNum = 24, kvHeadNum = 8, headSize = 128, rotaryDim = 96, kvCacheCapacity = 4096, qLen = 512
+    TestRopeWriteKvPrefill(2, {24, 8, 128, 96}, 4096, 512, 10000.0f, 1, 0, true);
+    // QheadNum = 24, kvHeadNum = 8, headSize = 128, rotaryDim = 96, kvCacheCapacity = 4096, qLen = 512,
+    // cosSinCacheBatchSize = 2, cosSinCacheSeqLen = 8192
+    TestRopeWriteKvPrefill(2, {24, 8, 128, 96}, 4096, 512, 10000.0f, 2, 8192, true);
+}
+#endif
 
 TEST(RopeWriteKvDecodeVanilla, Accuracy)
 {
@@ -493,6 +748,28 @@ TEST(RopeWriteKvDecodeTreeAttention, Accuracy)
     TestRopeWriteKvDecode(2, {24, 8, 128, 96}, 4096, 32, 10000.0f, true, 2);
 }
 
+#if SUPPORTS_FP8
+TEST(RopeWriteKvDecodeVanillaFp8KVCache, AccuracyFP8)
+{
+    // Mirror vanilla decode tests but enable FP8 KV cache verification.
+    TestRopeWriteKvDecode(1, {32, 8, 128, 128}, 2048, 1, 10000.0f, false, 1, true);
+    TestRopeWriteKvDecode(1, {28, 4, 128, 128}, 4096, 1, 500000.0f, false, 1, true);
+    TestRopeWriteKvDecode(1, {16, 2, 64, 64}, 4096, 1, 10000.0f, false, 1, true);
+    TestRopeWriteKvDecode(1, {24, 4, 128, 128}, 4096, 1, 10000.0f, false, 1, true);
+    TestRopeWriteKvDecode(2, {24, 8, 128, 96}, 4096, 1, 10000.0f, false, 2, true);
+}
+
+TEST(RopeWriteKvDecodeTreeAttentionFp8KVCache, AccuracyFP8)
+{
+    // Mirror tree attention decode tests but enable FP8 KV cache verification.
+    TestRopeWriteKvDecode(1, {32, 8, 128, 128}, 2048, 4, 10000.0f, true, 1, true);
+    TestRopeWriteKvDecode(1, {28, 4, 128, 128}, 4096, 32, 500000.0f, true, 1, true);
+    TestRopeWriteKvDecode(1, {24, 6, 64, 64}, 4096, 64, 10000.0f, true, 1, true);
+    TestRopeWriteKvDecode(1, {16, 2, 128, 128}, 4096, 50, 10000.0f, true, 1, true);
+    TestRopeWriteKvDecode(2, {24, 8, 128, 96}, 4096, 32, 10000.0f, true, 2, true);
+}
+#endif
+
 TEST(RopeWriteKvPrefill, Benchmark)
 {
     // QheadNum = 32, kvHeadNum = 8, headSize = 128, rotaryDim = 128, qLen = 1024
@@ -506,3 +783,15 @@ TEST(RopeWriteKvPrefill, Benchmark)
     // QheadNum = 32, kvHeadNum = 8, headSize = 128, rotaryDim = 128, qLen = 512, cosSinCacheBatchSize = 2
     BenchmarkRopeWriteKv(2, {32, 8, 128, 128}, 512, 2);
 }
+
+#if SUPPORTS_FP8
+TEST(RopeWriteKvPrefillFp8KVCache, BenchmarkFp8)
+{
+    // Same benchmark shapes as FP16 benchmark, but FP8 KV-cache path is enabled.
+    BenchmarkRopeWriteKv(1, {32, 8, 128, 128}, 1024, 1, true);
+    BenchmarkRopeWriteKv(2, {24, 3, 128, 128}, 2048, 1, true);
+    BenchmarkRopeWriteKv(1, {28, 7, 128, 128}, 4096, 1, true);
+    BenchmarkRopeWriteKv(4, {16, 4, 64, 64}, 1024, 1, true);
+    BenchmarkRopeWriteKv(2, {32, 8, 128, 128}, 512, 2, true);
+}
+#endif

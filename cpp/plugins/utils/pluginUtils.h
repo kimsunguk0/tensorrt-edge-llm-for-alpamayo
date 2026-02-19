@@ -21,6 +21,7 @@
 
 #include <NvInferRuntime.h>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -32,11 +33,6 @@ namespace plugins
 {
 //! Device memory alignment requirement (128 bytes)
 constexpr int32_t kDEVICE_ALIGNMENT{128};
-
-//! @brief Align device pointer to device alignment.
-//! @param ptr Device pointer that might not be aligned to device alignment.
-//! @return Aligned device pointer
-void* alignDevicePtr(void* ptr);
 
 /*!
  * @brief Convert C++ type to TensorRT PluginFieldType
@@ -106,21 +102,21 @@ struct Serializer<T, typename std::enable_if_t<std::is_arithmetic_v<T> || std::i
     //! @brief Serialize value to buffer
     //! @param buffer Output buffer pointer (advanced after write)
     //! @param value Value to serialize
-    static void serialize(void** buffer, T const& value)
+    static void serialize(std::byte** buffer, T const& value)
     {
         ::memcpy(*buffer, &value, sizeof(T));
-        reinterpret_cast<char*&>(*buffer) += sizeof(T);
+        *buffer += sizeof(T);
     }
 
     //! @brief Deserialize value from buffer
     //! @param buffer Input buffer pointer (advanced after read)
     //! @param buffer_size Buffer size (decremented after read)
     //! @param value Output value
-    static void deserialize(void const** buffer, size_t* buffer_size, T* value)
+    static void deserialize(std::byte const** buffer, size_t* buffer_size, T* value)
     {
         assert(*buffer_size >= sizeof(T));
         ::memcpy(value, *buffer, sizeof(T));
-        reinterpret_cast<char const*&>(*buffer) += sizeof(T);
+        *buffer += sizeof(T);
         *buffer_size -= sizeof(T);
     }
 };
@@ -132,7 +128,7 @@ struct Serializer<T, typename std::enable_if_t<std::is_arithmetic_v<T> || std::i
  * @param value Value to serialize
  */
 template <typename T>
-inline void serializeValue(void** buffer, T const& value)
+inline void serializeValue(std::byte** buffer, T const& value)
 {
     return Serializer<T>::serialize(buffer, value);
 }
@@ -145,7 +141,7 @@ inline void serializeValue(void** buffer, T const& value)
  * @param value Output value
  */
 template <typename T>
-inline void deserializeValue(void const** buffer, size_t* buffer_size, T* value)
+inline void deserializeValue(std::byte const** buffer, size_t* buffer_size, T* value)
 {
     return Serializer<T>::deserialize(buffer, buffer_size, value);
 }
@@ -163,7 +159,7 @@ size_t accumulateWorkspaceSize(size_t currentSize, rt::Coords const& shape, nvin
 //! @param shape Requested Tensor shape
 //! @param dataType Requested Tensor data type
 //! @return Assigned tensor
-rt::Tensor assignTensorFromWorkspace(void*& workspace, rt::Coords const& shape, nvinfer1::DataType dataType);
+rt::Tensor assignTensorFromWorkspace(std::byte*& workspace, rt::Coords const& shape, nvinfer1::DataType dataType);
 
 } // namespace plugins
 } // namespace trt_edgellm

@@ -39,7 +39,8 @@ struct XQALaunchParams
     void* output = nullptr;          //!< Output tensor
     void const* qInputPtr = nullptr; //!< Query input pointer
     KVCache kvCache;                 //!< KV cache structure
-    float const* kvScale = nullptr;  //!< KV scaling factors
+    float const* kScale = nullptr;   //!< K scaling factors (quantized -> original)
+    float const* vScale = nullptr;   //!< V scaling factors (quantized -> original)
     int32_t* semaphores = nullptr;   //!< Semaphores for synchronization
     void* scratch = nullptr;         //!< Scratch memory
 
@@ -60,7 +61,8 @@ struct XQALaunchParams
     float qScale = 1.0F;       //!< Query scaling factor
     int32_t headGroupSize = 0; //!< Head group size
 
-    nvinfer1::DataType dataType; //!< I/O data type of the kernel
+    nvinfer1::DataType dataType;   //!< I/O data type of the kernel
+    nvinfer1::DataType kvDataType; //!< KV cache data type
 };
 
 //! \brief Decoder XQA (eXtended Query Attention) kernel runner
@@ -69,13 +71,14 @@ class DecoderXQARunner
 public:
     //! \brief Constructor for DecoderXQARunner
     //! \param[in] dataType Data type for computation
+    //! \param[in] kvDataType KV cache data type
     //! \param[in] batchSize Batch size
     //! \param[in] numQHeads Number of query heads
     //! \param[in] numKvHeads Number of key-value heads
     //! \param[in] headSize Head dimension size
     //! \param[in] smVersion CUDA SM version
-    DecoderXQARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t numQHeads, int32_t numKvHeads,
-        int32_t headSize, int32_t smVersion);
+    DecoderXQARunner(nvinfer1::DataType const dataType, nvinfer1::DataType const kvDataType, int32_t batchSize,
+        int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion);
 
     DecoderXQARunner() = default;
 
@@ -104,22 +107,27 @@ public:
     //! \param[in] numKVHeads Number of key-value heads
     //! \param[in] smVersion CUDA SM version
     //! \param[in] dataType Data type for computation
+    //! \param[in] kvDataType KV cache data type
     //! \return True if implementation is supported, false otherwise
-    static bool canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, nvinfer1::DataType dataType);
+    static bool canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, nvinfer1::DataType dataType,
+        nvinfer1::DataType kvDataType);
 
     //! \brief Load decoder XQA kernels for given configuration
     //! \param[in] smVersion CUDA SM version
-    //! \param[in] dataType Data type for computation
+    //! \param[in] dataType Data type for computation (Q dtype)
+    //! \param[in] kvDataType KV cache data type
     //! \param[in] useSpecDecodeKernels Whether to load spec-decode kernels
     //! \return True if kernels loaded successfully, false otherwise
-    static bool loadDecodeXQAKernels(int32_t smVersion, nvinfer1::DataType dataType, bool useSpecDecodeKernels);
+    static bool loadDecodeXQAKernels(
+        int32_t smVersion, nvinfer1::DataType dataType, nvinfer1::DataType kvDataType, bool useSpecDecodeKernels);
 
 private:
-    nvinfer1::DataType mDataType; //!< Data type for computation
-    uint32_t mBatchSize;          //!< Batch size
-    uint32_t mNumHeads;           //!< Number of query heads
-    uint32_t mNumKVHeads;         //!< Number of key-value heads
-    uint32_t mHeadSize;           //!< Head dimension size
+    nvinfer1::DataType mDataType;   //!< Data type for computation
+    nvinfer1::DataType mKVDataType; //!< KV cache data type
+    uint32_t mBatchSize;            //!< Batch size
+    uint32_t mNumHeads;             //!< Number of query heads
+    uint32_t mNumKVHeads;           //!< Number of key-value heads
+    uint32_t mHeadSize;             //!< Head dimension size
 
     int32_t mSmVersion; //!< CUDA SM version
 };

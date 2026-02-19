@@ -31,7 +31,10 @@ namespace plugins
  * Implements efficient INT4 quantized matrix multiplication with group-wise quantization.
  * Used for quantized weight matrix multiplications in LLM inference.
  */
-class Int4GroupwiseGemmPlugin : public nvinfer1::IPluginV2DynamicExt
+class Int4GroupwiseGemmPlugin : public nvinfer1::IPluginV3,
+                                public nvinfer1::IPluginV3OneCore,
+                                public nvinfer1::IPluginV3OneBuild,
+                                public nvinfer1::IPluginV3OneRuntime
 {
 public:
     /*!
@@ -44,12 +47,11 @@ public:
     Int4GroupwiseGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize);
 
     /*!
-     * @brief Construct from serialized data
+     * @brief Construct from field collection
      * @param name Layer name
-     * @param data Serialized plugin data
-     * @param length Size of serialized data
+     * @param fc Plugin field collection
      */
-    Int4GroupwiseGemmPlugin(std::string const& name, void const* data, size_t length);
+    Int4GroupwiseGemmPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     //! @brief Deleted default constructor
     Int4GroupwiseGemmPlugin() = delete;
@@ -60,30 +62,49 @@ public:
     //! @brief Destructor
     ~Int4GroupwiseGemmPlugin() override;
 
-    // IPluginV2DynamicExt Methods
+    //! @brief Return the plugin capability interface for given type
+    nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
+
     //! @brief Clone the plugin for use in another network
     //! @return Cloned plugin instance
-    nvinfer1::IPluginV2DynamicExt* clone() const noexcept override;
+    nvinfer1::IPluginV3* clone() noexcept override;
+
+    //! @brief Get plugin name
+    //! @return Plugin name string
+    char const* getPluginName() const noexcept override;
+
+    //! @brief Get plugin version
+    //! @return Version string
+    char const* getPluginVersion() const noexcept override;
+
+    //! @brief Get plugin namespace
+    //! @return Namespace string
+    char const* getPluginNamespace() const noexcept override;
 
     //! @brief Get number of output tensors
     //! @return Number of outputs (1)
     int32_t getNbOutputs() const noexcept override;
 
-    //! @brief Get output tensor data type
-    //! @param index Output index
+    //! @brief Get output tensor data types
+    //! @param outputTypes Output array for data types
+    //! @param nbOutputs Number of outputs
     //! @param inputTypes Input data types
     //! @param nbInputs Number of inputs
-    //! @return Output data type
-    nvinfer1::DataType getOutputDataType(
-        int32_t index, nvinfer1::DataType const* inputTypes, int32_t nbInputs) const noexcept override;
+    //! @return 0 on success, non-zero on error
+    int32_t getOutputDataTypes(nvinfer1::DataType* outputTypes, int32_t nbOutputs, nvinfer1::DataType const* inputTypes,
+        int32_t nbInputs) const noexcept override;
 
-    //! @brief Get output tensor dimensions
-    //! @param outputIndex Output index
+    //! @brief Get output tensor shapes
     //! @param inputs Input dimensions
     //! @param nbInputs Number of inputs
+    //! @param shapeInputs Shape tensor inputs
+    //! @param nbShapeInputs Number of shape inputs
+    //! @param outputs Output dimensions
+    //! @param nbOutputs Number of outputs
     //! @param exprBuilder Expression builder for dynamic shapes
-    //! @return Output dimensions
-    nvinfer1::DimsExprs getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
+    //! @return 0 on success, non-zero on error
+    int32_t getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs, nvinfer1::DimsExprs const* shapeInputs,
+        int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs,
         nvinfer1::IExprBuilder& exprBuilder) noexcept override;
 
     //! @brief Check if format combination is supported
@@ -92,15 +113,16 @@ public:
     //! @param nbInputs Number of inputs
     //! @param nbOutputs Number of outputs
     //! @return True if supported
-    bool supportsFormatCombination(
-        int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept override;
+    bool supportsFormatCombination(int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs,
+        int32_t nbOutputs) noexcept override;
 
     //! @brief Configure plugin with tensor descriptions
     //! @param in Input tensor descriptors
     //! @param nbInputs Number of inputs
     //! @param out Output tensor descriptors
     //! @param nbOutputs Number of outputs
-    void configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
+    //! @return 0 on success, non-zero on error
+    int32_t configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
         nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept override;
 
     //! @brief Get workspace size required for execution
@@ -109,8 +131,8 @@ public:
     //! @param outputs Output tensor descriptors
     //! @param nbOutputs Number of outputs
     //! @return Workspace size in bytes
-    size_t getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int32_t nbInputs,
-        nvinfer1::PluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept override;
+    size_t getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
+        nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept override;
 
     //! @brief Execute the plugin
     //! @param inputDesc Input tensor descriptors
@@ -123,47 +145,38 @@ public:
     int32_t enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
 
-    //! @brief Get serialization size
-    //! @return Size in bytes
-    size_t getSerializationSize() const noexcept override;
+    //! @brief Called when input/output shapes change during runtime
+    //! @param in Input tensor descriptors
+    //! @param nbInputs Number of inputs
+    //! @param out Output tensor descriptors
+    //! @param nbOutputs Number of outputs
+    //! @return 0 on success, non-zero on error
+    int32_t onShapeChange(nvinfer1::PluginTensorDesc const* in, int32_t nbInputs, nvinfer1::PluginTensorDesc const* out,
+        int32_t nbOutputs) noexcept override;
 
-    //! @brief Serialize plugin state
-    //! @param buffer Output buffer
-    void serialize(void* buffer) const noexcept override;
+    //! @brief Attach plugin to an execution context
+    //! @param context Plugin resource context
+    //! @return Cloned plugin attached to context
+    nvinfer1::IPluginV3* attachToContext(nvinfer1::IPluginResourceContext* context) noexcept override;
 
-    //! @brief Get plugin type name
-    //! @return Plugin type string
-    char const* getPluginType() const noexcept override;
-
-    //! @brief Get plugin namespace
-    //! @return Namespace string
-    char const* getPluginNamespace() const noexcept override;
+    //! @brief Get plugin fields for serialization
+    //! @return Field collection for serialization
+    nvinfer1::PluginFieldCollection const* getFieldsToSerialize() noexcept override;
 
     //! @brief Set plugin namespace
     //! @param pluginNamespace Namespace string
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
-    //! @brief Get plugin version
-    //! @return Version string
-    char const* getPluginVersion() const noexcept override;
+private:
+    std::string mLayerName;
+    std::string mNamespace;
 
-    //! @brief Initialize plugin resources
-    //! @return 0 on success
-    int32_t initialize() noexcept override;
+    int32_t mGemmN{};
+    int32_t mGemmK{};
+    int32_t mGroupSize{};
 
-    //! @brief Release plugin resources
-    void terminate() noexcept override;
-
-    //! @brief Destroy plugin instance
-    void destroy() noexcept override;
-
-protected:
-    std::string mLayerName; //!< Layer name
-    std::string mNamespace; //!< Plugin namespace
-
-    int32_t mGemmN{};     //!< Output dimension (N)
-    int32_t mGemmK{};     //!< Input dimension (K)
-    int32_t mGroupSize{}; //!< Quantization group size
+    std::vector<nvinfer1::PluginField> mDataToSerialize;
+    nvinfer1::PluginFieldCollection mFCToSerialize;
 };
 
 /*!
@@ -171,7 +184,7 @@ protected:
  *
  * Handles plugin registration and creation in TensorRT.
  */
-class Int4GroupwiseGemmPluginCreator : public nvinfer1::IPluginCreator
+class Int4GroupwiseGemmPluginCreator : public nvinfer1::IPluginCreatorV3One
 {
 public:
     //! @brief Constructor
@@ -184,40 +197,34 @@ public:
     //! @return Plugin name string
     char const* getPluginName() const noexcept override;
 
+    //! @brief Get plugin version
+    //! @return Version string
+    char const* getPluginVersion() const noexcept override;
+
     //! @brief Get plugin field names
     //! @return Field collection
     nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override;
-
-    //! @brief Set plugin namespace
-    //! @param pluginNamespace Namespace string
-    void setPluginNamespace(char const* pluginNamespace) noexcept;
 
     //! @brief Get plugin namespace
     //! @return Namespace string
     char const* getPluginNamespace() const noexcept override;
 
-    //! @brief Get plugin version
-    //! @return Version string
-    char const* getPluginVersion() const noexcept override;
+    //! @brief Set plugin namespace
+    //! @param pluginNamespace Namespace string
+    void setPluginNamespace(char const* pluginNamespace) noexcept;
 
     //! @brief Create plugin from field collection
     //! @param name Plugin name
     //! @param fc Field collection with parameters
+    //! @param phase TensorRT phase (build or runtime)
     //! @return Created plugin instance
-    nvinfer1::IPluginV2* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept override;
-
-    //! @brief Deserialize plugin from data
-    //! @param name Plugin name
-    //! @param serialData Serialized data
-    //! @param serialLength Data size
-    //! @return Deserialized plugin instance
-    nvinfer1::IPluginV2* deserializePlugin(
-        char const* name, void const* serialData, size_t serialLength) noexcept override;
+    nvinfer1::IPluginV3* createPlugin(
+        char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept override;
 
 private:
-    static nvinfer1::PluginFieldCollection mFieldCollection;     //!< Field collection
-    static std::vector<nvinfer1::PluginField> mPluginAttributes; //!< Plugin attributes
-    std::string mNamespace;                                      //!< Plugin namespace
+    static nvinfer1::PluginFieldCollection mFieldCollection;
+    static std::vector<nvinfer1::PluginField> mPluginAttributes;
+    std::string mNamespace;
 };
 
 } // namespace plugins

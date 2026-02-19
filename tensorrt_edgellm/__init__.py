@@ -79,7 +79,6 @@ Example Usage:
             draft_model_dir="path/to/draft_model",
             output_dir="path/to/output",
             base_model_dir="path/to/base_model",
-            use_prompt_tuning=False
         )
         
         # Export visual model to ONNX
@@ -107,6 +106,7 @@ Example Usage:
         )
 """
 
+from .onnx_export.audio_export import audio_export
 from .onnx_export.llm_export import export_draft_model, export_llm_model
 from .onnx_export.lora import (insert_lora_and_save,
                                process_lora_weights_and_save)
@@ -126,6 +126,7 @@ __all__ = [
     "export_draft_model",
     "export_llm_model",
     "visual_export",
+    "audio_export",
     "insert_lora_and_save",
     "process_lora_weights_and_save",
     "reduce_vocab_size",

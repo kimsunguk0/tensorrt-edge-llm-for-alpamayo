@@ -128,8 +128,8 @@ __device__ __inline__ void mma_m16n8k16(half* C_warp, half* A_shared_warp, half*
 }
 
 template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int SHARED_K_ITERS, int STAGES>
-__device__ __inline__ void global_to_share_one_stage_A_T2(half* src, half* dst, int global_nrows, int global_ncols,
-    int cta_offset_m, int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
+__device__ __inline__ void global_to_share_one_stage_A_T2(half const* src, half* dst, int global_nrows,
+    int global_ncols, int cta_offset_m, int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
 {
     constexpr int threads_needed = (CTA_M * CTA_K) / PACK_SIZE / SHARED_K_ITERS;
     constexpr int threads_used = threads_needed < CTA_SIZE ? threads_needed : CTA_SIZE;
@@ -169,7 +169,7 @@ __device__ __inline__ void global_to_share_one_stage_A_T2(half* src, half* dst, 
 }
 
 template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int SHARED_K_ITERS, int STAGES>
-__device__ __inline__ void global_to_share_one_stage_B_T2(half* src, half* dst, int src_size, int global_ncols,
+__device__ __inline__ void global_to_share_one_stage_B_T2(half const* src, half* dst, int src_size, int global_ncols,
     int cta_offset_m, int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
 {
     constexpr int threads_needed = (CTA_N / kInterleave * CTA_K) / PACK_SIZE / SHARED_K_ITERS;
@@ -206,8 +206,8 @@ __device__ __inline__ void global_to_share_one_stage_B_T2(half* src, half* dst, 
 }
 
 template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int STAGES, int G>
-__device__ __inline__ void global_to_share_one_stage_scales_T2(half* src, half* dst, int src_size, int global_ncols,
-    int cta_offset_m, int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
+__device__ __inline__ void global_to_share_one_stage_scales_T2(half const* src, half* dst, int src_size,
+    int global_ncols, int cta_offset_m, int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
 {
     constexpr int threads_needed = CTA_N / PACK_SIZE / 1;
     constexpr int threads_used = threads_needed < CTA_SIZE ? threads_needed : CTA_SIZE;
@@ -233,7 +233,7 @@ __device__ __inline__ void global_to_share_one_stage_scales_T2(half* src, half* 
 
 template <int CTA_M, int CTA_N, int CTA_K, int STAGES, int shared_iters>
 __device__ __inline__ void share_to_reg_one_stage_A_T2(
-    half* src, half* dst, int warp_offset_m, int warp_offset_n, int k_0_1)
+    half const* src, half* dst, int warp_offset_m, int warp_offset_n, int k_0_1)
 {
     constexpr int kSmemCol = CTA_K + SMEM_PAD_A;
 
@@ -252,7 +252,7 @@ __device__ __inline__ void share_to_reg_one_stage_A_T2(
 
 template <int CTA_M, int CTA_N, int CTA_K, int STAGES, bool ldmatrix, int shared_iters, int G>
 __device__ __inline__ void share_to_reg_one_stage_B_T2(
-    half* src, half* src_scales, half* dst, half* dst_fp16, int warp_offset_m, int warp_offset_n, int k_0_1)
+    half const* src, half* src_scales, half* dst, half* dst_fp16, int warp_offset_m, int warp_offset_n, int k_0_1)
 {
     constexpr int kSmemCol = CTA_K + SMEM_PAD_B;
     int r0 = ((threadIdx.x / 8 / 2) * 8 + threadIdx.x % 8);
@@ -291,8 +291,8 @@ __device__ __inline__ void share_to_reg_one_stage_B_T2(
 }
 
 template <int CTA_M, int CTA_N, int CTA_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, int G>
-__global__ void gemm_w4a16_T2(
-    half* __restrict__ A, half* __restrict__ B, half* __restrict__ scales, half* __restrict__ C, int M, int N, int K)
+__global__ void gemm_w4a16_T2(half const* __restrict__ A, half const* __restrict__ B, half const* __restrict__ scales,
+    half* __restrict__ C, int M, int N, int K)
 {
     constexpr int NUM_WARPS = CTA_M / WARP_M * CTA_N / WARP_N;
     constexpr int CTA_SIZE = NUM_WARPS * WARP_SIZE;
@@ -476,11 +476,11 @@ __global__ void gemm_w4a16_T2(
     }
 }
 
-void gemm_forward_cuda_new(half* in_feats, int8_t* weights_device, half* scaling_factors, half* out_feats, int m, int n,
-    int k, int group_size, cudaStream_t stream)
+void gemm_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
+    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
 {
     // The GEMM kernel will load packed int4 weights as fp16 data tensor.
-    half* kernel = reinterpret_cast<half*>(weights_device);
+    half const* kernel = reinterpret_cast<half const*>(weights_device);
 
     constexpr int G = 128;
     constexpr int CTA_M = 64;

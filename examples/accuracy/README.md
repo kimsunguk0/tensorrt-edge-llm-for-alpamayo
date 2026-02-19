@@ -47,10 +47,7 @@ Build both visual encoder and text engines:
   --engineDir /path/to/text/engine/ \
   --maxInputLen 8192 \
   --maxKVCacheCapacity 10240 \
-  --maxBatchSize 1 \
-  --vlm \
-  --minImageTokens 256 \
-  --maxImageTokens 8192
+  --maxBatchSize 1
 ```
 
 ## Benchmark Types
@@ -148,7 +145,7 @@ Located in `example_datasets/` directory. Use `scripts/prepare_dataset.py` to co
 
 - **Engine Building**: Use `llm_build` for text engines, `visual_build` for visual encoders
 - **Sequence Lengths**: Use large values (8192-10240) for accuracy datasets
-- **Multimodal Models**: Build both engines, use `--vlm` flag and `--multimodalEngineDir` parameter
+- **Multimodal Models**: Build both LLM and visual engines, use `--multimodalEngineDir` parameter for inference
 - **Dataset Format**: All inputs must be in Edge LLM JSON format
 - **Binary Location**: Run inference binaries from tensorrt_edgellm root directory
 

@@ -18,7 +18,6 @@
 #include "utilKernels.h"
 
 #include "common/checkMacros.h"
-
 namespace trt_edgellm
 {
 namespace kernel
@@ -54,10 +53,14 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
 }
 
 // ===== kernel: produce [B, S, 2, H, D] (FMHA expected padded layout) =====
+//! This kernel prepares the KV-cache input required by the FMHA kernel when using
+//! the CONTIGUOUS_Q_KV input layout. Currently, that FMHA path only supports FP16 KV cache,
+//! so `dst` is always `half`.
 template <typename T>
 __global__ void cvtKVLayoutBHSDToBSHDKernel(T const* __restrict__ src, // [B, 2, H, S, D]
-    T* __restrict__ dst,                                               // [B, S, 2, H, D]
-    int32_t B, int32_t S, int32_t H, int32_t D)
+    half* __restrict__ dst,                                            // [B, S, 2, H, D]
+    float const* __restrict__ kScaleQuantOrig, float const* __restrict__ vScaleQuantOrig, int32_t B, int32_t S,
+    int32_t H, int32_t D)
 {
     // Thread mapping identical to paddedLayoutToCompactKernel but without cuSeqLens.
     //   x-dim: feature dimension  D
@@ -85,7 +88,17 @@ __global__ void cvtKVLayoutBHSDToBSHDKernel(T const* __restrict__ src, // [B, 2,
     // dst layout: [B, S, 2, H, D] -> ((((b * S + token) * 2 + kv) * H + h) * D + d)
     size_t dstIdx = (((((size_t) batch * S + token) * 2 + kv) * H + h) * D + d);
 
-    dst[dstIdx] = src[srcIdx];
+#if SUPPORTS_FP8
+    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+    {
+        float const scale = (kv == 0) ? kScaleQuantOrig[0] : vScaleQuantOrig[0];
+        dst[dstIdx] = __float2half(static_cast<float>(src[srcIdx]) * scale);
+    }
+    else
+#endif
+    {
+        dst[dstIdx] = src[srcIdx];
+    }
 }
 
 void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
@@ -116,7 +129,8 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
         cuKVSeqLens.dataPointer<int32_t>(), kvCacheEndIdxs.dataPointer<int32_t>(), runtimeSeqLen, runtimeBatchSize);
 }
 
-void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, cudaStream_t stream)
+void cvtKVLayoutBHSDToBSHD(
+    rt::Tensor const& src, rt::Tensor& dst, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream)
 {
     rt::Coords srcShape = src.getShape();
     int32_t const B = static_cast<int32_t>(srcShape[0]);
@@ -126,8 +140,7 @@ void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, cudaStream_t 
 
     // Perform necessary shape checks.
     rt::Coords dstShape = dst.getShape();
-    check::check(src.getDataType() == nvinfer1::DataType::kHALF && dst.getDataType() == nvinfer1::DataType::kHALF,
-        "Restrict input and output data types to FP16 for now.");
+    check::check(dst.getDataType() == nvinfer1::DataType::kHALF, "Please make sure the output tensor is FP16.");
     check::check(srcShape[1] == 2 && dstShape[2] == 2, "Source and destination tensors separate KV respectively.");
     check::check(dstShape[0] == B && dstShape[1] == S && dstShape[3] == H && dstShape[4] == D,
         "Destination tensor shall have consistent shape of [B, S, 2, H, D].");
@@ -144,8 +157,29 @@ void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, cudaStream_t 
         (S + ty - 1) / ty,                                  // y : token dim
         hpTilesPerBatch * B);                               // z : (batch, headPair)
 
-    cvtKVLayoutBHSDToBSHDKernel<half>
-        <<<grid, block, 0, stream>>>(src.dataPointer<half>(), dst.dataPointer<half>(), B, S, H, D);
+    if (src.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        cvtKVLayoutBHSDToBSHDKernel<half><<<grid, block, 0, stream>>>(
+            src.dataPointer<half>(), dst.dataPointer<half>(), nullptr, nullptr, B, S, H, D);
+    }
+#if SUPPORTS_FP8
+    else if (src.getDataType() == nvinfer1::DataType::kFP8)
+    {
+        check::check(!kvScaleQuantOrig.isEmpty(), "kvScaleQuantOrig is required for FP8 KV cache");
+        check::check(kvScaleQuantOrig.getDataType() == nvinfer1::DataType::kFLOAT, "kvScaleQuantOrig must be FP32.");
+        check::check(kvScaleQuantOrig.getShape().getNumDims() == 1 && kvScaleQuantOrig.getShape()[0] == 2,
+            "kvScaleQuantOrig shall have shape [2] with layout [kScaleQuantOrig, vScaleQuantOrig].");
+        float const* const scales = kvScaleQuantOrig.dataPointer<float>();
+        float const* const kScaleQuantOrigPtr = scales + 0;
+        float const* const vScaleQuantOrigPtr = scales + 1;
+        cvtKVLayoutBHSDToBSHDKernel<__nv_fp8_e4m3><<<grid, block, 0, stream>>>(src.dataPointer<__nv_fp8_e4m3>(),
+            dst.dataPointer<half>(), kScaleQuantOrigPtr, vScaleQuantOrigPtr, B, S, H, D);
+    }
+#endif
+    else
+    {
+        check::check(false, "Unsupported KV cache dtype");
+    }
 }
 
 } // namespace kernel

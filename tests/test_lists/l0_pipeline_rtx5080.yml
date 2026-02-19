@@ -7,6 +7,9 @@ tests:
   # FP8 LLM tests
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048-llm_basic]
+  # FP8 LLM tests with FP8 KV cache enabled (requires ONNX exported with --fp8_kv_cache)
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp8-fp8kv-mxsl4096-mxbs4-mxil2048]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp8-fp8kv-mxsl4096-mxbs4-mxil2048-llm_basic]
   # MMLU accuracy tests for LLM
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048-mmlu_0-bs4]
   # VLM tests with NVFP4 + FP8 lm_head + FP8 ViT

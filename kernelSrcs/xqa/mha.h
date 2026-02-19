@@ -118,8 +118,8 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
     BeamSearchParams const& beamSearchParams,
 #endif
     uint32_t batchSize,
-    float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
-                                            // int8/fp8 KV cache.
+    float const* __restrict__ kCacheScale, // Device memory scalar for K cache. Used only for int8/fp8 KV cache.
+    float const* __restrict__ vCacheScale, // Device memory scalar for V cache. Used only for int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
@@ -158,8 +158,8 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     BeamSearchParams const& beamSearchParams,
 #endif
     uint32_t batchSize,
-    float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
-                                            // int8/fp8 KV cache.
+    float const* __restrict__ kCacheScale, // Device memory scalar for K cache. Used only for int8/fp8 KV cache.
+    float const* __restrict__ vCacheScale, // Device memory scalar for V cache. Used only for int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
@@ -176,8 +176,8 @@ void launchMLA(cudaDeviceProp const& prop,
     GMemKVCacheHead* kvCacheData,
 #endif
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-    float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
-                                            // int8/fp8 KV cache.
+    float const* __restrict__ kCacheScale, // Device memory scalar for K cache. Used only for int8/fp8 KV cache.
+    float const* __restrict__ vCacheScale, // Device memory scalar for V cache. Used only for int8/fp8 KV cache.
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
 
 #if STATIC_NB_K_HEADS
