@@ -84,6 +84,20 @@ std::array<int64_t, kMAX_DIMS> computeStrides(Coords const& shape)
 }
 } // namespace utils
 
+bool Coords::operator==(Coords const& other) const noexcept
+{
+    if (mNumDims != other.mNumDims)
+    {
+        return false;
+    }
+    return std::equal(mDims.begin(), mDims.begin() + mNumDims, other.mDims.begin());
+}
+
+bool Coords::operator!=(Coords const& other) const noexcept
+{
+    return !(*this == other);
+}
+
 int64_t Coords::volume() const
 {
     if (mNumDims == 0)
@@ -131,8 +145,11 @@ Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType da
     {
         throw std::runtime_error("Construction of Tensor object with zero volume is prohibited");
     }
-
+#if NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 8
     if (dataType == DataType::kINT4 || dataType == DataType::kFP4)
+#else
+    if (dataType == DataType::kINT4)
+#endif
     {
         throw std::runtime_error("Sub-type like kInt4 or kFP4 are not supported");
     }

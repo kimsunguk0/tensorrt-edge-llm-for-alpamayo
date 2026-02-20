@@ -22,9 +22,11 @@
 #include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
+#include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/metrics.h"
+#include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
 #include <fstream>
@@ -38,14 +40,10 @@ namespace trt_edgellm
 
 namespace
 {
-
-// Left a utility function here in case we want to move to a better hashing method.
-size_t hashSystemPromptWithLoraWeights(std::string const& systemPrompt, std::string const& loraWeightsName)
+std::tuple<std::string, std::string> keySystemPromptWithLoraWeights(
+    std::string const& systemPrompt, std::string const& loraWeightsName)
 {
-    size_t hashValue = 0;
-    hash_utils::hashCombine(hashValue, systemPrompt);
-    hash_utils::hashCombine(hashValue, loraWeightsName);
-    return hashValue;
+    return std::make_tuple(systemPrompt, loraWeightsName);
 }
 
 } // namespace
@@ -56,6 +54,22 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
 {
     std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "llm.engine";
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
+
+    // Load embedding table from embedding.safetensors
+    std::filesystem::path const embeddingPath = std::filesystem::path(engineDir) / "embedding.safetensors";
+    LOG_INFO("Loading embedding table from: %s", embeddingPath.string().c_str());
+    std::vector<rt::Tensor> embeddingTensors;
+    if (!safetensors::loadSafetensors(embeddingPath, embeddingTensors, stream))
+    {
+        LOG_ERROR("Failed to load embedding table from: %s", embeddingPath.string().c_str());
+        throw std::runtime_error("Failed to load embedding table from: " + embeddingPath.string());
+    }
+    check::check(embeddingTensors.size() == 1, "embedding.safetensors should contain exactly one tensor");
+    check::check(
+        embeddingTensors[0].getShape().getNumDims() == 2, "embedding tensor should be 2D [vocabSize, hiddenSize]");
+    mEmbeddingTable = std::move(embeddingTensors[0]);
+    LOG_INFO("Embedding table loaded successfully with shape [%d, %d]", mEmbeddingTable.getShape()[0],
+        mEmbeddingTable.getShape()[1]);
 
     try
     {
@@ -86,6 +100,24 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
             "LLMInferenceRuntime::mSamplingWorkspace");
         mInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
             rt::DeviceType::kGPU, DataType::kINT32, "LLMInferenceRuntime::mInputIds");
+        mInputsEmbeds = rt::Tensor(
+            {mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength, mEngineConfig.hiddenSize},
+            rt::DeviceType::kGPU, DataType::kHALF, "LLMInferenceRuntime::mInputsEmbeds");
+        // Allocate deepstack embeddings if needed (one tensor per feature)
+        if (mEngineConfig.numDeepstackFeatures > 0)
+        {
+            mDeepstackEmbeds.resize(mEngineConfig.numDeepstackFeatures);
+            for (int32_t i = 0; i < mEngineConfig.numDeepstackFeatures; ++i)
+            {
+                mDeepstackEmbeds[i] = rt::Tensor({mEngineConfig.maxSupportedBatchSize,
+                                                     mEngineConfig.maxSupportedInputLength, mEngineConfig.hiddenSize},
+                    rt::DeviceType::kGPU, DataType::kHALF,
+                    format::fmtstr("LLMInferenceRuntime::mDeepstackEmbeds[%d]", i));
+            }
+            LOG_INFO("Allocated %d deepstack embeds tensors with shape [%d, %d, %d]",
+                mEngineConfig.numDeepstackFeatures, mEngineConfig.maxSupportedBatchSize,
+                mEngineConfig.maxSupportedInputLength, mEngineConfig.hiddenSize);
+        }
         mHostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
             rt::DeviceType::kCPU, DataType::kINT32, "LLMInferenceRuntime::mHostPackedInputIds");
         mOutputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize}, rt::DeviceType::kGPU,
@@ -192,6 +224,8 @@ bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
 bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32_t>> const& batchedInputIds,
     std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName, cudaStream_t stream)
 {
+    NVTX_SCOPED_RANGE(nvtx_setup, "SETUP_PREFILL_EXECUTION", nvtx_colors::PALE_GREEN);
+
     std::vector<std::vector<int32_t>> processedInputIds;
     std::vector<int32_t> processedIdsLengths;
     int32_t const activeBatchSize = static_cast<int32_t>(batchedInputIds.size());
@@ -207,10 +241,10 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
     // the pre-computed KVCache and remove the contents from inputIds.
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        auto promptHash = hashSystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
-        if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
+        auto const promptKey = keySystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
+        if (mSystemPromptKVCache.find(promptKey) != mSystemPromptKVCache.end())
         {
-            auto& precachedKVCache = mSystemPromptKVCache[promptHash];
+            auto& precachedKVCache = mSystemPromptKVCache[promptKey];
             auto const& kvCacheContent = precachedKVCache.kvCacheContent;
             kernel::instantiateKVCacheFromTensor(kvCacheBuffer, kvCacheContent, i, stream);
             int32_t reuseLength = static_cast<int32_t>(kvCacheContent.getShape()[3]);
@@ -249,10 +283,8 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
         return false;
     }
 
-    // The LLM Engine could also have minSupportedInputLength constraint.
-    int32_t const packedInputLength = std::max(maxInputLength, mEngineConfig.minSupportedInputLength);
-
     // Reshape and fill the pre-allocated pinned host tensor with pad tokens
+    int32_t const packedInputLength = maxInputLength;
     mHostPackedInputIds.reshape({activeBatchSize, packedInputLength});
     int32_t* packedInputIdsData = mHostPackedInputIds.dataPointer<int32_t>();
     std::fill(packedInputIdsData, packedInputIdsData + activeBatchSize * packedInputLength, mTokenizer->getPadId());
@@ -336,10 +368,17 @@ bool LLMInferenceRuntime::handleRequest(
         {
             batchedInputIds.emplace_back(
                 mTokenizer->encode(request.formattedRequests[i].formattedCompleteRequest, true));
+            if (batchedInputIds[i].empty())
+            {
+                LOG_ERROR("Failed to encode input text for request %d in batch", i);
+                return false;
+            }
         }
     }
     else
     {
+        // Mark multimodal preprocessing and inference for NVTX profiling
+        NVTX_SCOPED_RANGE(nvtx_multimodal, "MULTIMODAL_PROCESSING", nvtx_colors::ORANGE);
         if (!mMultimodalRunner->preprocess(
                 request, batchedInputIds, mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream))
         {
@@ -415,12 +454,55 @@ bool LLMInferenceRuntime::handleRequest(
         ++generationIter;
     };
 
-    // Use empty tensor for when no multimodal runner is available.
-    // All other data input used by prefill step is already set up in setUpForPrefillExecution().
+    // Perform embedding lookup for prefill
+    int32_t const prefillSequenceLength = mInputIds.getShape()[1];
+    mInputsEmbeds.reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+
     rt::OptionalInputTensor multimodalEmbeddings
         = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
-    rt::OptionalInputTensors extraVisualFeatures
-        = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
+
+    if (multimodalEmbeddings.has_value())
+    {
+        // Use image insertion variant for multimodal models
+        rt::Tensor const& imageEmbedsTensor = multimodalEmbeddings.value().get();
+        kernel::embeddingLookupWithImageInsertion(mInputIds, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, stream);
+    }
+    else
+    {
+        // Standard embedding lookup
+        kernel::embeddingLookup(mInputIds, mEmbeddingTable, mInputsEmbeds, stream);
+    }
+
+    // Process deepstack features: perform embedding assembly or error if not available
+    rt::OptionalInputTensors deepstackEmbeds{};
+    if (mEngineConfig.numDeepstackFeatures > 0)
+    {
+        if (mMultimodalRunner)
+        {
+            // Multimodal runner exists: perform deepstack embedding assembly
+            rt::OptionalInputTensors deepstackFeatures = mMultimodalRunner->getDeepstackFeatures();
+            for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
+            {
+                rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
+
+                // Reshape and perform embedding assembly for this feature
+                mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+                kernel::assembleDeepstackEmbedding(
+                    mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
+
+                // Add to output vector (engine will bind by index)
+                deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
+            }
+        }
+        else
+        {
+            LOG_ERROR(
+                "Deepstack features are required (numDeepstackFeatures=%d) but no multimodal runner is available to "
+                "provide them.",
+                mEngineConfig.numDeepstackFeatures);
+            return false;
+        }
+    }
 
     // Profile all sampling operations as one stage
     // Prefill profiling session
@@ -428,9 +510,16 @@ bool LLMInferenceRuntime::handleRequest(
     rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
     {
         TIME_STAGE(metrics::StageNames::kLLM_PREFILL, stream);
+        // Enhanced NVTX range with detailed information
+        NVTX_SCOPED_RANGE(nvtx_prefill,
+            ("LLM_PREFILL[BS=" + std::to_string(activeBatchSize)
+                + ",Reused=" + std::to_string(tokenCount.totalReusedTokens)
+                + ",Computed=" + std::to_string(tokenCount.totalComputedTokens) + "]")
+                .c_str(),
+            nvtx_colors::BLUE);
 
-        bool prefillStatus = mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings,
-            extraVisualFeatures, mOutputLogits, outputHiddenStates, stream);
+        bool prefillStatus = mLLMEngineRunner->executePrefillStep(
+            mInputsEmbeds, mHostContextLengths, deepstackEmbeds, mOutputLogits, outputHiddenStates, stream);
         if (!prefillStatus)
         {
             LOG_ERROR(
@@ -443,17 +532,33 @@ bool LLMInferenceRuntime::handleRequest(
     // Record prefill metrics
     mPrefillMetrics.recordRun(tokenCount.totalReusedTokens, tokenCount.totalComputedTokens);
 
-    // Reshape inputIds for decoding step
-    mInputIds.reshape({activeBatchSize, 1});
+    // Reshape for decoding step
+    mInputsEmbeds.reshape({activeBatchSize, 1, mEngineConfig.hiddenSize});
 
     // Profile entire generation phase like benchmark profiler
     {
         TIME_STAGE(metrics::StageNames::kLLM_GENERATION, stream);
+        // Enhanced NVTX range with batch size
+        NVTX_SCOPED_RANGE(nvtx_generation,
+            ("LLM_GENERATION[BS=" + std::to_string(activeBatchSize) + ",MaxLen=" + std::to_string(maxGenerationLength)
+                + "]")
+                .c_str(),
+            nvtx_colors::GREEN);
 
         while (unFinishedBatchNum > 0 && generationIter < maxGenerationLength)
         {
-            // Use the selected token indices as the input token indices for the decoding step.
-            bool decodingStatus = mLLMEngineRunner->executeVanillaDecodingStep(mSelectedIndices, mOutputLogits, stream);
+            // Mark each decoding iteration with detailed info
+            NVTX_SCOPED_RANGE(iter_range,
+                ("Decode_Iter[" + std::to_string(generationIter) + "/" + std::to_string(maxGenerationLength)
+                    + ",Active=" + std::to_string(unFinishedBatchNum) + "]")
+                    .c_str(),
+                nvtx_colors::LIGHT_GREEN);
+
+            // Perform embedding lookup for the selected token indices (decode only has text, no images)
+            kernel::embeddingLookup(mSelectedIndices, mEmbeddingTable, mInputsEmbeds, stream);
+
+            // Use the embedded tokens as input for the decoding step.
+            bool decodingStatus = mLLMEngineRunner->executeVanillaDecodingStep(mInputsEmbeds, mOutputLogits, stream);
             if (!decodingStatus)
             {
                 LOG_ERROR("LLMInferenceRuntime(): Failed to execute decoding step.");
@@ -498,15 +603,17 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     for (int32_t batchSize = minSupportedBatchSize; batchSize <= maxSupportedBatchSize; ++batchSize)
     {
         mSelectedIndices.reshape({batchSize, 1});
+        mInputsEmbeds.reshape({batchSize, 1, mEngineConfig.hiddenSize});
         mOutputLogits.reshape({batchSize, mEngineConfig.outputVocabSize});
+
         captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-            mSelectedIndices, mOutputLogits, mEmptyLoraWeightsName, stream);
+            mInputsEmbeds, mOutputLogits, mEmptyLoraWeightsName, stream);
         if (mEngineConfig.maxSupportedLoraRank > 0)
         {
             for (auto const& loraWeightsName : mLLMEngineRunner->getAvailableLoraWeights())
             {
                 captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-                    mSelectedIndices, mOutputLogits, loraWeightsName, stream);
+                    mInputsEmbeds, mOutputLogits, loraWeightsName, stream);
             }
         }
     }
@@ -537,10 +644,10 @@ LLMInferenceRuntime::TokenCountInfo LLMInferenceRuntime::calculateTokenCounts(
     {
         int32_t contextLength = static_cast<int32_t>(batchedInputIds[i].size());
         // Calculate reused length from system prompt cache
-        auto promptHash = hashSystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
-        if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
+        auto const promptKey = keySystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
+        if (mSystemPromptKVCache.find(promptKey) != mSystemPromptKVCache.end())
         {
-            int32_t reusedLength = static_cast<int32_t>(mSystemPromptKVCache.at(promptHash).tokenizedPrompt.size());
+            int32_t reusedLength = static_cast<int32_t>(mSystemPromptKVCache.at(promptKey).tokenizedPrompt.size());
             tokenCount.totalReusedTokens += reusedLength;
             tokenCount.totalComputedTokens += (contextLength - reusedLength);
         }
@@ -563,8 +670,8 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     }
 
     // hash the prompt if check if the prompt cache already exists.
-    size_t const promptHash = hashSystemPromptWithLoraWeights(prompt, loraWeightsName);
-    if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
+    auto const promptKey = keySystemPromptWithLoraWeights(prompt, loraWeightsName);
+    if (mSystemPromptKVCache.find(promptKey) != mSystemPromptKVCache.end())
     {
         LOG_DEBUG(
             "LLMInferenceRuntime(): The system prompt KVCache already exists for the prompt: {%s}", prompt.c_str());
@@ -572,6 +679,11 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     }
 
     auto tokenizedPrompt = mTokenizer->encode(prompt, true);
+    if (tokenizedPrompt.empty())
+    {
+        LOG_ERROR("Failed to encode system prompt for KVCache generation.");
+        return false;
+    }
     int32_t const promptIdsLength = static_cast<int32_t>(tokenizedPrompt.size());
     int32_t const activeBatchSize = 1;
 
@@ -594,14 +706,59 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     }
 
     // Execute prefill step to initialize the KVCache data.
+    // Perform embedding lookup
+    int32_t const prefillSequenceLength = mInputIds.getShape()[1];
+    mInputsEmbeds.reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+
     rt::OptionalInputTensor multimodalEmbeddings
         = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
-    rt::OptionalInputTensors extraVisualFeatures
-        = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
+
+    if (multimodalEmbeddings.has_value())
+    {
+        // Use image insertion variant for multimodal models
+        rt::Tensor const& imageEmbedsTensor = multimodalEmbeddings.value().get();
+        kernel::embeddingLookupWithImageInsertion(mInputIds, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, stream);
+    }
+    else
+    {
+        // Standard embedding lookup
+        kernel::embeddingLookup(mInputIds, mEmbeddingTable, mInputsEmbeds, stream);
+    }
+
+    // Process deepstack features: perform embedding lookup or provide zero tensors
+    rt::OptionalInputTensors deepstackEmbeds{};
+    if (mEngineConfig.numDeepstackFeatures > 0)
+    {
+        if (mMultimodalRunner)
+        {
+            // Multimodal runner exists: perform deepstack embedding lookup
+            rt::OptionalInputTensors deepstackFeatures = mMultimodalRunner->getDeepstackFeatures();
+            for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
+            {
+                rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
+
+                // Reshape and perform embedding lookup for this feature
+                mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+                kernel::assembleDeepstackEmbedding(
+                    mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
+
+                // Add to output vector (engine will bind by index)
+                deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
+            }
+        }
+        else
+        {
+            LOG_ERROR(
+                "Deepstack features are required (numDeepstackFeatures=%d) but no multimodal runner is available to "
+                "provide them.",
+                mEngineConfig.numDeepstackFeatures);
+            return false;
+        }
+    }
 
     rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
-    bool prefillStatus = mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings,
-        extraVisualFeatures, mOutputLogits, outputHiddenStates, stream);
+    bool prefillStatus = mLLMEngineRunner->executePrefillStep(
+        mInputsEmbeds, mHostContextLengths, deepstackEmbeds, mOutputLogits, outputHiddenStates, stream);
     if (!prefillStatus)
     {
         LOG_ERROR("LLMInferenceRuntime(): Failed to execute prefill step.");
@@ -618,13 +775,13 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     SystemPromptKVCache savedKVCache;
     savedKVCache.systemPrompt = prompt;
     savedKVCache.tokenizedPrompt = tokenizedPrompt;
-    savedKVCache.kvCacheContent = rt::Tensor(savedKVCacheShape, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT,
-        "LLMInferenceRuntime::savedKVCache.kvCacheContent");
+    savedKVCache.kvCacheContent = rt::Tensor(savedKVCacheShape, rt::DeviceType::kGPU,
+        linearKVCache.getConfig().kvCacheTypeTRT, "LLMInferenceRuntime::savedKVCache.kvCacheContent");
 
     // We only process one sequence at a time.
     constexpr int32_t CACHE_BATCH_IDX{0};
     kernel::saveKVCacheIntoTensor(savedKVCache.kvCacheContent, kvCacheBuffer, CACHE_BATCH_IDX, stream);
-    mSystemPromptKVCache.insert({promptHash, std::move(savedKVCache)});
+    mSystemPromptKVCache.insert({promptKey, std::move(savedKVCache)});
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
     LOG_DEBUG("LLMInferenceRuntime(): The KVCache is saved for the prompt: {%s}", prompt.c_str());

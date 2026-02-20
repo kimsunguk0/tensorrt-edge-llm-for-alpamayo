@@ -20,18 +20,18 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.12",
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
     "torch~=2.9.1",
-    "transformers==4.57.1",
+    "transformers==4.57.3",
     "nvidia-modelopt[torch]==0.39.0",
     "nvidia-modelopt[onnx]==0.39.0",
     "onnx==1.19.0",
-    "datasets==4.0.0",
+    "datasets==4.4.2",
     "tqdm~=4.67.1",
     "numpy~=2.2.6",
-    "peft~=0.18.0",
-    "backoff~=2.2.1"
+    "peft==0.18.1",
+    "backoff==2.2.1"
 ]
 
 [project.optional-dependencies]
@@ -43,6 +43,7 @@ tensorrt-edgellm-quantize-llm = "tensorrt_edgellm.scripts.quantize_llm:main"
 tensorrt-edgellm-quantize-draft = "tensorrt_edgellm.scripts.quantize_draft:main"
 tensorrt-edgellm-export-visual = "tensorrt_edgellm.scripts.export_visual:main"
 tensorrt-edgellm-export-llm = "tensorrt_edgellm.scripts.export_llm:main"
+tensorrt-edgellm-export-audio = "tensorrt_edgellm.scripts.export_audio:main"
 tensorrt-edgellm-export-draft = "tensorrt_edgellm.scripts.export_draft:main"
 tensorrt-edgellm-insert-lora = "tensorrt_edgellm.scripts.insert_lora:main"
 tensorrt-edgellm-process-lora = "tensorrt_edgellm.scripts.process_lora_weights:main"

@@ -26,4 +26,5 @@ __all__ = [
     "export_draft_model",
     "export_llm_model",
     "visual_export",
+    "audio_export",
 ]

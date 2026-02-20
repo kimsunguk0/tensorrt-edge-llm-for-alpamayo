@@ -25,6 +25,14 @@ from pytest_helpers import run_command, timer_context
 from .utils.device import DeviceConfig
 
 
+def _get_trt_env_vars(env_config: EnvironmentConfig) -> Optional[dict]:
+    """Get environment variables for TensorRT library path."""
+    if env_config.trt_package_dir:
+        trt_lib_path = f"{env_config.trt_package_dir}/lib"
+        return {"LD_LIBRARY_PATH": f"$LD_LIBRARY_PATH:{trt_lib_path}"}
+    return None
+
+
 def test_build_project(env_config: EnvironmentConfig,
                        remote_config: Optional[RemoteConfig],
                        test_logger: logging.Logger):
@@ -72,6 +80,15 @@ def test_build_project(env_config: EnvironmentConfig,
         'examples/llm/llm_inference',
         'examples/multimodal/visual_build',
     ]
+    # Executables that support --help smoke test
+    help_check_files = [
+        'examples/llm/llm_build',
+        'examples/llm/llm_inference',
+        'examples/multimodal/visual_build',
+    ]
+
+    env_vars = _get_trt_env_vars(env_config)
+
     for artifact in expected_files:
         artifact_path = os.path.join(build_dir, artifact)
 
@@ -81,6 +98,22 @@ def test_build_project(env_config: EnvironmentConfig,
                              logger=test_logger)
         if not result['success']:
             pytest.fail(f"Build artifact not found: {artifact_path}")
+
+        if artifact not in help_check_files:
+            continue
+
+        # Verify executable runs correctly with --help
+        result = run_command(cmd=[artifact_path, '--help'],
+                             remote_config=remote_config,
+                             timeout=180,
+                             logger=test_logger,
+                             env_vars=env_vars)
+        if not result['success']:
+            output = result.get('output', '')
+            test_logger.error(f"Executable --help output:\n{output}")
+            pytest.fail(
+                f"Executable --help failed (exit code {result['returncode']}): {artifact_path}"
+            )
 
 
 def test_unit_tests(env_config: EnvironmentConfig,
@@ -92,12 +125,7 @@ def test_unit_tests(env_config: EnvironmentConfig,
 
     build_dir = env_config.build_dir
     unit_test_cmd = ['bash', '-c', f'cd {build_dir} && ./unitTest']
-
-    # Unified TensorRT library path handling for both local and remote
-    env_vars = None
-    if env_config.trt_package_dir:
-        trt_lib_path = f"{env_config.trt_package_dir}/lib"
-        env_vars = {"LD_LIBRARY_PATH": f"$LD_LIBRARY_PATH:{trt_lib_path}"}
+    env_vars = _get_trt_env_vars(env_config)
 
     result = run_command(cmd=unit_test_cmd,
                          remote_config=remote_config,

@@ -465,7 +465,7 @@ if __name__ == "__main__":
         CompileMacroOption('DTYPE', 'dt', ['__half']),
         CompileMacroOption('HEAD_ELEMS', 'd', [128, 64, 32]),
         CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
-        CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0]),
+        CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
         CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
                            [0]),  # 0 denotes contiguous kv cache.
         CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [1, 2, 3, 4, 5, 6, 7, 8]),
@@ -477,7 +477,7 @@ if __name__ == "__main__":
         CompileMacroOption('DTYPE', 'dt', ['__half']),
         CompileMacroOption('HEAD_ELEMS', 'd', [128, 64]),
         CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
-        CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0]),
+        CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
         CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
                            [0]),  # 0 denotes contiguous kv cache.
         CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [0]),

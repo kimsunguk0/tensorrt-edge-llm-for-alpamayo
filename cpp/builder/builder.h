@@ -35,13 +35,10 @@ namespace builder
 
 //! Configuration structure for LLM model building.
 //! Contains all parameters needed to configure the TensorRT engine building process
-//! for Large Language Models, including standard LLMs, Eagle models, and Vision-Language Models.
+//! for Large Language Models, including standard LLMs and Eagle models.
 struct LLMBuilderConfig
 {
-    int64_t maxInputLen{128};         //!< Maximum input sequence length for the model
-    bool isVlm{false};                //!< Whether this is a Vision-Language Model (VLM)
-    int64_t minImageTokens{4};        //!< Minimum number of image tokens (VLM only)
-    int64_t maxImageTokens{1024};     //!< Maximum number of image tokens (VLM only)
+    int64_t maxInputLen{1024};        //!< Maximum input sequence length for the model
     bool eagleDraft{false};           //!< Whether this is an Eagle draft model
     bool eagleBase{false};            //!< Whether this is an Eagle base model
     int64_t maxBatchSize{4};          //!< Maximum batch size for inference
@@ -56,12 +53,6 @@ struct LLMBuilderConfig
     {
         Json json;
         json["max_input_len"] = maxInputLen;
-        json["is_vlm"] = isVlm;
-        if (isVlm)
-        {
-            json["min_image_tokens"] = minImageTokens;
-            json["max_image_tokens"] = maxImageTokens;
-        }
         json["eagle_draft"] = eagleDraft;
         json["eagle_base"] = eagleBase;
         json["max_batch_size"] = maxBatchSize;
@@ -88,18 +79,6 @@ struct LLMBuilderConfig
         if (json.contains("max_input_len"))
         {
             config.maxInputLen = json["max_input_len"];
-        }
-        if (json.contains("is_vlm"))
-        {
-            config.isVlm = json["is_vlm"];
-        }
-        if (json.contains("min_image_tokens"))
-        {
-            config.minImageTokens = json["min_image_tokens"];
-        }
-        if (json.contains("max_image_tokens"))
-        {
-            config.maxImageTokens = json["max_image_tokens"];
         }
         if (json.contains("eagle_draft"))
         {
@@ -139,12 +118,6 @@ struct LLMBuilderConfig
         std::ostringstream oss;
         oss << "LLMBuilderConfig:\n";
         oss << "  maxInputLen: " << maxInputLen << "\n";
-        oss << "  isVlm: " << (isVlm ? "true" : "false") << "\n";
-        if (isVlm)
-        {
-            oss << "  minImageTokens: " << minImageTokens << "\n";
-            oss << "  maxImageTokens: " << maxImageTokens << "\n";
-        }
         oss << "  eagleDraft: " << (eagleDraft ? "true" : "false") << "\n";
         oss << "  eagleBase: " << (eagleBase ? "true" : "false") << "\n";
         oss << "  maxBatchSize: " << maxBatchSize << "\n";
@@ -285,13 +258,13 @@ private:
     bool setupEagleProfiles(
         nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
 
-    //! Set up optimization profiles for Vision-Language Models.
-    //! Configures image embedding inputs for VLM processing.
+    //! Set up optimization profiles for Deepstack embeddings (Qwen3VL).
+    //! Configures deepstack embedding inputs with the same profile as inputs_embeds.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @param network TensorRT network definition for input analysis
     //! @return true if setup was successful, false otherwise
-    bool setupVLMProfiles(nvinfer1::IOptimizationProfile* contextProfile,
+    bool setupDeepstackProfiles(nvinfer1::IOptimizationProfile* contextProfile,
         nvinfer1::IOptimizationProfile* generationProfile, nvinfer1::INetworkDefinition const* network);
 
     //! Set up optimization profiles for LoRA-enabled models.
@@ -332,6 +305,11 @@ private:
     //! @return true if copying was successful, false otherwise
     bool copyVocabMappingFiles();
 
+    //! Copy embedding table file to the engine directory.
+    //! Copies embedding.safetensors file for eagleBase and vanilla LLM models.
+    //! @return true if copying was successful, false otherwise
+    bool copyEmbeddingFile();
+
     // Model dimensions extracted from config.json
     int64_t mHiddenSize{0};                 //!< Hidden size of the model
     int64_t mNumKVHeads{0};                 //!< Number of key-value heads
@@ -339,6 +317,7 @@ private:
     int64_t mRotaryDim{0};                  //!< Dimension for rotary position embeddings
     int32_t mNbKVCacheInputs{0};            //!< Number of KV cache inputs (layers)
     int32_t mTargetModelOutputHiddenDim{0}; //!< Target output hidden dimension
+    int32_t mNumDeepstackFeatures{0};       //!< Number of deepstack features (for Qwen3VL)
     Json mModelConfig;                      //!< Parsed model configuration
 };
 

@@ -37,6 +37,14 @@ def validate_export_result(config: TestConfig) -> None:
         if not os.path.exists(lora_onnx):
             raise FileNotFoundError(f"LoRA ONNX model not found: {lora_onnx}")
 
+    if config.reduced_vocab_size:
+        # Validate vocab_map.safetensors exists in ONNX directory
+        vocab_map_file = os.path.join(output_dir, "vocab_map.safetensors")
+        if not os.path.exists(vocab_map_file):
+            raise FileNotFoundError(
+                f"vocab_map.safetensors not found in ONNX dir: {vocab_map_file}"
+            )
+
     if config.model_type == ModelType.VLM:
         # Visual model should be in separate visual subdirectory
         fp16_visual_onnx_dir = config.get_visual_onnx_dir("fp16")
@@ -84,10 +92,19 @@ class TestModelExport:
         print(f"Creating output directory: {llm_onnx_dir}")
         os.makedirs(llm_onnx_dir, exist_ok=True)
 
+        # Create reduced vocab directory if needed
+        if config.reduced_vocab_size:
+            reduced_vocab_dir = config.get_reduced_vocab_dir()
+            os.makedirs(reduced_vocab_dir, exist_ok=True)
+
         # Create quantized model directory if needed
         if config.llm_precision != "fp16" and config.llm_precision != "int4_gptq":
             quantized_model_dir = config.get_quantized_model_dir()
             os.makedirs(quantized_model_dir, exist_ok=True)
+        elif config.fp8_kv_cache:
+            # fp16 weights + FP8 KV cache requires a derived model directory produced by quantize-llm
+            kv_cache_quantized_dir = config.get_kv_cache_quantized_model_dir()
+            os.makedirs(kv_cache_quantized_dir, exist_ok=True)
 
         if config.is_eagle:
             draft_onnx_dir = config.get_draft_onnx_dir()

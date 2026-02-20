@@ -384,8 +384,8 @@ def export_qwen3_vl_visual(
     ]
     # In Qwen3-VL 2B, 4B and 8B, there are 3 deepstack features
     output_names = [
-        "output", "deepstack_features.0", "deepstack_features.1",
-        "deepstack_features.2"
+        "output", "deepstack_features_0", "deepstack_features_1",
+        "deepstack_features_2"
     ]
 
     # Define dynamic axes for variable input sizes
@@ -411,13 +411,13 @@ def export_qwen3_vl_visual(
         'output': {
             0: 'image_token_len'
         },
-        'deepstack_features.0': {
+        'deepstack_features_0': {
             0: 'image_token_len'
         },
-        'deepstack_features.1': {
+        'deepstack_features_1': {
             0: 'image_token_len'
         },
-        'deepstack_features.2': {
+        'deepstack_features_2': {
             0: 'image_token_len'
         },
     }

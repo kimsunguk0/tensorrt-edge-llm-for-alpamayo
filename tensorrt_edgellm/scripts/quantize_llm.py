@@ -52,12 +52,13 @@ def main() -> None:
                         type=str,
                         required=True,
                         help="Path to save the quantized model")
-    parser.add_argument("--quantization",
-                        type=str,
-                        required=False,
-                        choices=["fp8", "int4_awq", "nvfp4", "int8_sq"],
-                        default=None,
-                        help="Quantization method to use")
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        required=False,
+        choices=["fp8", "int4_awq", "nvfp4", "mxfp8", "int8_sq"],
+        default=None,
+        help="Quantization method to use")
     parser.add_argument("--dtype",
                         type=str,
                         choices=["fp16"],
@@ -73,11 +74,19 @@ def main() -> None:
         "--lm_head_quantization",
         type=str,
         required=False,
-        choices=["fp8", "nvfp4"],
+        choices=["fp8", "nvfp4", "mxfp8"],
         default=None,
         help=
-        "Quantization method for language model head (only fp8 and nvfp4 are currently supported)"
+        "Quantization method for language model head (only fp8, nvfp4, and mxfp8 are currently supported)"
     )
+    parser.add_argument(
+        "--kv_cache_quantization",
+        type=str,
+        required=False,
+        choices=["fp8"],
+        default=None,
+        help=
+        "Quantization method for KV cache (only fp8 is currently supported)")
     parser.add_argument(
         "--device",
         type=str,
@@ -94,6 +103,7 @@ def main() -> None:
                               dtype=args.dtype,
                               dataset_dir=args.dataset_dir,
                               lm_head_quantization=args.lm_head_quantization,
+                              kv_cache_quantization=args.kv_cache_quantization,
                               device=args.device)
         print("Model quantization completed successfully!")
     except Exception as e:

@@ -145,6 +145,7 @@ class TestConfig:
 
     # Export LoRA parameters
     lora: Optional[bool] = None
+    merge_lora: Optional[bool] = None
 
     # Engine build parameters
     max_batch_size: Optional[int] = None
@@ -168,6 +169,10 @@ class TestConfig:
     # Inference parameters
     test_case: Optional[str] = None
 
+    # KV cache options
+    fp8_kv_cache: Optional[
+        bool] = None  # If true, export ONNX/config with FP8 KV cache enabled
+
     # Benchmark parameters
     batch_size: Optional[int] = None
     input_seq_len: Optional[int] = None
@@ -176,6 +181,12 @@ class TestConfig:
     # VLM-specific parameters (no defaults - must be specified)
     text_token_length: Optional[int] = None
     image_token_length: Optional[int] = None
+
+    # Vocabulary reduction parameters
+    reduced_vocab_size: Optional[int] = None
+    vocab_reduction_method: Optional[
+        str] = None  # "input_aware" or "frequency"
+    vocab_reduction_max_samples: Optional[int] = None
 
     # Declarative parameter specifications
     _PARAMETER_SPECS = [
@@ -198,6 +209,15 @@ class TestConfig:
         # Export-specific parameters
         ParameterSpec("lora",
                       "", {TaskType.EXPORT}, {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("merge_lora",
+                      "", {TaskType.EXPORT}, {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("fp8_kv_cache",
+                      "fp8kv", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("is_eagle",
                       "eagle",
@@ -272,6 +292,20 @@ class TestConfig:
                       "bs", {TaskType.INFERENCE},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
+
+        # Vocabulary reduction parameters
+        ParameterSpec("reduced_vocab_size",
+                      "rvs",
+                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
+                      {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("vocab_reduction_method",
+                      "vrm", {TaskType.EXPORT}, {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("vocab_reduction_max_samples",
+                      "vrms", {TaskType.EXPORT},
+                      {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
     ]
 
     @classmethod
@@ -341,6 +375,10 @@ class TestConfig:
                 parsed_params['max_seq_len'] = int(part[4:])
             elif part == "lora":
                 parsed_params['lora'] = True
+            elif part == "merge_lora":
+                parsed_params['merge_lora'] = True
+            elif part == "fp8kv":
+                parsed_params['fp8_kv_cache'] = True
             elif part == "eagle":
                 parsed_params['is_eagle'] = True
                 # Parse eagle-{draft_id}-{draft_precision}[-lm{draft_lm_head}]
@@ -416,6 +454,13 @@ class TestConfig:
                 parsed_params['eagle_draft_top_k'] = int(part[4:])
             elif part.startswith('edst'):
                 parsed_params['eagle_draft_step'] = int(part[4:])
+            # For vocabulary reduction parameters
+            elif part.startswith('rvs'):
+                parsed_params['reduced_vocab_size'] = int(part[3:])
+            elif part.startswith('vrm'):
+                parsed_params['vocab_reduction_method'] = part[3:]
+            elif part.startswith('vrms'):
+                parsed_params['vocab_reduction_max_samples'] = int(part[4:])
             # For inference parameters
             else:
                 parsed_params['test_case'] = part
@@ -457,15 +502,26 @@ class TestConfig:
             if self.task_type == TaskType.EXPORT:
                 if self.lora is None:
                     self.lora = False
+                if self.merge_lora is None:
+                    self.merge_lora = False
+                if self.fp8_kv_cache is None:
+                    self.fp8_kv_cache = False
                 if self.is_eagle is None:
                     self.is_eagle = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
+                if self.reduced_vocab_size is not None:
+                    if self.vocab_reduction_method is None:
+                        self.vocab_reduction_method = "input_aware"
+                    if self.vocab_reduction_max_samples is None:
+                        self.vocab_reduction_max_samples = 50000
             else:  # Runtime tasks
                 if self.max_lora_rank is None:
                     self.max_lora_rank = 0
                 if self.lora is None:
                     self.lora = self.max_lora_rank > 0
+                if self.fp8_kv_cache is None:
+                    self.fp8_kv_cache = False
                 if self.is_eagle is None:
                     self.is_eagle = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
@@ -527,6 +583,10 @@ class TestConfig:
     def get_onnx_model_id(self) -> str:
         """Generate unique model identifier"""
         model_id = f"{self.llm_precision}-{self.lm_head_precision}"
+        if self.fp8_kv_cache:
+            model_id += "-fp8kv"
+        if self.reduced_vocab_size:
+            model_id += f"-rvs{self.reduced_vocab_size}"
         return model_id
 
     def get_engine_id(self) -> str:
@@ -559,6 +619,7 @@ class TestConfig:
             "Qwen2.5-7B-Instruct": "Qwen2.5-7B-Instruct",
             "Qwen2.5-VL-3B-Instruct": "Qwen2.5-VL-3B-Instruct",
             "Qwen2.5-VL-7B-Instruct": "Qwen2.5-VL-7B-Instruct",
+            "Qwen2-VL-2B-Instruct": "Qwen2-VL-2B-Instruct",
             "InternVL3-1B": "InternVL3-1B-hf",
             "InternVL3-2B": "InternVL3-2B-hf",
             "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
@@ -570,6 +631,7 @@ class TestConfig:
             "Qwen3-VL-2B-Instruct": "Qwen3/Qwen3-VL-2B-Instruct",
             "Qwen3-VL-4B-Instruct": "Qwen3/Qwen3-VL-4B-Instruct",
             "Qwen3-VL-8B-Instruct": "Qwen3/Qwen3-VL-8B-Instruct",
+            "Phi-4-multimodal-instruct": "Phi-4-multimodal-instruct",
         }
 
         # GPTQ models in edgellm_data_dir
@@ -742,6 +804,10 @@ class TestConfig:
         # Test case name to file path mapping
         # Maps logical test case names to their actual file paths.
         # You can adjust this map to match your test case organization.
+        mtbench_dataset = ("mtbench_eagle3.json" if self.is_eagle or "qwen3"
+                           in str(getattr(self, "model_name", "")).lower() else
+                           "mtbench_dataset.json")
+
         TEST_CASE_NAME_TO_PATH_MAP = {
             # Add test case mappings here, for example:
             "llm_basic":
@@ -753,7 +819,7 @@ class TestConfig:
             "vlm_lora":
             "tests/test_cases/vlm_lora.json",
             "mtbench":
-            f"{self.edgellm_data_dir}/updated_datasets/MTBench/mtbench_eagle3.json",
+            f"{self.edgellm_data_dir}/updated_datasets/updated_MTBench/{mtbench_dataset}",
             "mmmu":
             f"{self.edgellm_data_dir}/updated_datasets/mmmu/mmmu_dataset.json",
             "mmmu_pro_4":
@@ -816,13 +882,55 @@ class TestConfig:
         """Get LoRA weights directory"""
         return os.path.join(self.get_onnx_base_dir(), "lora_weights")
 
+    def get_lora_adapter_dir(self) -> str:
+        """
+        Get LoRA adapter directory for models with embedded LoRA (e.g., Phi-4).
+        Returns the path to the vision-lora subdirectory in the torch model dir.
+        """
+        LORA_ADAPTER_SUBDIRS = {
+            "Phi-4-multimodal-instruct": "vision-lora",
+        }
+        if self.model_name not in LORA_ADAPTER_SUBDIRS:
+            raise ValueError(
+                f"No LoRA adapter mapping for model: {self.model_name}. "
+                f"Supported models: {', '.join(LORA_ADAPTER_SUBDIRS.keys())}")
+        subdir = LORA_ADAPTER_SUBDIRS[self.model_name]
+        return os.path.join(self.get_torch_model_dir(), subdir)
+
+    def get_merged_model_dir(self) -> str:
+        """Get merged LoRA model directory (for models requiring LoRA merge before quantization)"""
+        return os.path.join(self.get_onnx_base_dir(), "merged-vision")
+
     def get_quantized_model_dir(self) -> str:
         """Get quantized model directory (for export)"""
         if self.llm_precision == "fp16":
             return self.get_torch_model_dir()
         prefix = "quantized-base" if self.is_eagle else "quantized"
         quantized_name = f"{self.llm_precision}-{self.lm_head_precision}"
+        if self.fp8_kv_cache:
+            quantized_name += "-fp8kv"
+
         return os.path.join(self.get_onnx_base_dir(), prefix, quantized_name)
+
+    def get_kv_cache_quantized_model_dir(self) -> str:
+        """
+        Get a derived model directory for KV-cache-only quantization.
+
+        Used when llm_precision == fp16 but fp8_kv_cache is enabled, so we need a distinct
+        output directory for `tensorrt-edgellm-quantize-llm --kv_cache_quantization fp8`.
+        """
+        return os.path.join(self.get_onnx_base_dir(), "quantized-kvcache",
+                            self.get_onnx_model_id())
+
+    def get_reduced_vocab_dir(self) -> str:
+        """Get reduced vocabulary directory (for export)"""
+        if not self.reduced_vocab_size:
+            raise ValueError("reduced_vocab_size not set")
+        vocab_name = f"vocab-{self.reduced_vocab_size}"
+        if self.vocab_reduction_method:
+            vocab_name += f"-{self.vocab_reduction_method}"
+        return os.path.join(self.get_onnx_base_dir(), "reduced_vocab",
+                            vocab_name)
 
     def get_cnn_dailymail_dataset_dir(self) -> str:
         """Get CNN DailyMail dataset directory for LLM quantization calibration"""
@@ -849,3 +957,39 @@ class TestConfig:
                 f"MMMU dataset directory not found under {self.llm_models_dir}"
             )
         return dataset_dir
+
+    def get_reference_json_file(self) -> Optional[str]:
+        """
+        Get model-specific reference JSON file for ROUGE score calculation.
+        
+        Lookup order:
+        1. {test_case}_{model_name}_{llm_precision}.json
+        2. {test_case}_{model_name}_fp16.json (fallback)
+        3. None (use original test_case_file as reference)
+        
+        Returns:
+            Path to reference JSON file, or None if no model-specific reference exists
+        """
+        if not self.test_case or not self.edgellm_data_dir:
+            return None
+
+        reference_dir = os.path.join(self.edgellm_data_dir,
+                                     "specific_model_reference")
+        if not os.path.isdir(reference_dir):
+            return None
+
+        # Try exact precision match first
+        exact_match = os.path.join(
+            reference_dir,
+            f"{self.test_case}_{self.model_name}_{self.llm_precision}.json")
+        if os.path.exists(exact_match):
+            return exact_match
+
+        # Fallback to fp16 if current precision is not fp16
+        if self.llm_precision != "fp16":
+            fp16_fallback = os.path.join(
+                reference_dir, f"{self.test_case}_{self.model_name}_fp16.json")
+            if os.path.exists(fp16_fallback):
+                return fp16_fallback
+
+        return None

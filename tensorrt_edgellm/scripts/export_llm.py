@@ -84,6 +84,10 @@ def main() -> None:
         help=
         "Path to chat template JSON file. When provided, validates and uses this template instead of inferring from the model (optional)"
     )
+    parser.add_argument("--fp8_kv_cache",
+                        required=False,
+                        action='store_true',
+                        help="Whether to use FP8 KV cache")
 
     args = parser.parse_args()
 
@@ -94,7 +98,8 @@ def main() -> None:
                          device=args.device,
                          is_eagle_base=args.is_eagle_base,
                          reduced_vocab_dir=args.reduced_vocab_dir,
-                         chat_template_path=args.chat_template_path)
+                         chat_template_path=args.chat_template_path,
+                         fp8_kv_cache=args.fp8_kv_cache)
 
         print("LLM model export completed successfully!")
 

@@ -17,10 +17,12 @@
 
 #include "applyRopeWriteKV.h"
 #include "common/checkMacros.h"
+#include "common/cudaMacros.h"
 #include "kernels/common/vectorizedTypes.cuh"
 
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <type_traits>
 
 namespace trt_edgellm
 {
@@ -41,7 +43,7 @@ __device__ __forceinline__ half applyRope<half>(
 
 template <typename T>
 __device__ __forceinline__ DVec<T> vecApplyRopeNonInterleave(
-    T* dataPtr, DVec<float> const& cosVec, DVec<float> const& sinVec, uint32_t const rotaryDim)
+    T const* dataPtr, DVec<float> const& cosVec, DVec<float> const& sinVec, uint32_t const rotaryDim)
 {
     DVec<T> result;
     DVec<T> input;
@@ -69,10 +71,39 @@ __device__ __forceinline__ DVec<T> vecApplyRopeNonInterleave(
     }
 }
 
-template <typename T>
-__global__ void applyRopeWriteKV(T* qkv, T* kvCache, T* qOut, float const* cosSinCache, int32_t const* kvCacheEndLens,
-    int32_t const* tokenPosIds, int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead,
-    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen)
+template <typename TCache>
+__device__ __forceinline__ void storeVec(
+    TCache* dst, int base, DVec<half> const& vec, float const* const scaleQuantOrig)
+{
+    if constexpr (std::is_same_v<TCache, half>)
+    {
+        // Save directly to dst
+        vec.store(dst + base);
+    }
+#if SUPPORTS_FP8
+    else if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
+    {
+        // Quantize and store to dst.
+        // If scaleQuantOrig is provided, it represents the dequant scale (quant -> orig),
+        // so quantization uses its reciprocal (orig -> quant).
+        DVec<__nv_fp8_e4m3> out;
+        float const invScale = (scaleQuantOrig != nullptr) ? (1.0f / scaleQuantOrig[0]) : 1.0f;
+#pragma unroll
+        for (uint32_t i = 0; i < DVec<half>::vec_size; ++i)
+        {
+            float const scaled = __half2float(vec[i]) * invScale;
+            out[i] = __nv_fp8_e4m3(scaled);
+        }
+        out.store(dst + base);
+    }
+#endif
+}
+
+template <typename T, typename TCache>
+__global__ void applyRopeWriteKV(T* qkv, TCache* kvCache, T* qOut, float const* cosSinCache,
+    int32_t const* kvCacheEndLens, int32_t const* tokenPosIds, float const* kvScaleQuantOrig, int32_t qSeqLen,
+    int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim,
+    uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen)
 {
     // Each CTA will process multiple tokens of a single head which each thread handles 16 / sizeof(T) elements.
     // blockDim.x: number of threads to process each token, blockDim.y: number of tokens processed by each CTA.
@@ -209,16 +240,19 @@ __global__ void applyRopeWriteKV(T* qkv, T* kvCache, T* qOut, float const* cosSi
                 + tokenIdxInCache * headDim + DVec<T>::vec_size * tIdx;
             int32_t cacheOffsetV = cacheOffsetSequence + (numKVHead + kvHeadIdx) * kvCacheCapacity * headDim
                 + tokenIdxInCache * headDim + DVec<T>::vec_size * tIdx;
-            kRoped.store(kvCache + cacheOffsetK);
-            vSrc.store(kvCache + cacheOffsetV);
+            float const* kScaleQuantOrig = kvScaleQuantOrig;
+            float const* vScaleQuantOrig = (kvScaleQuantOrig != nullptr) ? (kvScaleQuantOrig + 1) : nullptr;
+            storeVec(kvCache, cacheOffsetK, kRoped, kScaleQuantOrig);
+            storeVec(kvCache, cacheOffsetV, vSrc, vScaleQuantOrig);
         }
     }
 }
 
 void launchApplyRopeWriteKV(rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor const& cosSinCache,
     rt::OptionalInputTensor kvCacheEndLens, rt::OptionalInputTensor tokenPosIds, rt::OptionalOutputTensor qOut,
-    cudaStream_t stream)
+    rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream)
 {
+    auto const dt = kvCache.getDataType();
     // QKV has layout of [B, S, H_q + H_k + H_v, D]
     // CosSinCache always in layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
     // KVCache has layout of [B, 2, H_kv, S_cache_capacity, D]
@@ -243,7 +277,7 @@ void launchApplyRopeWriteKV(rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor con
 
     // Device pointers for required input / output tensors.
     half* qkvPtr = qkv.dataPointer<half>();
-    half* kvCachePtr = kvCache.dataPointer<half>();
+    float const* kvScaleQuantOrigPtr = nullptr;
     float const* cosSinCachePtr = cosSinCache.dataPointer<float>();
 
     // Device pointers for optional input / output tensors.
@@ -263,13 +297,37 @@ void launchApplyRopeWriteKV(rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor con
 
     dim3 grid(gDimX, gDimY);
     dim3 block(bDimX, bDimY);
-    applyRopeWriteKV<half><<<grid, block, 0, stream>>>(qkvPtr, kvCachePtr, qOutPtr, cosSinCachePtr, kvCacheEndLensPtr,
-        tokenPosIdsPtr, runtimeSeqLen, totalNumTokens, kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim,
-        cosSinCacheBatchSize, cosSinCacheSeqLen);
+
+    if (dt == nvinfer1::DataType::kHALF)
+    {
+        half* kvCachePtr = kvCache.dataPointer<half>();
+        applyRopeWriteKV<half, half><<<grid, block, 0, stream>>>(qkvPtr, kvCachePtr, qOutPtr, cosSinCachePtr,
+            kvCacheEndLensPtr, tokenPosIdsPtr, kvScaleQuantOrigPtr, runtimeSeqLen, totalNumTokens, kvCacheCapacity,
+            numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen);
+    }
+#if SUPPORTS_FP8
+    else if (dt == nvinfer1::DataType::kFP8)
+    {
+        check::check(!kvScaleQuantOrig.isEmpty(), "kvScaleQuantOrig is required for FP8 KV cache");
+        check::check(kvScaleQuantOrig.getDataType() == nvinfer1::DataType::kFLOAT, "kvScaleQuantOrig must be FP32.");
+        check::check(kvScaleQuantOrig.getShape().getNumDims() == 1 && kvScaleQuantOrig.getShape()[0] == 2,
+            "kvScaleQuantOrig shall have shape [2] with layout [kScaleQuantOrig, vScaleQuantOrig].");
+        kvScaleQuantOrigPtr = kvScaleQuantOrig.dataPointer<float>();
+
+        __nv_fp8_e4m3* kvCachePtr = kvCache.dataPointer<__nv_fp8_e4m3>();
+        applyRopeWriteKV<half, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(qkvPtr, kvCachePtr, qOutPtr, cosSinCachePtr,
+            kvCacheEndLensPtr, tokenPosIdsPtr, kvScaleQuantOrigPtr, runtimeSeqLen, totalNumTokens, kvCacheCapacity,
+            numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen);
+    }
+#endif
+    else
+    {
+        check::check(false, "Unsupported KV cache dtype");
+    }
 }
 
-void launchApplyRopeWriteKVPackedQKV(
-    rt::Tensor const& cosSinCache, rt::Tensor& qkv, rt::Tensor& kvCache, cudaStream_t stream)
+void launchApplyRopeWriteKVPackedQKV(rt::Tensor const& cosSinCache, rt::Tensor& qkv, rt::Tensor& kvCache,
+    rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream)
 {
     // Handle case where the QKV can be packed into a single tensor. This happens when there are no existing KVCache
     // values. We will overwrite QKV directly and instantiate the KVCache. Later attention kernel can directly perform
@@ -285,11 +343,11 @@ void launchApplyRopeWriteKVPackedQKV(
     check::check(cosSinCache.getShape()[0] == 1 || cosSinCache.getShape()[0] == qkv.getShape()[0],
         "CosSinCache shall have batch size 1 or equal to runtime batch size");
 
-    launchApplyRopeWriteKV(qkv, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, qOut, stream);
+    launchApplyRopeWriteKV(qkv, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, qOut, kvScaleQuantOrig, stream);
 }
 
 void launchApplyRopeWriteKVContinuousQAndKVCache(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
-    rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, cudaStream_t stream)
+    rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream)
 {
     // Handle case where there are existing KVCache values. Thus, we are unable to use packed QKV tensor for attention
     // computation. Here we will write write to a dedicated Q tensor and KVCache. Since there are existing KVCache
@@ -316,11 +374,12 @@ void launchApplyRopeWriteKVContinuousQAndKVCache(rt::Tensor const& cosSinCache, 
     check::check(cosSinCache.getShape()[0] == 1 || cosSinCache.getShape()[0] == batchSize,
         "CosSinCache shall have batch size 1 or equal to runtime batch size");
 
-    launchApplyRopeWriteKV(qkv, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, qOut, stream);
+    launchApplyRopeWriteKV(qkv, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, qOut, kvScaleQuantOrig, stream);
 }
 
 void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
-    rt::Tensor const& tokenPosIds, rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, cudaStream_t stream)
+    rt::Tensor const& tokenPosIds, rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut,
+    rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream)
 {
     // Special case where we need to perform tree attention for speculative decoding. The mapping between rope positions
     // are no longer consistent with the position to write KVCache. Thus we need the tokenPosIds to indicate the
@@ -342,7 +401,7 @@ void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tenso
     check::check(cosSinCache.getShape()[0] == 1 || cosSinCache.getShape()[0] == qkv.getShape()[0],
         "CosSinCache shall have batch size 1 or equal to runtime batch size");
 
-    launchApplyRopeWriteKV(qkv, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, qOut, stream);
+    launchApplyRopeWriteKV(qkv, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, qOut, kvScaleQuantOrig, stream);
 }
 
 } // namespace kernel

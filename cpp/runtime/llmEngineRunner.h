@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "common/hashUtils.h"
 #include "common/tensor.h"
 #include "runtime/linearKVCache.h"
 #include "runtime/llmRuntimeUtils.h"
@@ -44,23 +45,21 @@ struct LLMEngineRunnerConfig
     RopeConfig ropeConfig{};             //!< Type of rotary positional encoding
     bool useContextDependentRope{false}; //!< Use context-dependent RoPE
     bool enableEagleSpecDecode{false};   //!< Enable Eagle speculative decoding
-    bool isVlm{false};                   //!< Whether this is a Vision-Language Model
     int32_t numDecoderLayers{};          //!< Number of decoder layers
     int32_t numKVHeads{};                //!< Number of key-value heads
     int32_t headDim{};                   //!< Dimension of each attention head
     int32_t rotaryDim{};                 //!< Rotary embedding dimension
     int32_t hiddenSize{};                //!< Model's hidden dimension
     int32_t maxSupportedBatchSize{};     //!< Maximum supported batch size
-    int32_t minSupportedInputLength{};   //!< Minimum supported input length
     int32_t maxSupportedInputLength{};   //!< Maximum supported input length
     int32_t maxKVCacheCapacity{};        //!< Maximum KV cache capacity
     int32_t vocabSize{};                 //!< Vocabulary size (full vocabulary)
     int32_t reducedVocabSize{0};         //!< Reduced vocabulary size (0 if not using reduced vocab)
-    int32_t outputVocabSize{};      //!< Actual output vocabulary size (reducedVocabSize if enabled, else vocabSize)
-    int32_t maxSupportedLoraRank{}; //!< Maximum supported LoRA rank
-    int32_t outputHiddenDim{};      //!< Output hidden dimension for Eagle speculative decoding (hidden_size * 3)
-    int32_t maxVerifyTreeSize{};    //!< Maximum verification tree size for Eagle speculative decoding
-    int32_t numDeepstackFeatures{}; //!< Number of deepstack features for Qwen3-VL
+    int32_t outputVocabSize{};       //!< Actual output vocabulary size (reducedVocabSize if enabled, else vocabSize)
+    int32_t maxSupportedLoraRank{};  //!< Maximum supported LoRA rank
+    int32_t outputHiddenDim{};       //!< Output hidden dimension for Eagle speculative decoding (hidden_size * 3)
+    int32_t maxVerifyTreeSize{};     //!< Maximum verification tree size for Eagle speculative decoding
+    int32_t numDeepstackFeatures{0}; //!< Number of deepstack features for Qwen3-VL
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.
@@ -105,54 +104,56 @@ public:
     //! last
     //!     batch of requests and perform prefill operations to fill the KVCache and produce the output logits.
     //! Inputs:
-    //!     inputIds [GPU]: The input token_ids for the batch of new requests.
+    //!     inputsEmbeds [GPU]: The input embeddings for the batch of new requests [batchSize, seqLen, hiddenSize].
     //!     contextLengths [CPU]: The context lengths for each sequence in the batch.
-    //!     multimodalEmbeddings [GPU]: Optional. The multimodal embeddings for the batch of requests.
-    //!     extraInputTensors [GPU]: Optional. Extra input tensors (e.g., deepstack features for Qwen3-VL).
-    //!     outputLogits [GPU]: The output logits for the batch of requests..
-    //!     stream: The CUDA stream to execute the prefill stp.
+    //!     deepstackEmbeds [GPU]: Optional. Deepstack embeddings for Qwen3-VL (already embedded).
+    //!     outputLogits [GPU]: The output logits for the batch of requests.
+    //!     outputHiddenStates [GPU]: Optional. The output hidden states for Eagle speculative decoding.
+    //!     stream: The CUDA stream to execute the prefill step.
     //! Returns:
     //!     True if the prefill step is successful, false otherwise.
-    bool executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
-        rt::OptionalInputTensor multimodalEmbeddings, rt::OptionalInputTensors extraInputTensors,
-        rt::Tensor& outputLogits, rt::OptionalOutputTensor outputHiddenStates, cudaStream_t stream);
+    bool executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Tensor const& contextLengths,
+        rt::OptionalInputTensors deepstackEmbeds, rt::Tensor& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
+        cudaStream_t stream);
 
     //! API entry to execute one vanilla decoding engine action for a batched request. The API will perform decoding
     //!     operations fill the KVCache of the new generated tokens and produce the output logits. The decoding
     //!     operation shall be performed after the prefill step is completed.
     //! Inputs:
-    //!     inputIds [GPU]: The input token_ids for the batch of new requests.
-    //!     outputLogits [GPU]: The output logits for the batch of requests.
+    //!     inputsEmbeds [GPU]: The input embeddings for the batch of new requests [batchSize, 1, hiddenSize].
     //!     stream: The CUDA stream to execute the decoding step.
+    //! Outputs:
+    //!     outputLogits [GPU]: The output logits for the batch of requests.
     //! Returns:
     //!     True if the decoding step is successful, false otherwise.
-    bool executeVanillaDecodingStep(rt::Tensor const& inputIds, rt::Tensor& outputLogits, cudaStream_t stream);
+    bool executeVanillaDecodingStep(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, cudaStream_t stream);
 
-    //! API entry to execute eagle base tree decoding step. The API will takes a draft tree of input_token_ids.
+    //! API entry to execute eagle base tree decoding step. The API will takes a draft tree of input embeddings.
     //!     baseTreeDecodingMask denote the relationship between the draft tree nodes.
     //! Inputs:
-    //!     baseTreeDecodingInputIds [GPU, Int32]: Input token_ids for the base model with shape [1, Tree-Size].
-    //!     baseTreeDecodingMask [GPU, Int32]: Denote the relationship between the base tree nodes with shape
-    //!         [1, Tree-Size, Tree-Size].
+    //!     baseTreeDecodingInputsEmbeds [GPU, Float16]: Input embeddings for the base model with shape [batchSize,
+    //!     Tree-Size, hiddenSize]. baseTreeDecodingMask [GPU, Int32]: Denote the relationship between the base tree
+    //!     nodes with shape
+    //!         [batchSize, Tree-Size, Tree-Size].
     //!     stream: The CUDA stream to execute the base tree decoding step.
     //! Outputs:
-    //!     outputLogits [GPU, Float16]: The output logits with shape [topK, base-Vocab-Size].
-    //!     outputHiddenStates [GPU]: The output hidden states with shape [topK, base-hidden-dim].
-    bool executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputIds,
+    //!     outputLogits [GPU, Float16]: The output logits with shape [batchSize*Tree-Size, base-Vocab-Size].
+    //!     outputHiddenStates [GPU]: The output hidden states with shape [batchSize*Tree-Size, base-hidden-dim].
+    bool executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputsEmbeds,
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
         cudaStream_t stream);
 
     //! API entry to capture the CUDA graph for the decoding step. If CUDA graph capture is successful, later
     //!     call to executeVanillaDecodingStep() will always launch the captured CUDA graph.
     //! Inputs:
-    //!     inputIds [GPU]: The input token_ids for the batch of new requests.
+    //!     inputsEmbeds [GPU]: The input embeddings for the batch of new requests [batchSize, 1, hiddenSize].
     //!     outputLogits [GPU]: The output logits for the batch of requests.
     //!     loraWeightsName: The name to the LoRA weights. Empty string if no LoRA weights.
     //!     stream: The CUDA stream to execute the decoding step.
     //! Returns:
     //!     True if the CUDA graph capture is successful, false otherwise.
-    bool captureVanillaDecodingCudaGraph(
-        rt::Tensor const& inputIds, rt::Tensor& outputLogits, std::string const& loraWeightsName, cudaStream_t stream);
+    bool captureVanillaDecodingCudaGraph(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits,
+        std::string const& loraWeightsName, cudaStream_t stream);
 
     //! API entry to switch the LoRA weights of the LLM engine.
     //! Inputs:
@@ -176,32 +177,39 @@ public:
     //! later
     //!     call to executeEagleBaseTreeDecodingStep() will always launch the captured CUDA graph.
     //! Inputs:
-    //!     baseTreeDecodingInputIds [GPU, Int32]: Input token_ids for the base model with shape [1, Tree-Size].
-    //!     baseTreeDecodingMask [GPU, Int32]: Denote the relationship between the base tree nodes with shape
-    //!         [1, Tree-Size, Tree-Size].
-    //!     outputLogits [GPU, Float16]: The output logits with shape [topK, base-Vocab-Size].
-    //!     outputHiddenStates [GPU]: The output hidden states with shape [topK, base-hidden-dim].
+    //!     baseTreeDecodingInputsEmbeds [GPU, Float16]: Input embeddings for the base model with shape [batchSize,
+    //!     Tree-Size, hiddenSize]. baseTreeDecodingMask [GPU, Int32]: Denote the relationship between the base tree
+    //!     nodes with shape
+    //!         [batchSize, Tree-Size, Tree-Size].
+    //!     outputLogits [GPU, Float16]: The output logits with shape [batchSize*Tree-Size, base-Vocab-Size].
+    //!     outputHiddenStates [GPU]: The output hidden states with shape [batchSize*Tree-Size, base-hidden-dim].
     //!     stream: The CUDA stream to capture the CUDA graph. The API will capture the CUDA graph for the base tree
     //!     decoding step.
     //! Returns:
     //!     True if the CUDA graph capture is successful, false otherwise.
-    bool captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& baseTreeDecodingInputIds,
+    bool captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& baseTreeDecodingInputsEmbeds,
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
         cudaStream_t stream);
 
+    //! Key to uniquely identify a captured CUDA graph for the decoding step
+    using DecodingGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, std::string>;
+
+    //! Key to uniquely identify a captured CUDA graph for the base model verification step
+    using BaseGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, uintptr_t>;
+
 private:
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;                          //!< TensorRT runtime
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                        //!< TensorRT engine
-    rt::Tensor mExecContextMemory{};                                       //!< Device memory for the execution contexts
-    std::unique_ptr<nvinfer1::IExecutionContext> mPrefillExecutionContext; //!< Prefill execution context
-    std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext; //!< Generation execution context
-    //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique hash value
+    std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime
+    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine
+    rt::Tensor mExecContextMemory{};                                   //!< Device memory for the execution contexts
+    std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext; //!< Prefill and Generation execution context
+
+    //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique key value
     //! which denote the input/output shapes and other execution properties like LoRA weights.
-    std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mCudaGraphs;
+    hash_utils::HashMap<DecodingGraphKey, std::pair<cudaGraph_t, cudaGraphExec_t>> mCudaGraphs;
 
     //! Holds the CUDA graph captured for the base model verification step. Each CUDA graph is associated with a unique
-    //! hash value which denote the input/output shapes and other execution properties.
-    std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mBaseTreeDecodingCudaGraphs;
+    //! key value which denote the input/output shapes and other execution properties.
+    hash_utils::HashMap<BaseGraphKey, std::pair<cudaGraph_t, cudaGraphExec_t>> mBaseTreeDecodingCudaGraphs;
 
     //! Holds the LoRA weights for the LLM engine.
     std::unordered_map<std::string, std::vector<rt::Tensor>> mLoraWeights{};
@@ -228,9 +236,13 @@ private:
     //! The LinearKVCache tensor that carried for the LLM model execution.
     rt::LinearKVCache mKVCache{};
 
-    //! Dummy tensor used to reserved space for un-used input tensors. Apply this workaround since TensorRT
-    //! does not support nullptr for input bindings.
-    rt::Tensor mDummyTensor{};
+    //! Dummy input tensor used to reserve space for unused input tensors. We always keep this tensor as zero tensor
+    //! because to "void" some computation (ex. use as empty lora weights as if there is no LoRA GEMM).
+    rt::Tensor mDummyInputTensor{};
+
+    //! Dummy output tensor used to reserve space for unused output tensors. TRT engines have static I/O, to keep
+    //! runtime design clean, we will route unused output tensors to this dummy tensor.
+    rt::Tensor mDummyOutputTensor{};
 
     //! The eagle base position ids tensor within the sequence that used by positional encoding.
     rt::Tensor mEagleBasePositionIds{};
@@ -252,22 +264,22 @@ private:
     bool validateConfigFromEngine();
 
     /*!
-     * @brief Bind KV cache to engine for new requests
+     * @brief Bind KV cache to engine for prefill and generation of new requests
      * @param activeBatchSize Number of active sequences
      * @return True on success, false on failure
      */
     bool bindKVCacheToEngine(int32_t activeBatchSize);
 
     //! @brief Validate inputs for prefill step
-    bool prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
+    bool prefillStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& contextLengths,
         rt::Tensor const& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
-        rt::OptionalInputTensor multimodalEmbeddings, rt::OptionalInputTensors extraInputTensors);
+        rt::OptionalInputTensors deepstackEmbeds);
 
     //! @brief Validate inputs for vanilla decoding step
-    bool vanillaDecodingStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& outputLogits);
+    bool vanillaDecodingStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits);
 
     //! @brief Validate inputs for Eagle base tree decoding step
-    bool eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputIds,
+    bool eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputsEmbeds,
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
 
     //! The Function is used to add a LoRA weights to the LLM engine.

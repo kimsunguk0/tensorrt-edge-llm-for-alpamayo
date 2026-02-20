@@ -77,15 +77,18 @@ struct LLMGenerationRequest
     int64_t topK;                    //!< Top-k sampling parameter
     int64_t maxGenerateLength;       //!< Max length of the generated tokens
     std::string loraWeightsName{""}; //!< Name of the LoRA weights. Default to empty string for no LoRA weights
-    bool saveSystemPromptKVCache{
-        false}; //!< Whether to save system prompt KV cache of this request to be used by later requests
+
+    // Whether to save system prompt KV cache of this request to be used by later requests
+    bool saveSystemPromptKVCache{false};
+    // Whether to apply chat template formatting. If false, raw messages will be concatenated without special tokens
     bool applyChatTemplate{true};
-    //!< Whether to apply chat template formatting. If false, raw messages will be concatenated without special tokens
+    // Whether to add generation prompt (e.g., assistant header) at the end. Only effective when
+    // applyChatTemplate=true..
     bool addGenerationPrompt{true};
-    //!< Whether to add generation prompt (e.g., assistant header) at the end. Only effective when
-    //!< applyChatTemplate=true
+    // Whether to enable thinking mode for models that support it. Default is disabled.
     bool enableThinking{false};
-    //!< Whether to enable thinking mode for models that support it. Default is disabled
+    // Always disable speculative decoding for this request even if Eagle Draft engine is loaded.
+    bool disableSpecDecode{false};
 };
 
 /*! \brief LLM Generation Response structure

@@ -43,6 +43,22 @@ struct SystemPromptKVCache
 namespace rt
 {
 /*!
+ * @brief Batch result data for a single sequence
+ *
+ * Encapsulates all data needed to track a batch's execution results,
+ * whether it's active or evicted. Groups related fields together for
+ * better cache locality and maintainability.
+ */
+struct BatchResult
+{
+    std::vector<int32_t> tokenIds;           //!< Generated token IDs
+    std::vector<int32_t> rawBatchedInputIds; //!< Original input token IDs
+    int32_t generateLength{0};               //!< Number of tokens generated
+    int32_t actualIterations{0};             //!< Number of iterations executed
+    int32_t effectivePrefillLength{0};       //!< Effective prefill length (excluding reused KVCache length)
+};
+
+/*!
  * @brief Execution context for speculative decode runtime
  *
  * Holds execution information and intermediate metadata during inference.
@@ -55,40 +71,31 @@ struct SpecDecodeInferenceContext
                                                           //!< and removal of reused system IDs)
     std::vector<std::vector<int32_t>> tokenIds;           //!< Token IDs for each sequence: [batch_size][seq_length]
     std::vector<int32_t> currentGenerateLengths;          //!< Current generation length for each sequence: [batch_size]
-    std::vector<int32_t> promptLengths; //!< Prompt length (after reuse) for each sequence: [batch_size]
+    std::vector<int32_t>
+        effectivePrefillLengths;        //!< Effective prefill length (excluding reused KVCache length) [batch_size]
     std::vector<int8_t> finishedStates; //!< Finished state for each sequence: [batch_size] (0=not finished, 1=finished)
-    std::vector<int32_t> actualIterations; //!< Actual iterations run for each sequence: [batch_size]
-    int32_t packedInputLength; //!< Packed input length for batch processing (max of all sequences, considering engine
-                               //!< constraints)
 
-    // Evicted batch results (saved before eviction for final output)
-    // Key: original batch index, Value: batch data
-    std::unordered_map<int32_t, std::vector<int32_t>> evictedTokenIds; //!< Token IDs of evicted batches
-    std::unordered_map<int32_t, int32_t> evictedGenerateLengths;       //!< Generation lengths of evicted batches
-    std::unordered_map<int32_t, int32_t> evictedActualIterations;      //!< Iterations of evicted batches
-    std::unordered_map<int32_t, std::string> evictedSystemPrompts;     //!< System prompts of evicted batches
-    std::unordered_map<int32_t, std::vector<int32_t>> evictedRawBatchedInputIds; //!< Raw input IDs of evicted batches
-    std::unordered_map<int32_t, int32_t> evictedPromptLengths;                   //!< Prompt lengths of evicted batches
-    std::vector<int32_t> batchIndexMapping;       //!< Maps current batch index to original index
-    rt::OptionalInputTensor multimodalEmbeddings; //!< Optional multimodal embeddings
-    rt::OptionalInputTensors extraInputTensors;   //!< Extra input tensors (e.g., deepstack features)
-    int32_t generationRound;                      //!< Current generation round (shared across all batches)
-    int32_t maxGenerateLength;                    //!< Maximum generation length
-    int32_t activeBatchSize;                      //!< Current active batch size
-    int32_t originalBatchSize;                    //!< Original batch size (before any eviction)
-    int32_t genAndSaveSystemCacheIndex; //!< Batch index being processed for generating and saving system prompt KVCache
-    cudaStream_t stream;                //!< CUDA stream
+    // Completed batch results (saved before eviction for final output)
+    // Key: original batch index, Value: complete batch result data
+    std::unordered_map<int32_t, BatchResult> completedBatches; //!< Results of completed batches (unified storage)
+    std::vector<int32_t> batchIndexMapping;                    //!< Maps current batch index to original index
+    rt::OptionalInputTensor multimodalEmbeddings;              //!< Optional multimodal embeddings
+    rt::OptionalInputTensors deepstackFeatures; //!< Deepstack features for Qwen3-VL (raw features before embedding)
+    int32_t generationRound;                    //!< Current generation round (shared across all batches)
+    int32_t maxGenerateLength;                  //!< Maximum generation length
+    int32_t activeBatchSize;                    //!< Current active batch size
+    cudaStream_t stream;                        //!< CUDA stream
 
     /*!
      * @brief Initialize the context with given parameters
      * @param batchSize Active batch size
      * @param maxGenLength Maximum generation length
      * @param multimodal Optional multimodal embeddings
-     * @param extraInputTensors Extra input tensors (e.g., deepstack features)
+     * @param deepstackFeatures Deepstack features for Qwen3-VL (raw features before embedding)
      * @param cudaStream CUDA stream for operations
      */
     void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& multimodal,
-        rt::OptionalInputTensors const& extraInputTensors, cudaStream_t cudaStream);
+        rt::OptionalInputTensors const& deepstackFeatures, cudaStream_t cudaStream);
 };
 
 /*!
@@ -124,20 +131,17 @@ public:
 
     //! @brief Destructor
     ~LLMInferenceSpecDecodeRuntime() = default;
-    //! @brief Capture CUDA graph for draft proposal
-    //! @param stream CUDA stream
-    //! @return True on success, false on failure
-    bool captureDraftProposalCudaGraph(cudaStream_t stream);
 
-    //! @brief Capture CUDA graph for draft accept decode token
+    //! @brief Capture CUDA graphs for Eagle decoding stages to optimize performance.
+    //!
+    //! Captures graphs for draft proposal, draft accept token, base verification, and
+    //! base vanilla decoding across all supported batch sizes.
+    //!
     //! @param stream CUDA stream
-    //! @return True on success, false on failure
-    bool captureDraftAcceptDecodeTokenCudaGraph(cudaStream_t stream);
-
-    //! @brief Capture CUDA graph for base verification
-    //! @param stream CUDA stream
-    //! @return True on success, false on failure
-    bool captureBaseVerificationCudaGraph(cudaStream_t stream);
+    //! @return True if all stage captures succeed, false otherwise
+    //! @note If capture fails for any stage, the inference can proceed without CUDA graph capture,
+    //! but at cost of performance degradation.
+    bool captureDecodingCudaGraph(cudaStream_t stream);
 
     /*!
      * @brief Handle generation request
@@ -172,17 +176,21 @@ private:
     LLMEngineRunnerConfig mBaseEngineConfig;         //!< Base engine configuration
     EagleDraftEngineRunnerConfig mDraftEngineConfig; //!< Draft engine configuration
 
-    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;                       //!< Base model engine runner
-    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;               //!< Draft model engine runner
-    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr};             //!< Multimodal runner (optional)
-    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;                         //!< Tokenizer
-    std::unordered_map<size_t, SystemPromptKVCache> mSystemPromptKVCacheBase; //!< System prompt KVCache for base model
-    std::unordered_map<size_t, SystemPromptKVCache>
+    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;           //!< Base model engine runner
+    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;   //!< Draft model engine runner
+    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner (optional)
+    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;             //!< Tokenizer
+    std::unordered_map<std::string, SystemPromptKVCache>
+        mSystemPromptKVCacheBase; //!< System prompt KVCache for base model
+    std::unordered_map<std::string, SystemPromptKVCache>
         mSystemPromptKVCacheDraft; //!< System prompt KVCache for draft model
 
     // Pre-define key runtime GPU tensors and initialize them during construction.
     // [1] I/O Tensors to work with base and eagle draft engine.
-    rt::Tensor mIdsInput;
+    rt::Tensor mEmbeddingTable;               //!< Embedding table [vocabSize, hiddenSize]
+    rt::Tensor mIdsInput;                     //!< Input token IDs (used for embedding lookup)
+    rt::Tensor mInputsEmbeds;                 //!< Input embeddings (after embedding lookup)
+    std::vector<rt::Tensor> mDeepstackEmbeds; //!< Deepstack embeddings for Qwen3-VL (one per feature)
     rt::Tensor mContextLengthsInput;
     rt::Tensor mLogitsOutput;
     rt::Tensor mDraftTreeSize;
@@ -248,8 +256,11 @@ private:
     // token of the accepted sequence.
     bool runDraftModelAcceptToken(SpecDecodeInferenceContext& context);
 
+    // Consume the token sequence & KVCache to produce the next token directly.
+    bool runVanillaDecoding(SpecDecodeInferenceContext& context);
+
     // Consume system prompt, produce the hash table of system prompt KVCache if kv cache reuse is enabled.
-    bool genAndSaveSystemPromptKVCache(SpecDecodeInferenceContext& context);
+    bool genAndSaveSystemPromptKVCache(SpecDecodeInferenceContext& context, int32_t genAndSaveBatchIdx);
 
     // Consume batched input ids and the hash table of system prompt KVCache, produce the padded input ids and input
     // lengths. Instantiate the KVCache from the hash table if the system prompt has been cached.

@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 
+#include "common/cudaMacros.h"
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
@@ -52,12 +53,15 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
 //!
 //! Converts an input tensor in [B, 2, H, S, D] into [B, S, 2, H, D].
 //!
-//! \tparam T Element type (e.g. float, half, bfloat16, etc.).
+//! \tparam T Element type (half/fp8).
 //!
 //! \param[in] src    Source tensor with shape [B, 2, H, S, D].
 //! \param[out] dst   Destination tensor with shape [B, S, 2, H, D].
+//! \param[in] kvScaleQuantOrig Optional packed dequant scale tensor for FP8 KV cache (shape [2], float).
+//!            Layout: [kScaleQuantOrig, vScaleQuantOrig].
 //! \param[in] stream CUDA stream to launch the kernel on
-void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, cudaStream_t stream);
+void cvtKVLayoutBHSDToBSHD(
+    rt::Tensor const& src, rt::Tensor& dst, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

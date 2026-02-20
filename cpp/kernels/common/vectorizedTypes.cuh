@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "common/cudaMacros.h"
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -149,6 +150,53 @@ struct DVec<half>
     }
 };
 //! \endcond
+
+#if SUPPORTS_FP8
+//! \cond INTERNAL
+/*!
+ * @brief Vectorization specialization for fp8[8]
+ *
+ * Vectorization for FP8 E4M3 precision data.
+ * Uses uint2 (8 bytes) for optimal memory coalescing.
+ */
+template <>
+struct DVec<__nv_fp8_e4m3>
+{
+    uint2 data;                             //!< Storage for 8 fp8 as uint2 (8 bytes)
+    static constexpr uint32_t vec_size = 8; //!< Vector size
+
+    //! @brief Access element at index
+    //! @param idx Element index (0-7)
+    //! @return Reference to fp8 element
+    __device__ __forceinline__ __nv_fp8_e4m3& operator[](uint32_t idx)
+    {
+        return reinterpret_cast<__nv_fp8_e4m3*>(&data)[idx];
+    }
+
+    //! @brief Access element at index (const)
+    //! @param idx Element index (0-7)
+    //! @return Const reference to fp8 element
+    __device__ __forceinline__ __nv_fp8_e4m3 const& operator[](uint32_t idx) const
+    {
+        return reinterpret_cast<__nv_fp8_e4m3 const*>(&data)[idx];
+    }
+
+    //! @brief Load 8 fp8 from global memory
+    //! @param ptr Source pointer (must be 8-byte aligned)
+    __device__ __forceinline__ void load(__nv_fp8_e4m3 const* ptr)
+    {
+        data = *(reinterpret_cast<uint2 const*>(ptr));
+    }
+
+    //! @brief Store 8 fp8 to global memory
+    //! @param ptr Destination pointer (must be 8-byte aligned)
+    __device__ __forceinline__ void store(__nv_fp8_e4m3* ptr) const
+    {
+        *(reinterpret_cast<uint2*>(ptr)) = data;
+    }
+};
+//! \endcond
+#endif
 
 } // namespace kernel
 } // namespace trt_edgellm

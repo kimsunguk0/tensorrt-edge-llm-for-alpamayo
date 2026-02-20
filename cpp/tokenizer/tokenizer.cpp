@@ -16,6 +16,7 @@
  */
 
 #include "tokenizer.h"
+#include "common/inputLimits.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizerUtils.h"
 #include <fstream>
@@ -29,9 +30,6 @@ namespace trt_edgellm
 {
 namespace tokenizer
 {
-
-// File size limits for configuration files
-constexpr size_t MAX_CONFIG_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100MB limit for config files
 
 // Chat template role names
 constexpr char kRoleSystem[] = "system";
@@ -129,7 +127,7 @@ bool Tokenizer::parseTokenizerConfig(
     std::filesystem::path const& tokenizerFile, TokenToRanks& vocab, TokenToRanks& specialTokens)
 {
     // Validate file size before reading
-    if (!validateFileSize(tokenizerFile, MAX_CONFIG_FILE_SIZE_BYTES))
+    if (!validateFileSize(tokenizerFile, limits::tokenizer::kMaxConfigFileSizeBytes))
     {
         return false;
     }
@@ -198,7 +196,7 @@ bool Tokenizer::parseTokenizerConfig(
 bool Tokenizer::parseSpecialTokenConfig(std::filesystem::path const& configFile, TokenToRanks& specialTokens)
 {
     // Validate file size before reading
-    if (!validateFileSize(configFile, MAX_CONFIG_FILE_SIZE_BYTES))
+    if (!validateFileSize(configFile, limits::tokenizer::kMaxConfigFileSizeBytes))
     {
         return false;
     }
@@ -448,6 +446,14 @@ std::vector<Rank> Tokenizer::encode(std::string const& text, bool addBos, bool a
         return {};
     }
 
+    // Validate input text size before any processing to prevent expensive operations on oversized input
+    if (text.size() > limits::tokenizer::kMaxInputTextSizeBytes)
+    {
+        LOG_ERROR(
+            "Input text too large (%zu bytes, max: %zu).", text.size(), limits::tokenizer::kMaxInputTextSizeBytes);
+        return {};
+    }
+
     std::vector<Rank> output;
     output.reserve(text.size() + (addBos ? 1 : 0) + (addEos ? 1 : 0));
 
@@ -650,7 +656,7 @@ bool Tokenizer::loadChatTemplate(std::filesystem::path const& chatTemplateFile)
     }
 
     // Validate file size before reading
-    if (!validateFileSize(chatTemplateFile, MAX_CONFIG_FILE_SIZE_BYTES))
+    if (!validateFileSize(chatTemplateFile, limits::tokenizer::kChatTemplateFileSizeBytes))
     {
         return false;
     }

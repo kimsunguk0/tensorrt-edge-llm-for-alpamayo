@@ -17,6 +17,7 @@
 
 #include "phi4mmViTRunner.h"
 #include "common/bindingNames.h"
+#include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
@@ -392,7 +393,7 @@ void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
 
 void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, std::vector<int64_t> const& numImages,
-    std::vector<int64_t> const& imageTokenLengths, tokenizer::Tokenizer* tokenizer)
+    std::vector<int64_t> const& imageTokenLengths, tokenizer::Tokenizer const* tokenizer)
 {
     if (numImages.size() != request.requests.size())
     {
@@ -410,6 +411,7 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     {
         // Use the formatted complete request
         std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
+        check::check(!ids.empty(), "Phi4MMViTRunner::textPreprocess() Failed to encode text");
 
         // Replace image placeholder tokens with sequential image token IDs
         std::vector<int32_t> newIds;
@@ -436,7 +438,7 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 }
 
 bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
-    std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer* tokenizer,
+    std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
     rt::Tensor& /*ropeRotaryCosSinDevice*/, cudaStream_t stream)
 {
     std::vector<int64_t> imageTokenLengths;

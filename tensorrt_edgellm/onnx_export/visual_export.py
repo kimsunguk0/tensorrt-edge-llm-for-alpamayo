@@ -21,7 +21,6 @@ This module provides functions to export visual components of multimodal models
 
 import json
 import os
-import shutil
 from typing import Optional
 
 import torch
@@ -36,6 +35,8 @@ from tensorrt_edgellm.visual_models.qwen2_5_vl_model import (
     Qwen2_5_VisionTransformerPretrainedModelPatch, export_qwen2_5_vl_visual)
 from tensorrt_edgellm.visual_models.qwen2_vl_model import (
     Qwen2VisionTransformerPretrainedModelPatch, export_qwen2_vl_visual)
+from tensorrt_edgellm.visual_models.qwen3_omni_model import (
+    Qwen3OmniVisionModelPatch, export_qwen3_omni_visual)
 from tensorrt_edgellm.visual_models.qwen3_vl_model import (
     Qwen3VLVisionModelPatch, export_qwen3_vl_visual)
 
@@ -145,6 +146,29 @@ def visual_export(model_dir: str,
         # Export using the wrapper's export function
         export_qwen3_vl_visual(wrapped_model, output_dir, torch_dtype)
 
+    elif model_type == 'qwen3_omni':
+        print(f"Exporting Qwen3-Omni visual model from {model_dir}")
+        # Qwen3-Omni uses the following structure: model.thinker.visual
+        assert hasattr(model, 'thinker') and hasattr(
+            model.thinker, 'visual'
+        ), f"Could not find visual encoder in Qwen3-Omni model structure"
+
+        # Create Qwen3-Omni wrapper model (extends Qwen3-VL)
+        wrapped_model = Qwen3OmniVisionModelPatch._from_config(
+            model.thinker.visual.config,
+            torch_dtype=torch_dtype,
+        )
+        # Load weights with automatic key mapping
+        wrapped_model.load_omni_state_dict(model.thinker.visual.state_dict())
+        wrapped_model.eval().to(device)
+        # Apply quantization to wrapped model if requested
+        if quantization == "fp8":
+            wrapped_model = quantize_visual(wrapped_model, quantization,
+                                            processor, dataset_dir)
+
+        # Export using the Qwen3-Omni export function (which calls Qwen3-VL export)
+        export_qwen3_omni_visual(wrapped_model, output_dir, torch_dtype)
+
     elif model_type == 'internvl':
         print(f"Exporting InternVL3 visual model from {model_dir}")
         # Create InternVL3 wrapper model
@@ -176,14 +200,19 @@ def visual_export(model_dir: str,
         raise ValueError(f"Unsupported model type: {model_type}")
 
     # Export model configuration to JSON
-    config_dict = export_vision_config(model.config)
+    config_dict = export_vision_config(
+        model.config.thinker_config if model_type ==
+        'qwen3_omni' else model.config)
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(config_dict, f, indent=2)
 
     # Export processor configuration to JSON if exists
-    if os.path.exists(os.path.join(model_dir, "preprocessor_config.json")):
-        shutil.copy(os.path.join(model_dir, "preprocessor_config.json"),
-                    os.path.join(output_dir, "preprocessor_config.json"))
+    if processor is not None:
+        # Phi4MMProcessor may not define audio_tokenizer, but transformers'
+        # save_pretrained expects the attribute.
+        if not hasattr(processor, "audio_tokenizer"):
+            processor.audio_tokenizer = None
+        processor.save_pretrained(output_dir)
 
     print(
         f"Visual export completed for {model_type} with dtype={dtype}, quantization={quantization}, device={device}"

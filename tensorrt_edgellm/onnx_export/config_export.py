@@ -169,7 +169,6 @@ def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
     config_class_name = config.__class__.__name__
     model_name = config_class_name.lower().replace('config', '')
 
-    # For other model types, use text_config if available
     if "text_config" in config_dict:
         print("Detected multimodal model, using text_config")
         config_dict = config_dict["text_config"]
@@ -190,3 +189,17 @@ def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
     output_config['edgellm_version'] = __version__
 
     return output_config
+
+
+def export_audio_config(config: Any) -> Dict[str, Any]:
+    """Export audio configuration without modification."""
+    config_dict = config.to_dict()
+
+    has_audio = "audio_config" in config_dict
+    if not (has_audio):
+        raise KeyError("Required field 'audio_config' not found in config")
+    # Add TensorRT Edge-LLM version
+    config_dict['edgellm_version'] = __version__
+
+    # Return the original config_dict as-is without any modification
+    return config_dict

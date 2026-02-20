@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "cudaMacros.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
 #include <array>
@@ -69,6 +70,14 @@ struct is_arithmetic_ext<__nv_bfloat16> : std::true_type
 {
 };
 
+#if SUPPORTS_FP8
+//! @brief Specialization for fp8 precision floating point
+template <>
+struct is_arithmetic_ext<__nv_fp8_e4m3> : std::true_type
+{
+};
+#endif
+
 //! Array of dimensions that used to store the shape of a tensor.
 //! Support up to 8 dimensions with all dimensions are non-negative.
 //! Default constructor create empty coords with 0 dimensions and 0 volumes.
@@ -106,6 +115,17 @@ public:
     {
         std::copy(dims.d, dims.d + mNumDims, mDims.begin());
     }
+
+    //! @brief Equality comparison operator
+    //! @param other Coords object to compare with
+    //! @return True if both Coords have the same number of dimensions
+    //!         and all corresponding dimension values are equal, false otherwise
+    bool operator==(Coords const& other) const noexcept;
+
+    //! @brief Inequality comparison operator
+    //! @param other Coords object to compare with
+    //! @return True if the Coords are not equal (i.e., operator== returns false), false otherwise
+    bool operator!=(Coords const& other) const noexcept;
 
     /*!
      * @brief Construct from iterator range

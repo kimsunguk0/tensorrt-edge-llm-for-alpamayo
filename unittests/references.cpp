@@ -17,14 +17,17 @@
 
 #include "references.h"
 
+#include "common/cudaMacros.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cuda.h>
 #include <limits>
 
-std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<half> const& k, std::vector<half> const& v,
+template <typename T>
+std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> const& k, std::vector<T> const& v,
     int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    std::optional<std::vector<int32_t>> const& treeAttnMask)
+    std::optional<std::vector<int32_t>> const& treeAttnMask, float const kScaleQuantOrig, float const vScaleQuantOrig)
 {
     assert(qlen <= kvlen);
     int32_t const numQheadPerKV = numQHeads / numKVHeads;
@@ -52,7 +55,16 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<hal
                 for (int32_t valIdx = 0; valIdx < headSize; ++valIdx)
                 {
                     float qVal = __half2float(q[qoIndexer(tokenIdx, qHeadIdx, valIdx)]);
-                    float kvVal = __half2float(k[kvIndexer(kvIdx, kvHeadIdx, valIdx)]);
+                    float kvVal;
+                    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+                    {
+                        kvVal = static_cast<float>(k[kvIndexer(kvIdx, kvHeadIdx, valIdx)])
+                            * kScaleQuantOrig; // FP8 -> FP32
+                    }
+                    else
+                    {
+                        kvVal = __half2float(k[kvIndexer(kvIdx, kvHeadIdx, valIdx)]); // half -> FP32
+                    }
                     attnScores[kvIdx] += qVal * kvVal * qkScale;
                 }
 
@@ -91,7 +103,18 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<hal
                 float outVal = 0.0F;
                 for (int32_t kvIdx = 0; kvIdx < kvlen; ++kvIdx)
                 {
-                    outVal += attnScores[kvIdx] * __half2float(v[kvIndexer(kvIdx, kvHeadIdx, valIdx)]);
+                    float vVal;
+                    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+                    {
+                        // Dequantize FP8 value back to original range using vScaleQuantOrig
+                        vVal = static_cast<float>(v[kvIndexer(kvIdx, kvHeadIdx, valIdx)])
+                            * vScaleQuantOrig; // FP8 -> FP32
+                    }
+                    else
+                    {
+                        vVal = __half2float(v[kvIndexer(kvIdx, kvHeadIdx, valIdx)]); // half -> FP32
+                    }
+                    outVal += attnScores[kvIdx] * vVal;
                 }
                 result[qoIndexer(tokenIdx, qHeadIdx, valIdx)] = __float2half(outVal);
             }
@@ -100,6 +123,19 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<hal
 
     return result;
 }
+
+// Explicit template instantiations for attention reference used in unit tests
+template std::vector<half> casualAttentionRef<half>(std::vector<half> const& q, std::vector<half> const& k,
+    std::vector<half> const& v, int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headSize, std::optional<std::vector<int32_t>> const& treeAttnMask, float const kScaleQuantOrig,
+    float const vScaleQuantOrig);
+
+#if SUPPORTS_FP8
+template std::vector<half> casualAttentionRef<__nv_fp8_e4m3>(std::vector<half> const& q,
+    std::vector<__nv_fp8_e4m3> const& k, std::vector<__nv_fp8_e4m3> const& v, int32_t const qlen, int32_t kvlen,
+    int32_t numQHeads, int32_t numKVHeads, int32_t headSize, std::optional<std::vector<int32_t>> const& treeAttnMask,
+    float const kScaleQuantOrig, float const vScaleQuantOrig);
+#endif
 
 std::vector<half> ropeRef(std::vector<half> const& input, int32_t const numHeads, int32_t const headSize,
     int32_t const rotaryDim, int32_t const seqIdx, float const ropeScale, float const ropeTheta, bool const permute)
@@ -523,6 +559,122 @@ std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::
                     {
                         embeddingValue = __float2half(0.0f);
                     }
+                }
+
+                result[resultIdx] = embeddingValue;
+            }
+        }
+    }
+
+    return result;
+}
+
+std::vector<half> embeddingLookupMultimodalRef(std::vector<int32_t> const& inputIds,
+    std::vector<half> const& embeddingTable, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
+    std::vector<int32_t> const& multimodalIndices, int32_t imageTokenId, std::vector<half> const& imageEmbeds,
+    int64_t imageTokenLen, int32_t audioTokenId, std::vector<half> const& audioEmbeds, int64_t audioTokenLen)
+{
+    std::vector<half> result(batchSize * seqLen * hiddenSize, __float2half(0.0f));
+
+    for (int64_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
+        {
+            int64_t const linearIdx = batchIdx * seqLen + tokenIdx;
+            int32_t const tokenId = inputIds[linearIdx];
+
+            for (int64_t elementIdx = 0; elementIdx < hiddenSize; ++elementIdx)
+            {
+                int64_t const resultIdx = linearIdx * hiddenSize + elementIdx;
+
+                half embeddingValue;
+                if (tokenId == imageTokenId)
+                {
+                    // Image token: use multimodalIndices to get the index into imageEmbeds
+                    int32_t const imageIdx = multimodalIndices[linearIdx];
+                    if (imageIdx >= 0 && imageIdx < imageTokenLen)
+                    {
+                        int64_t const imageEmbedIdx = imageIdx * hiddenSize + elementIdx;
+                        embeddingValue = imageEmbeds[imageEmbedIdx];
+                    }
+                    else
+                    {
+                        embeddingValue = __float2half(0.0f);
+                    }
+                }
+                else if (tokenId == audioTokenId)
+                {
+                    // Audio token: use multimodalIndices to get the index into audioEmbeds
+                    int32_t const audioIdx = multimodalIndices[linearIdx];
+                    if (audioIdx >= 0 && audioIdx < audioTokenLen)
+                    {
+                        int64_t const audioEmbedIdx = audioIdx * hiddenSize + elementIdx;
+                        embeddingValue = audioEmbeds[audioEmbedIdx];
+                    }
+                    else
+                    {
+                        embeddingValue = __float2half(0.0f);
+                    }
+                }
+                else
+                {
+                    // Normal text token: check bounds and use embeddingTable
+                    if (tokenId >= 0 && tokenId < vocabSize)
+                    {
+                        int64_t const embeddingIdx = tokenId * hiddenSize + elementIdx;
+                        embeddingValue = embeddingTable[embeddingIdx];
+                    }
+                    else
+                    {
+                        embeddingValue = __float2half(0.0f);
+                    }
+                }
+
+                result[resultIdx] = embeddingValue;
+            }
+        }
+    }
+
+    return result;
+}
+
+std::vector<half> assembleDeepstackEmbeddingRef(std::vector<int32_t> const& inputIds,
+    std::vector<half> const& deepstackFeatures, int64_t batchSize, int64_t seqLen, int32_t vocabSize,
+    int64_t hiddenSize, int64_t numImageTokens)
+{
+    std::vector<half> result(batchSize * seqLen * hiddenSize, __float2half(0.0f));
+
+    for (int64_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
+        {
+            int32_t const tokenId = inputIds[batchIdx * seqLen + tokenIdx];
+            bool const isImageToken = tokenId >= vocabSize;
+
+            for (int64_t elementIdx = 0; elementIdx < hiddenSize; ++elementIdx)
+            {
+                int64_t const resultIdx = batchIdx * seqLen * hiddenSize + tokenIdx * hiddenSize + elementIdx;
+
+                half embeddingValue;
+                if (isImageToken)
+                {
+                    // For image tokens (tokenId >= vocabSize), use deepstack features
+                    int32_t const deepstackIdx = tokenId - vocabSize;
+                    if (deepstackIdx >= 0 && deepstackIdx < numImageTokens)
+                    {
+                        int64_t const featuresIdx = deepstackIdx * hiddenSize + elementIdx;
+                        embeddingValue = deepstackFeatures[featuresIdx];
+                    }
+                    else
+                    {
+                        // Out-of-bounds image token, use zero embedding
+                        embeddingValue = __float2half(0.0f);
+                    }
+                }
+                else
+                {
+                    // Token ID < vocabSize, use zero embedding
+                    embeddingValue = __float2half(0.0f);
                 }
 
                 result[resultIdx] = embeddingValue;

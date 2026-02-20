@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "common/hashUtils.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
@@ -127,19 +128,22 @@ private:
     std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};   //!< LLM engine runner instance
     std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner instance (optional)
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};    //!< Tokenizer instance
-    std::unordered_map<size_t, SystemPromptKVCache>
-        mSystemPromptKVCache{}; //!< Cache of system prompts and their KV caches
+    hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
+        mSystemPromptKVCache{}; //!< Cache of system prompts / LORA weights and their KV caches
 
-    rt::Tensor mSamplingWorkspace{};       //!< Workspace tensor for sampling operations
-    rt::Tensor mInputIds{};                //!< Input token IDs tensor
-    rt::Tensor mHostPackedInputIds{};      //!< Host tensor for packed input IDs
-    rt::Tensor mHostContextLengths{};      //!< Host tensor for context lengths
-    rt::Tensor mOutputLogits{};            //!< Output logits tensor
-    rt::Tensor mSelectedIndices{};         //!< Selected token indices tensor
-    rt::Tensor mHostSelectedTokenIds{};    //!< Host tensor for selected token IDs
-    rt::Tensor mHostReuseKVCacheLengths{}; //!< Reuse KV cache lengths for prefill
-    rt::Tensor mVocabMappingTable{};       //!< Vocab mapping table for reduced vocab (empty if not used)
-    std::string mEmptyLoraWeightsName{""}; //!< Empty LoRA weights name for default case
+    rt::Tensor mEmbeddingTable{};             //!< Shared embedding table [vocabSize, hiddenSize]
+    rt::Tensor mSamplingWorkspace{};          //!< Workspace tensor for sampling operations
+    rt::Tensor mInputIds{};                   //!< Input token IDs tensor
+    rt::Tensor mInputsEmbeds{};               //!< Input embeddings tensor [batchSize, seqLen, hiddenSize]
+    std::vector<rt::Tensor> mDeepstackEmbeds; //!< Deepstack embeddings tensors for Qwen3-VL (one per feature)
+    rt::Tensor mHostPackedInputIds{};         //!< Host tensor for packed input IDs
+    rt::Tensor mHostContextLengths{};         //!< Host tensor for context lengths
+    rt::Tensor mOutputLogits{};               //!< Output logits tensor
+    rt::Tensor mSelectedIndices{};            //!< Selected token indices tensor
+    rt::Tensor mHostSelectedTokenIds{};       //!< Host tensor for selected token IDs
+    rt::Tensor mHostReuseKVCacheLengths{};    //!< Reuse KV cache lengths for prefill
+    rt::Tensor mVocabMappingTable{};          //!< Vocab mapping table for reduced vocab (empty if not used)
+    std::string mEmptyLoraWeightsName{""};    //!< Empty LoRA weights name for default case
 
     LLMEngineRunnerConfig mEngineConfig{}; //!< Engine configuration
 

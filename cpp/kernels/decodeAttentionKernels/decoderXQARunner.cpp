@@ -51,12 +51,14 @@ XQADataType trtToXqaDataType(nvinfer1::DataType type)
 struct XQAKernelLoadHashKey
 {
     XQADataType data_type;
+    XQADataType kv_data_type;
     int32_t sm;
     bool specDecode;
 
     bool operator==(XQAKernelLoadHashKey const& other) const
     {
-        return data_type == other.data_type && sm == other.sm && specDecode == other.specDecode;
+        return data_type == other.data_type && kv_data_type == other.kv_data_type && sm == other.sm
+            && specDecode == other.specDecode;
     }
 };
 
@@ -65,6 +67,8 @@ struct XQAKernelLoadHasher
     size_t operator()(XQAKernelLoadHashKey const& s) const
     {
         size_t key = s.data_type;
+        key <<= 16;
+        key ^= s.kv_data_type;
         key <<= 16;
         key ^= s.sm;
         key <<= 4;
@@ -75,6 +79,7 @@ struct XQAKernelLoadHasher
 
 struct XQAKernelRuntimeHashKey
 {
+    XQADataType q_data_type;
     XQADataType kv_data_type;
     int32_t head_size;
     int32_t num_q_heads_per_kv;
@@ -82,7 +87,7 @@ struct XQAKernelRuntimeHashKey
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const
     {
-        return kv_data_type == other.kv_data_type && head_size == other.head_size
+        return q_data_type == other.q_data_type && kv_data_type == other.kv_data_type && head_size == other.head_size
             && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size;
     }
 };
@@ -91,21 +96,25 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQALaunchParams const& xq
 {
     constexpr int32_t kBEAM_SIZE{1};
     int32_t numQHeadPerKV = xqaParams.numQheads / xqaParams.numKVheads;
-    return {trtToXqaDataType(xqaParams.dataType), xqaParams.headSize, numQHeadPerKV, kBEAM_SIZE};
+    return {trtToXqaDataType(xqaParams.dataType), trtToXqaDataType(xqaParams.kvDataType), xqaParams.headSize,
+        numQHeadPerKV, kBEAM_SIZE};
 }
 
 XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParamsSpecDecode(XQALaunchParams const& xqaParams)
 {
     constexpr int32_t kBEAM_SIZE{1};
     constexpr int32_t kQHEAD_PER_KV = 0; // Tree attention kernel supports any ratio of Q/KV heads.
-    return {trtToXqaDataType(xqaParams.dataType), xqaParams.headSize, kQHEAD_PER_KV, kBEAM_SIZE};
+    return {trtToXqaDataType(xqaParams.dataType), trtToXqaDataType(xqaParams.kvDataType), xqaParams.headSize,
+        kQHEAD_PER_KV, kBEAM_SIZE};
 }
 
 struct XQAKernelRuntimeHasher
 {
     size_t operator()(XQAKernelRuntimeHashKey const& s) const
     {
-        size_t key = s.kv_data_type;
+        size_t key = s.q_data_type;
+        key <<= 16;
+        key ^= s.kv_data_type;
         key <<= 16;
         key ^= s.head_size;
         key <<= 8;
@@ -120,6 +129,7 @@ struct XQAKernelFuncInfo
 {
     uint32_t mSharedMemBytes{0};
     CUfunction mDeviceFunction{0};
+    uint32_t mMTileSize{0};
 };
 
 class XQAKernelList
@@ -127,12 +137,13 @@ class XQAKernelList
     using TKernelMetaInfo = xqa::kernels::XQAKernelMetaInfo;
 
 public:
-    XQAKernelList(XQADataType type, int32_t sm, bool specDecode)
+    XQAKernelList(XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode)
         : mKernelMeta(nullptr)
         , mKernelMetaCount(0)
         , mSMVersion(sm)
-        , mDataType(type)
         , mSpecDecode(specDecode)
+        , mDataType(dataType)
+        , mKVDataType(kvDataType)
     {
         mKernelMeta = &(xqa::kernels::sXqaKernelMetaInfo[0]);
         mKernelMetaCount = sizeof(xqa::kernels::sXqaKernelMetaInfo) / sizeof(xqa::kernels::sXqaKernelMetaInfo[0]);
@@ -147,13 +158,13 @@ public:
         for (int32_t i = 0; i < mKernelMetaCount; ++i)
         {
             auto const& kernelMeta = mKernelMeta[i];
-            if (kernelMeta.mDataType != mDataType || kernelMeta.mSM != mSMVersion || kernelMeta.mCubin == nullptr)
+            if (kernelMeta.mDataType != mDataType || kernelMeta.mKVDataType != mKVDataType
+                || kernelMeta.mSM != mSMVersion || kernelMeta.mCubin == nullptr)
             {
                 continue;
             }
             // Filter out kernel that irrelevant to this project.
-            if (kernelMeta.mPagedKVCache == true || kernelMeta.mBeamWidth != 1
-                || kernelMeta.mDataType != kernelMeta.mKVDataType)
+            if (kernelMeta.mPagedKVCache == true || kernelMeta.mBeamWidth != 1)
             {
                 continue;
             }
@@ -176,6 +187,7 @@ public:
 
             XQAKernelFuncInfo funcInfo{};
             CUDA_DRIVER_CHECK(cuModuleGetFunction(&funcInfo.mDeviceFunction, hModule, kernelMeta.mFuncName));
+            funcInfo.mMTileSize = kernelMeta.mMTileSize;
 
             uint32_t* deviceSmemSize{nullptr};
             size_t dataSize{0};
@@ -192,8 +204,9 @@ public:
                 CUDA_DRIVER_CHECK(cuFuncSetAttribute(funcInfo.mDeviceFunction,
                     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, funcInfo.mSharedMemBytes));
             }
-            XQAKernelRuntimeHashKey hashKey{
-                kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mNumQHeadsOverKV, kernelMeta.mBeamWidth};
+            XQAKernelRuntimeHashKey hashKey{kernelMeta.mDataType, kernelMeta.mKVDataType,
+                static_cast<int32_t>(kernelMeta.mHeadDim), static_cast<int32_t>(kernelMeta.mNumQHeadsOverKV),
+                static_cast<int32_t>(kernelMeta.mBeamWidth)};
             mFunctions.insert(std::make_pair(hashKey, funcInfo));
         }
     }
@@ -216,6 +229,7 @@ protected:
     int32_t mSMVersion;
     bool mSpecDecode;
     XQADataType mDataType;
+    XQADataType mKVDataType;
     std::unordered_map<unsigned long long const*, CUmodule> mModules;
 
     std::unordered_map<XQAKernelRuntimeHashKey, XQAKernelFuncInfo, XQAKernelRuntimeHasher> mFunctions;
@@ -225,17 +239,18 @@ class XQAKernelLoader
 {
 
 public:
-    XQAKernelList* getXQAKernelList(XQADataType type, int32_t sm, bool specDecode)
+    XQAKernelList* getXQAKernelList(XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
 
-        XQAKernelLoadHashKey hash_key{type, sm, specDecode};
+        XQAKernelLoadHashKey hash_key{dataType, kvDataType, sm, specDecode};
 
         auto findIter = mKernels.find(hash_key);
         if (findIter == mKernels.end())
         {
-            std::unique_ptr<XQAKernelList> newKernel = std::make_unique<XQAKernelList>(type, sm, specDecode);
+            std::unique_ptr<XQAKernelList> newKernel
+                = std::make_unique<XQAKernelList>(dataType, kvDataType, sm, specDecode);
             newKernel->loadXQAKernels();
             mKernels.insert(std::make_pair(hash_key, std::move(newKernel)));
             findIter = mKernels.find(hash_key);
@@ -260,16 +275,17 @@ private:
     std::unordered_map<XQAKernelLoadHashKey, std::unique_ptr<XQAKernelList> const, XQAKernelLoadHasher> mKernels;
 };
 
-inline XQAKernelList* getXQAKernels(XQADataType type, int32_t sm, bool specDecode)
+inline XQAKernelList* getXQAKernels(XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode)
 {
-    return XQAKernelLoader::Get().getXQAKernelList(type, sm, specDecode);
+    return XQAKernelLoader::Get().getXQAKernelList(dataType, kvDataType, sm, specDecode);
 }
 
 } // namespace
 
-DecoderXQARunner::DecoderXQARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t numQHeads,
-    int32_t numKvHeads, int32_t headSize, int32_t smVersion)
+DecoderXQARunner::DecoderXQARunner(nvinfer1::DataType const dataType, nvinfer1::DataType const kvDataType,
+    int32_t batchSize, int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion)
     : mDataType(dataType)
+    , mKVDataType(kvDataType)
     , mBatchSize(batchSize)
     , mNumHeads(numQHeads)
     , mNumKVHeads(numKvHeads)
@@ -286,15 +302,18 @@ XQALaunchParams DecoderXQARunner::initXQAParams()
     params.headSize = mHeadSize;
     params.batchSize = mBatchSize;
     params.dataType = mDataType;
+    params.kvDataType = mKVDataType;
     params.headGroupSize = params.numQheads / params.numKVheads;
 
     return params;
 }
 
-bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, DataType dataType)
+bool DecoderXQARunner::canImplement(
+    int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, DataType dataType, DataType kvDataType)
 {
     bool const checkHeadNumbers = numQHeads % numKVHeads == 0;
     bool const checkType = dataType == DataType::kHALF;
+    bool const checkKVType = kvDataType == DataType::kHALF || kvDataType == DataType::kFP8;
     std::vector<int32_t> allowedSMVersions{80, 86, 87, 89, 100, 101, 120, 121};
     bool const checkSMVersion
         = std::find(allowedSMVersions.begin(), allowedSMVersions.end(), smVersion) != allowedSMVersions.end();
@@ -303,12 +322,14 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
     int32_t const headRatio = numQHeads / numKVHeads;
     bool const checkQHeadPerKV = headRatio >= 1 && headRatio <= 8;
 
-    return checkHeadNumbers && checkType && checkSMVersion && checkQHeadPerKV;
+    return checkHeadNumbers && checkType && checkKVType && checkSMVersion && checkQHeadPerKV;
 }
 
-bool DecoderXQARunner::loadDecodeXQAKernels(int32_t smVersion, DataType dataType, bool useSpecDecodeKernels)
+bool DecoderXQARunner::loadDecodeXQAKernels(
+    int32_t smVersion, DataType dataType, DataType kvDataType, bool useSpecDecodeKernels)
 {
-    XQAKernelList* xqaKernelList = getXQAKernels(trtToXqaDataType(dataType), smVersion, useSpecDecodeKernels);
+    XQAKernelList* xqaKernelList
+        = getXQAKernels(trtToXqaDataType(dataType), trtToXqaDataType(kvDataType), smVersion, useSpecDecodeKernels);
     return xqaKernelList != nullptr;
 }
 
@@ -321,13 +342,14 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
 
     constexpr bool useSpecDecode = false;
     auto hashKey = getRuntimeHashKeyFromXQAParams(params);
-    XQAKernelList* xqaKernelList = getXQAKernels(trtToXqaDataType(mDataType), mSmVersion, useSpecDecode);
+    XQAKernelList* xqaKernelList
+        = getXQAKernels(trtToXqaDataType(mDataType), trtToXqaDataType(mKVDataType), mSmVersion, useSpecDecode);
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
     check::check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the GQA");
 
     void* kernelParams[]
         = {&params.numKVheads, &params.qScale, &params.output, &params.qInputPtr, &params.attentionSinks,
-            &params.kvCache, &params.batchSize, &params.kvScale, &params.semaphores, &params.scratch};
+            &params.kvCache, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
 
     // The multi-block kernel launch is mainly for long sequence.
     // TODO: Add multiple block launch logic. The launch configuration highly depends on usecase and performance
@@ -347,15 +369,18 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
 
     constexpr bool useSpecDecode = true;
     auto hashKey = getRuntimeHashKeyFromXQAParamsSpecDecode(params);
-    XQAKernelList* xqaKernelList = getXQAKernels(trtToXqaDataType(mDataType), mSmVersion, useSpecDecode);
+    XQAKernelList* xqaKernelList
+        = getXQAKernels(trtToXqaDataType(mDataType), trtToXqaDataType(mKVDataType), mSmVersion, useSpecDecode);
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
     check::check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the Spec-DecodeGQA");
 
     void* kernelParams[] = {&params.qSeqLen, &params.numKVheads, &params.headGroupSize, &params.qCuSeqLen,
         &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
-        &params.kvCache, &params.batchSize, &params.kvScale, &params.semaphores, &params.scratch};
-    constexpr int32_t CTA_TILE_Y = 32;
-    int32_t const tokenBlockPerGroup = (params.qSeqLen * params.headGroupSize - 1) / CTA_TILE_Y + 1;
+        &params.kvCache, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
+    int32_t const ctaTileY = static_cast<int32_t>(kernelInfo.mMTileSize);
+    check::check(
+        ctaTileY == 32, format::fmtstr("ctaTileY should be 32 for spec-decode kernels, but got %d.", ctaTileY));
+    int32_t const tokenBlockPerGroup = (params.qSeqLen * params.headGroupSize - 1) / ctaTileY + 1;
     dim3 const dimGrid{1, mNumKVHeads * tokenBlockPerGroup, mBatchSize};
     dim3 const dimCta{128, 1, 2};
     CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y,

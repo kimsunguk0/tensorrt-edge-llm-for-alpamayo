@@ -36,6 +36,11 @@ public:
     {
     }
 
+    ~MemoryMonitor()
+    {
+        stop();
+    }
+
     void start();
     void stop();
 

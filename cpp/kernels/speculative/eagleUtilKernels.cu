@@ -19,6 +19,7 @@
 #include "kernels/common/vectorizedTypes.cuh"
 
 #include "common/checkMacros.h"
+#include "common/cudaMacros.h"
 #include "common/cudaUtils.h"
 #include <cmath>
 
@@ -640,20 +641,21 @@ void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, 
         selectTokenIndices.dataPointer<int64_t>(), treeSize, treeSize);
 }
 
-template <int32_t HEAD_DIM, int32_t MAX_PATH>
+template <int32_t HEAD_DIM, int32_t MAX_PATH, typename KV_T>
 __global__ void eagleBaseCommitKVCacheKernel(int32_t const* acceptedIndices, int32_t const* acceptLengths,
-    int32_t const* kvCacheLengths, half* kvCacheBuffer, int32_t const activeBatchSize, int32_t const maxDepth,
+    int32_t const* kvCacheLengths, KV_T* kvCacheBuffer, int32_t const activeBatchSize, int32_t const maxDepth,
     int32_t const numLayers, int32_t const maxBatchSize, int32_t const numHeads, int32_t const maxSeqLen)
 {
     static_assert(HEAD_DIM == 64 || HEAD_DIM == 128, "Only HEAD_DIM = 64 or 128 are supported");
-    DVec<half> tempBuffer[MAX_PATH];
+    DVec<KV_T> tempBuffer[MAX_PATH];
 
     // The kernel have assumptions that:
     //     1. Each CTA will handle multiple heads.
-    //     2. Each thread will copy 16 bytes of data (half[8]), each warp will copy 512 bytes (half[256]) data per
-    //     iteration.
+    //     2. Each thread will copy 8 elements of KV_T via DVec<KV_T>.
+    //        - FP16: 8 halves = 16 bytes
+    //        - FP8 : 8 fp8  = 8 bytes
     //     3. Each CTA contains 128 threads (4 warps).
-    //         blockDim.x = number of threads used to process 1 head = HEAD_DIM / DVec<half>::vec_size
+    //         blockDim.x = number of threads used to process 1 head = HEAD_DIM / DVec<KV_T>::vec_size
     //         blockDim.y = number of heads handled by each CTA = 128 / blockDim.x
     //     4. The KVCache buffer has layout of [numLayers, maxBatchSize, 2, numHeads, maxSeqLen, HEAD_DIM]
 
@@ -668,9 +670,10 @@ __global__ void eagleBaseCommitKVCacheKernel(int32_t const* acceptedIndices, int
 
     int32_t const actualAcceptLength = acceptLengths[kvBatchIdx];
     int32_t const pastKvCacheLength = kvCacheLengths[kvBatchIdx];
-    int32_t const kvCacheOffset = kvLayerIdx * maxBatchSize * 2 * numHeads * maxSeqLen * HEAD_DIM
-        + kvBatchIdx * 2 * numHeads * maxSeqLen * HEAD_DIM + kvHeadIdx * maxSeqLen * HEAD_DIM
-        + pastKvCacheLength * HEAD_DIM;
+    // Use int64_t to avoid integer overflow when processing large batch sizes
+    int64_t const kvCacheOffset = static_cast<int64_t>(kvLayerIdx) * maxBatchSize * 2 * numHeads * maxSeqLen * HEAD_DIM
+        + static_cast<int64_t>(kvBatchIdx) * 2 * numHeads * maxSeqLen * HEAD_DIM
+        + static_cast<int64_t>(kvHeadIdx) * maxSeqLen * HEAD_DIM + static_cast<int64_t>(pastKvCacheLength) * HEAD_DIM;
 
     // PHASE 1: Collect all accepted data into local temp buffer
     // Start from 1 since the root position will always be accepted.
@@ -679,7 +682,8 @@ __global__ void eagleBaseCommitKVCacheKernel(int32_t const* acceptedIndices, int
         int32_t const acceptedIdx = acceptedIndices[kvBatchIdx * maxDepth + i];
         if (acceptedIdx >= 0 && acceptedIdx + pastKvCacheLength < maxSeqLen)
         {
-            int32_t const srcOffset = kvCacheOffset + acceptedIdx * HEAD_DIM + tIdx * DVec<half>::vec_size;
+            int64_t const srcOffset
+                = kvCacheOffset + static_cast<int64_t>(acceptedIdx) * HEAD_DIM + tIdx * DVec<half>::vec_size;
             tempBuffer[i].load(kvCacheBuffer + srcOffset);
         }
     }
@@ -687,7 +691,7 @@ __global__ void eagleBaseCommitKVCacheKernel(int32_t const* acceptedIndices, int
     // PHASE 2: Write from local temp buffer to final positions
     for (int32_t i = 1; i < actualAcceptLength; ++i)
     {
-        int32_t const dstOffset = kvCacheOffset + i * HEAD_DIM + tIdx * DVec<half>::vec_size;
+        int64_t const dstOffset = kvCacheOffset + static_cast<int64_t>(i) * HEAD_DIM + tIdx * DVec<half>::vec_size;
         tempBuffer[i].store(kvCacheBuffer + dstOffset);
     }
 }
@@ -761,10 +765,10 @@ void eagleBaseCommitKVCacheAndAssembleHiddenState(rt::Tensor const& acceptedIndi
             && hiddenState.getDeviceType() == rt::DeviceType::kGPU,
         "Device type shall all be GPU for these tensors.");
     check::check(acceptedIndices.getDataType() == DataType::kINT32 && acceptLengths.getDataType() == DataType::kINT32
-            && kvCacheBuffer.getDataType() == DataType::kHALF && kvCacheLengths.getDataType() == DataType::kINT32
-            && hiddenState.getDataType() == DataType::kHALF,
+            && (kvCacheBuffer.getDataType() == DataType::kHALF || kvCacheBuffer.getDataType() == DataType::kFP8)
+            && kvCacheLengths.getDataType() == DataType::kINT32 && hiddenState.getDataType() == DataType::kHALF,
         "Data type validation failed: acceptedIndices, acceptLengths, and kvCacheLengths should be INT32; "
-        "kvCacheBuffer and hiddenState should be HALF.");
+        "hiddenState should be HALF; kvCacheBuffer should be HALF or FP8.");
 
     auto const acceptIndicesShape = acceptedIndices.getShape();
     auto const acceptLengthsShape = acceptLengths.getShape();
@@ -808,16 +812,44 @@ void eagleBaseCommitKVCacheAndAssembleHiddenState(rt::Tensor const& acceptedIndi
     switch (headDim)
     {
     case 64:
-        eagleBaseCommitKVCacheKernel<64, MAX_PATH>
-            <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndices.dataPointer<int32_t>(),
-                acceptLengths.dataPointer<int32_t>(), kvCacheLengths.dataPointer<int32_t>(),
-                kvCacheBuffer.dataPointer<half>(), batchSize, maxDepth, numLayers, maxBatchSize, numHeads, maxSeqLen);
+        if (kvCacheBuffer.getDataType() == DataType::kHALF)
+        {
+            eagleBaseCommitKVCacheKernel<64, MAX_PATH, half><<<gridDim1, blockDim1, 0, stream>>>(
+                acceptedIndices.dataPointer<int32_t>(), acceptLengths.dataPointer<int32_t>(),
+                kvCacheLengths.dataPointer<int32_t>(), kvCacheBuffer.dataPointer<half>(), batchSize, maxDepth,
+                numLayers, maxBatchSize, numHeads, maxSeqLen);
+        }
+        else
+        {
+#if SUPPORTS_FP8
+            eagleBaseCommitKVCacheKernel<64, MAX_PATH, __nv_fp8_e4m3><<<gridDim1, blockDim1, 0, stream>>>(
+                acceptedIndices.dataPointer<int32_t>(), acceptLengths.dataPointer<int32_t>(),
+                kvCacheLengths.dataPointer<int32_t>(), kvCacheBuffer.dataPointer<__nv_fp8_e4m3>(), batchSize, maxDepth,
+                numLayers, maxBatchSize, numHeads, maxSeqLen);
+#else
+            throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
+#endif
+        }
         break;
     case 128:
-        eagleBaseCommitKVCacheKernel<128, MAX_PATH>
-            <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndices.dataPointer<int32_t>(),
-                acceptLengths.dataPointer<int32_t>(), kvCacheLengths.dataPointer<int32_t>(),
-                kvCacheBuffer.dataPointer<half>(), batchSize, maxDepth, numLayers, maxBatchSize, numHeads, maxSeqLen);
+        if (kvCacheBuffer.getDataType() == DataType::kHALF)
+        {
+            eagleBaseCommitKVCacheKernel<128, MAX_PATH, half><<<gridDim1, blockDim1, 0, stream>>>(
+                acceptedIndices.dataPointer<int32_t>(), acceptLengths.dataPointer<int32_t>(),
+                kvCacheLengths.dataPointer<int32_t>(), kvCacheBuffer.dataPointer<half>(), batchSize, maxDepth,
+                numLayers, maxBatchSize, numHeads, maxSeqLen);
+        }
+        else
+        {
+#if SUPPORTS_FP8
+            eagleBaseCommitKVCacheKernel<128, MAX_PATH, __nv_fp8_e4m3><<<gridDim1, blockDim1, 0, stream>>>(
+                acceptedIndices.dataPointer<int32_t>(), acceptLengths.dataPointer<int32_t>(),
+                kvCacheLengths.dataPointer<int32_t>(), kvCacheBuffer.dataPointer<__nv_fp8_e4m3>(), batchSize, maxDepth,
+                numLayers, maxBatchSize, numHeads, maxSeqLen);
+#else
+            throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
+#endif
+        }
         break;
     default:
         throw std::runtime_error(

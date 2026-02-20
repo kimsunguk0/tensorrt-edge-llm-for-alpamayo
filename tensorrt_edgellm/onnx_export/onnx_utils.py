@@ -65,12 +65,13 @@ def is_mxfp8_quantized(model: nn.Module) -> bool:
 
 
 def is_fp8_quantized(model: nn.Module) -> bool:
-    """Check if the model is quantized in FP8 mode."""
+    """Check if the model is quantized in FP8 mode but not MXFP8."""
     for _, module in model.named_modules():
         if (hasattr(module, "input_quantizer")
                 and module.input_quantizer._num_bits == (4, 3)
                 and hasattr(module, "weight_quantizer")
-                and module.weight_quantizer._num_bits == (4, 3)):
+                and module.weight_quantizer._num_bits
+                == (4, 3)) and not is_mxfp8_quantized(module):
             return True
     return False
 

@@ -41,8 +41,8 @@ namespace kernel
  * @param group_size Quantization group size
  * @param stream CUDA stream
  */
-void gemv_forward_cuda_new(half* in_feats, int8_t* kernel, half* scaling_factors, half* out_feats, int m, int n, int k,
-    int group_size, cudaStream_t stream);
+void gemv_forward_cuda_new(half const* in_feats, int8_t const* kernel, half const* scaling_factors, half* out_feats,
+    int m, int n, int k, int group_size, cudaStream_t stream);
 
 /*!
  * @brief INT4 group-wise quantized GEMM (matrix-matrix multiplication)
@@ -60,7 +60,7 @@ void gemv_forward_cuda_new(half* in_feats, int8_t* kernel, half* scaling_factors
  * @param group_size Quantization group size
  * @param stream CUDA stream
  */
-void gemm_forward_cuda_new(half* in_feats, int8_t* kernel, half* scaling_factors, half* out_feats, int m, int n, int k,
-    int group_size, cudaStream_t stream);
+void gemm_forward_cuda_new(half const* in_feats, int8_t const* kernel, half const* scaling_factors, half* out_feats,
+    int m, int n, int k, int group_size, cudaStream_t stream);
 } // namespace kernel
 } // namespace trt_edgellm

@@ -18,9 +18,7 @@
 #include "tensor.h"
 
 #include "checkMacros.h"
-#if CUDA_VERSION >= 11080
-#include <cuda_fp8.h>
-#endif
+#include "cudaMacros.h"
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -98,7 +96,7 @@ std::string formatElement(T value)
         {
             fval = __bfloat162float(value);
         }
-#if CUDA_VERSION >= 11080
+#if SUPPORTS_FP8
         else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
         {
             // Use __nv_fp8_e4m3's "explicit operator float()" to convert to float.
@@ -289,14 +287,14 @@ std::string formatString(Tensor const& tensor)
     }
     case DataType::kFP8:
     {
-#if CUDA_VERSION < 11080
-        throw std::runtime_error("FP8 data type is not supported with CUDA version < 11.8");
-#else
+#if SUPPORTS_FP8
         size_t maxWidth = getMaxFormatDataWidth(shape, static_cast<__nv_fp8_e4m3 const*>(dataPtr));
         buildStringRecursive(
             ss, static_cast<__nv_fp8_e4m3 const*>(dataPtr), shape, strides, offset, startDim, maxWidth, startIndent);
-        break;
+#else
+        throw std::runtime_error("FP8 data type is not supported with CUDA version < 11.8");
 #endif
+        break;
     }
     case DataType::kUINT8:
     {

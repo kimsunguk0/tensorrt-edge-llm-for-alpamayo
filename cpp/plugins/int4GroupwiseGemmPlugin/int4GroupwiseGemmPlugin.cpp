@@ -37,9 +37,6 @@ namespace
 constexpr char const* kINT4_GEMM_PLUGIN_VERSION{"1"};
 constexpr char const* kINT4_GEMM_PLUGIN_NAME{"Int4GroupwiseGemmPlugin"};
 
-// Enforce groupsize to be 128, can be further extended to support 64.
-constexpr int32_t kGROUP_SIZE{128};
-
 } // namespace
 
 // Static class fields initialization
@@ -56,25 +53,71 @@ Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, int32_
 {
 }
 
-Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, void const* data, size_t length)
+Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, PluginFieldCollection const* fc)
     : mLayerName(name)
 {
-    deserializeValue(&data, &length, &mGemmN);
-    deserializeValue(&data, &length, &mGemmK);
-    deserializeValue(&data, &length, &mGroupSize);
+    for (int32_t i = 0; i < fc->nbFields; ++i)
+    {
+        std::string fieldName(fc->fields[i].name);
+        if (fieldName == "gemm_n")
+        {
+            mGemmN = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
+        else if (fieldName == "gemm_k")
+        {
+            mGemmK = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
+        else if (fieldName == "group_size")
+        {
+            mGroupSize = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
+    }
 }
 
 Int4GroupwiseGemmPlugin::~Int4GroupwiseGemmPlugin() {}
 
-IPluginV2DynamicExt* Int4GroupwiseGemmPlugin::clone() const noexcept
+IPluginCapability* Int4GroupwiseGemmPlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
 {
-    Int4GroupwiseGemmPlugin* plugin = new Int4GroupwiseGemmPlugin(mLayerName, mGemmN, mGemmK, mGroupSize);
-    return plugin;
+    try
+    {
+        if (type == PluginCapabilityType::kBUILD)
+        {
+            return static_cast<IPluginV3OneBuild*>(this);
+        }
+        if (type == PluginCapabilityType::kRUNTIME)
+        {
+            return static_cast<IPluginV3OneRuntime*>(this);
+        }
+        return static_cast<IPluginV3OneCore*>(this);
+    }
+    catch (std::exception const& e)
+    {
+        return nullptr;
+    }
 }
 
-char const* Int4GroupwiseGemmPlugin::getPluginType() const noexcept
+IPluginV3* Int4GroupwiseGemmPlugin::clone() noexcept
+{
+    try
+    {
+        auto* plugin = new Int4GroupwiseGemmPlugin(mLayerName, mGemmN, mGemmK, mGroupSize);
+        plugin->setPluginNamespace(mNamespace.c_str());
+        return plugin;
+    }
+    catch (std::exception const& e)
+    {
+        return nullptr;
+    }
+}
+
+char const* Int4GroupwiseGemmPlugin::getPluginName() const noexcept
 {
     return kINT4_GEMM_PLUGIN_NAME;
+}
+
+char const* Int4GroupwiseGemmPlugin::getPluginVersion() const noexcept
+{
+    return kINT4_GEMM_PLUGIN_VERSION;
 }
 
 char const* Int4GroupwiseGemmPlugin::getPluginNamespace() const noexcept
@@ -87,26 +130,54 @@ void Int4GroupwiseGemmPlugin::setPluginNamespace(char const* pluginNamespace) no
     mNamespace = std::string(pluginNamespace);
 }
 
-char const* Int4GroupwiseGemmPlugin::getPluginVersion() const noexcept
-{
-    return kINT4_GEMM_PLUGIN_VERSION;
-}
-
 int32_t Int4GroupwiseGemmPlugin::getNbOutputs() const noexcept
 {
     return 1;
 }
 
-bool Int4GroupwiseGemmPlugin::supportsFormatCombination(
-    int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+int32_t Int4GroupwiseGemmPlugin::getOutputDataTypes(
+    DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes, int32_t nbInputs) const noexcept
 {
-    // input 0: Fp16 activation tensor, input 1: packed int4 weights in type int8, input2: Fp16 scale values.
-    // output 0: Fp16 computed result of the int4-woq gemm
+    try
+    {
+        assert(nbOutputs == 1);
+        outputTypes[0] = DataType::kHALF;
+        return 0;
+    }
+    catch (std::exception const& e)
+    {
+        return -1;
+    }
+}
+
+int32_t Int4GroupwiseGemmPlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs,
+    DimsExprs const* shapeInputs, int32_t nbShapeInputs, DimsExprs* outputs, int32_t nbOutputs,
+    IExprBuilder& exprBuilder) noexcept
+{
+    try
+    {
+        assert(nbInputs == 3);
+        assert(nbOutputs == 1);
+        outputs[0].nbDims = 3;
+        outputs[0].d[0] = inputs[0].d[0];
+        outputs[0].d[1] = inputs[0].d[1];
+        outputs[0].d[2] = exprBuilder.constant(mGemmN);
+        return 0;
+    }
+    catch (std::exception const& e)
+    {
+        return -1;
+    }
+}
+
+bool Int4GroupwiseGemmPlugin::supportsFormatCombination(
+    int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+{
     try
     {
         assert(nbInputs == 3 && nbOutputs == 1);
         assert(pos < (nbInputs + nbOutputs));
-        auto const& tensorDesc = inOut[pos];
+        auto const& tensorDesc = inOut[pos].desc;
         bool status{true};
 
         switch (pos)
@@ -114,18 +185,15 @@ bool Int4GroupwiseGemmPlugin::supportsFormatCombination(
         case 0:
         {
             status &= tensorDesc.type == DataType::kHALF;
-            status &= tensorDesc.format == TensorFormat::kLINEAR;
+            status &= tensorDesc.format == PluginFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 3;
             status &= tensorDesc.dims.d[2] == mGemmK;
             break;
         }
         case 1:
         {
-            // The int4 weights are packed and swizzled into a special layout with int16 [N/4, K].
-            // Since TensorRT doesn't have Int16 datatype, we use int8 datatype to store the weights.
-            // Therefore the type should be [N/2, K] in int8.
             status &= tensorDesc.type == DataType::kINT8;
-            status &= tensorDesc.format == TensorFormat::kLINEAR;
+            status &= tensorDesc.format == PluginFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 2;
             status &= tensorDesc.dims.d[0] == mGemmN / 2;
             status &= tensorDesc.dims.d[1] == mGemmK;
@@ -133,9 +201,8 @@ bool Int4GroupwiseGemmPlugin::supportsFormatCombination(
         }
         case 2:
         {
-            // The accepted scale for the kernel should be fp16 with [K/group_size,N]
             status &= tensorDesc.type == DataType::kHALF;
-            status &= tensorDesc.format == TensorFormat::kLINEAR;
+            status &= tensorDesc.format == PluginFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 2;
             status &= tensorDesc.dims.d[0] == mGemmK / mGroupSize;
             status &= tensorDesc.dims.d[1] == mGemmN;
@@ -144,7 +211,7 @@ bool Int4GroupwiseGemmPlugin::supportsFormatCombination(
         case 3:
         {
             status &= tensorDesc.type == DataType::kHALF;
-            status &= tensorDesc.format == TensorFormat::kLINEAR;
+            status &= tensorDesc.format == PluginFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 3;
             status &= tensorDesc.dims.d[2] == mGemmN;
             break;
@@ -155,91 +222,74 @@ bool Int4GroupwiseGemmPlugin::supportsFormatCombination(
     }
     catch (std::exception const& e)
     {
+        return false;
     }
-    return false;
 }
 
-// IPluginV2Ext Methods
-DataType Int4GroupwiseGemmPlugin::getOutputDataType([[maybe_unused]] int32_t index,
-    [[maybe_unused]] nvinfer1::DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
-{
-    return DataType::kHALF;
-}
-
-DimsExprs Int4GroupwiseGemmPlugin::getOutputDimensions([[maybe_unused]] int32_t outputIndex,
-    nvinfer1::DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
-{
-    // Output[0] is attention result, has shape [B, S. Hq, D]. Refers to QKV shape [B, S, Hq+Hk+Hv,D]
-    DimsExprs output;
-
-    output.nbDims = 3;
-    output.d[0] = inputs[0].d[0];
-    output.d[1] = inputs[0].d[1];
-    output.d[2] = exprBuilder.constant(mGemmN);
-    return output;
-}
-
-void Int4GroupwiseGemmPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* in,
-    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out,
-    [[maybe_unused]] int32_t nbOutputs) noexcept
-{
-}
-
-// TODO: extend the worksapce calculation to a more generalized form.
-size_t Int4GroupwiseGemmPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs,
-    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs,
-    [[maybe_unused]] int32_t nbOutputs) const noexcept
+int32_t Int4GroupwiseGemmPlugin::configurePlugin(
+    DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
     return 0;
 }
 
-int32_t Int4GroupwiseGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
-    [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs,
-    [[maybe_unused]] void* workspace, cudaStream_t stream) noexcept
+size_t Int4GroupwiseGemmPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
+    DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
-    auto const& inputDesc0 = inputDesc[0];
-    int32_t const M = inputDesc0.dims.d[0] * inputDesc0.dims.d[1];
+    return 0;
+}
 
-    half* gemmInPtr = reinterpret_cast<half*>(const_cast<void*>(inputs[0]));
-    int8_t* weightsInPtr = reinterpret_cast<int8_t*>(const_cast<void*>(inputs[1]));
-    half* ScaleInPtr = reinterpret_cast<half*>(const_cast<void*>(inputs[2]));
-    half* gemmOutDevicePtr = reinterpret_cast<half*>(outputs[0]);
-
-    if (M <= 6)
+int32_t Int4GroupwiseGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+{
+    try
     {
-        trt_edgellm::kernel::gemv_forward_cuda_new(
-            gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
+        auto const& inputDesc0 = inputDesc[0];
+        int32_t const M = inputDesc0.dims.d[0] * inputDesc0.dims.d[1];
+
+        half* gemmInPtr = reinterpret_cast<half*>(const_cast<void*>(inputs[0]));
+        int8_t* weightsInPtr = reinterpret_cast<int8_t*>(const_cast<void*>(inputs[1]));
+        half* ScaleInPtr = reinterpret_cast<half*>(const_cast<void*>(inputs[2]));
+        half* gemmOutDevicePtr = reinterpret_cast<half*>(outputs[0]);
+
+        if (M <= 6)
+        {
+            trt_edgellm::kernel::gemv_forward_cuda_new(
+                gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
+        }
+        else
+        {
+            trt_edgellm::kernel::gemm_forward_cuda_new(
+                gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
+        }
+        return 0;
     }
-    else
+    catch (std::exception const& e)
     {
-        trt_edgellm::kernel::gemm_forward_cuda_new(
-            gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
+        return -1;
     }
-    return 0;
 }
 
-size_t Int4GroupwiseGemmPlugin::getSerializationSize() const noexcept
-{
-    return sizeof(mGemmN) + sizeof(mGemmK) + sizeof(mGroupSize);
-}
-
-void Int4GroupwiseGemmPlugin::serialize(void* buffer) const noexcept
-{
-    serializeValue(&buffer, mGemmN);
-    serializeValue(&buffer, mGemmK);
-    serializeValue(&buffer, mGroupSize);
-}
-
-int32_t Int4GroupwiseGemmPlugin::initialize() noexcept
+int32_t Int4GroupwiseGemmPlugin::onShapeChange(
+    PluginTensorDesc const* in, int32_t nbInputs, PluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
     return 0;
 }
 
-void Int4GroupwiseGemmPlugin::terminate() noexcept {}
-
-void Int4GroupwiseGemmPlugin::destroy() noexcept
+IPluginV3* Int4GroupwiseGemmPlugin::attachToContext(IPluginResourceContext* context) noexcept
 {
-    delete this;
+    return clone();
+}
+
+PluginFieldCollection const* Int4GroupwiseGemmPlugin::getFieldsToSerialize() noexcept
+{
+    mDataToSerialize.clear();
+    mDataToSerialize.emplace_back("gemm_n", &mGemmN, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("gemm_k", &mGemmK, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("group_size", &mGroupSize, PluginFieldType::kINT32, 1);
+
+    mFCToSerialize.nbFields = mDataToSerialize.size();
+    mFCToSerialize.fields = mDataToSerialize.data();
+    return &mFCToSerialize;
 }
 
 Int4GroupwiseGemmPluginCreator::Int4GroupwiseGemmPluginCreator()
@@ -281,43 +331,19 @@ char const* Int4GroupwiseGemmPluginCreator::getPluginVersion() const noexcept
     return kINT4_GEMM_PLUGIN_VERSION;
 }
 
-nvinfer1::IPluginV2* Int4GroupwiseGemmPluginCreator::createPlugin(
-    char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept
+IPluginV3* Int4GroupwiseGemmPluginCreator::createPlugin(
+    char const* name, PluginFieldCollection const* fc, TensorRTPhase phase) noexcept
 {
     try
     {
-        // Read N, K attributes for the plugin.
-        std::optional<int32_t> gemmN = parsePluginScalarField<int32_t>("gemm_n", fc);
-        std::optional<int32_t> gemmK = parsePluginScalarField<int32_t>("gemm_k", fc);
-        std::optional<int32_t> groupSize = parsePluginScalarField<int32_t>("group_size", fc);
-
-        bool checkRequiredFields = gemmN.has_value() && gemmK.has_value() && groupSize.has_value();
-        if (!checkRequiredFields)
-        {
-            return nullptr;
-        }
-
-        Int4GroupwiseGemmPlugin* plugin
-            = new Int4GroupwiseGemmPlugin(std::string(name), gemmN.value(), gemmK.value(), groupSize.value());
+        Int4GroupwiseGemmPlugin* plugin = new Int4GroupwiseGemmPlugin(std::string(name), fc);
+        plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
     catch (std::exception const& e)
     {
+        return nullptr;
     }
-    return nullptr;
-}
-
-nvinfer1::IPluginV2* Int4GroupwiseGemmPluginCreator::deserializePlugin(
-    char const* name, void const* serialData, size_t serialLength) noexcept
-{
-    try
-    {
-        return new Int4GroupwiseGemmPlugin(name, serialData, serialLength);
-    }
-    catch (std::exception const& e)
-    {
-    }
-    return nullptr;
 }
 
 } // namespace plugins

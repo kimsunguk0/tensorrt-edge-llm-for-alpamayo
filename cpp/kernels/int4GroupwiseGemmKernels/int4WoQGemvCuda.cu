@@ -211,10 +211,10 @@ __global__ void gemv_kernel(
     }
 }
 
-void gemv_forward_cuda_new(half* in_feats, int8_t* weights_device, half* scaling_factors, half* out_feats, int m, int n,
-    int k, int group_size, cudaStream_t stream)
+void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
+    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
 {
-    uint32_t* kernel = reinterpret_cast<uint32_t*>(weights_device);
+    auto kernel = reinterpret_cast<uint32_t const*>(weights_device);
     static constexpr int N_PER_BLOCK = 2;
     static constexpr int K_INTERLEAVE = 4;
     static constexpr int BLOCK_SIZE = 256;

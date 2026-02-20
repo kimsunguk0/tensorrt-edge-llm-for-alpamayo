@@ -73,16 +73,22 @@ def set_dynamic_quant(model: nn.Module, dtype: str) -> None:
 
 
 def is_vlm(model_dir: str) -> bool:
-    """Check if the model is a VLM."""
-    cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    cfg_dict = cfg.to_dict()
-    has_vision = "vision_config" in cfg_dict
-    has_phi4_vision = "image_embd_layer" in cfg_dict.get("embd_layer", {})
-    if (has_vision or has_phi4_vision):
-        print("Set use_prompt_tuning to True")
-        return True
-    else:
-        print("Set use_prompt_tuning to False")
+    """
+    Check if the model is a Vision-Language Model (VLM).
+    
+    Args:
+        model_dir: Path to the model directory
+        
+    Returns:
+        True if the model is a VLM, False otherwise
+    """
+    try:
+        cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        cfg_dict = cfg.to_dict()
+        has_vision = "vision_config" in cfg_dict
+        has_phi4_vision = "image_embd_layer" in cfg_dict.get("embd_layer", {})
+        return has_vision or has_phi4_vision
+    except Exception:
         return False
 
 
@@ -120,6 +126,12 @@ def _check_model_type(model_dir: str, model_identifier: str) -> bool:
 def _is_phi4mm_model(dir_path: str) -> bool:
     """Check if the model is a Phi4MM model."""
     return _check_model_type(dir_path, "phi4mm")
+
+
+def _is_qwen3_omni_model(model_dir: str) -> bool:
+    """Check if the model is a Qwen3 Omni model by checking config.json for model_type."""
+    cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    return getattr(cfg, "model_type", None) == "qwen3_omni"
 
 
 # Models that require explicit chat template because auto-extraction fails
@@ -274,20 +286,27 @@ def load_hf_model(
     # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
     # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
     if _is_phi4mm_model(model_dir):
+        # Avoid converting the model into a PEFT-wrapped model, which ModelOpt and
+        # Transformers cannot currently handle correctly. LoRA weights will instead
+        # be merged directly into the base model.
         module = _load_phi4mm_war(model_dir)
         model = module.Phi4MMForCausalLM.from_pretrained(
             model_dir,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
-            _attn_implementation="eager").to(device)
+            attn_implementation="eager").to(device)
+
+    elif _is_qwen3_omni_model(model_dir):
+        from transformers import Qwen3OmniForConditionalGeneration
+        model = Qwen3OmniForConditionalGeneration.from_pretrained(
+            model_dir, torch_dtype=torch_dtype,
+            trust_remote_code=True).to(device)
     else:
         # Try loading as AutoModelForCausalLM first
         try:
             model = AutoModelForCausalLM.from_pretrained(
-                model_dir,
-                torch_dtype=torch_dtype,
-                trust_remote_code=True,
-                _attn_implementation="eager").to(device)
+                model_dir, torch_dtype=torch_dtype,
+                trust_remote_code=True).to(device)
         except Exception:
             # If that fails, try AutoModelForImageTextToText
             try:
@@ -334,7 +353,7 @@ def load_llm_model(
     is_eagle_base: bool,
     reduced_vocab_size: Optional[int] = None,
     vocab_map: Optional[torch.Tensor] = None
-) -> tuple[nn.Module, bool, AutoTokenizer, Optional[AutoProcessor]]:
+) -> tuple[nn.Module, AutoTokenizer, Optional[AutoProcessor]]:
     """
     Load a language model (standard or EAGLE base).
     
@@ -347,7 +366,7 @@ def load_llm_model(
         vocab_map: Tensor of shape (reduced_vocab_size,) with int32 indices for vocabulary reduction (optional)
         
     Returns:
-        tuple: (model, use_prompt_tuning, tokenizer, processor)
+        tuple: (model, tokenizer, processor)
         processor will be None if AutoProcessor cannot be loaded from the model directory
     """
     # Determine model type and print message
@@ -357,32 +376,32 @@ def load_llm_model(
         print(f"Loading standard model from {model_dir}")
 
     model, tokenizer, processor = load_hf_model(model_dir, dtype, device)
-    use_prompt_tuning = is_vlm(model_dir)
     set_dynamic_quant(model, dtype)
 
     # Create EdgeLLMModelForCausalLM wrapper.
-    edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
-                                         use_prompt_tuning, reduced_vocab_size,
-                                         vocab_map)
+    if _is_qwen3_omni_model(model_dir):
+        edge_model = EdgeLLMModelForCausalLM(model.thinker, is_eagle_base,
+                                             reduced_vocab_size, vocab_map)
+    else:
+        edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
+                                             reduced_vocab_size, vocab_map)
 
     del model
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-    return edge_model, use_prompt_tuning, tokenizer, processor
+    return edge_model, tokenizer, processor
 
 
 def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
-                            use_prompt_tuning: bool, dtype: str,
-                            device: str) -> nn.Module:
+                            dtype: str, device: str) -> nn.Module:
     """
     Load an EAGLE draft model with base model for weight copying.
     
     Args:
         draft_model_dir: Directory containing the draft model
         base_model_dir: Directory containing the base model 
-        use_prompt_tuning: Whether the model uses prompt tuning
         dtype: Model data type ("fp16")
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
         
@@ -400,7 +419,6 @@ def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
     draft_model = Eagle3DraftModel.from_pretrained(
         draft_model_dir=draft_model_dir,
         base_model_dir=base_model_dir,
-        use_prompt_tuning=use_prompt_tuning,
         device=device).eval().to(device)
     if not is_gptq_model(draft_model):
         draft_model.to(torch_dtype)

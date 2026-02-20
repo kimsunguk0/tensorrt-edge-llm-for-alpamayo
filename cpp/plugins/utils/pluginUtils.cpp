@@ -17,6 +17,7 @@
 
 #include "pluginUtils.h"
 #include "common/checkMacros.h"
+#include <memory>
 
 using namespace nvinfer1;
 
@@ -24,12 +25,6 @@ namespace trt_edgellm
 {
 namespace plugins
 {
-
-void* alignDevicePtr(void* ptr)
-{
-    return reinterpret_cast<void*>(
-        (reinterpret_cast<uintptr_t>(ptr) + kDEVICE_ALIGNMENT - 1) & ~(kDEVICE_ALIGNMENT - 1));
-}
 
 size_t alignTensorSize(size_t size)
 {
@@ -44,9 +39,12 @@ size_t accumulateWorkspaceSize(size_t currentSize, rt::Coords const& shape, Data
     return alignedSize + alignTensorSize(tensorSizeBytes);
 }
 
-rt::Tensor assignTensorFromWorkspace(void*& workspace, rt::Coords const& shape, DataType dataType)
+rt::Tensor assignTensorFromWorkspace(std::byte*& workspace, rt::Coords const& shape, DataType dataType)
 {
-    check::check(workspace != nullptr && reinterpret_cast<uintptr_t>(workspace) % kDEVICE_ALIGNMENT == 0,
+    size_t space = kDEVICE_ALIGNMENT;
+    void* workspace_void = workspace;
+    check::check(
+        workspace != nullptr && std::align(kDEVICE_ALIGNMENT, kDEVICE_ALIGNMENT, workspace_void, space) == workspace,
         "Workspace pointer shall be valid and aligned to device alignment granularity.");
 
     // Create non-owned tensor instance from the workspace pointer.
@@ -54,8 +52,7 @@ rt::Tensor assignTensorFromWorkspace(void*& workspace, rt::Coords const& shape, 
 
     // Move the workspace pointer to the next aligned position after this tensor.
     size_t alignedSize = alignTensorSize(tensor.getMemoryCapacity());
-    uintptr_t newAddr = reinterpret_cast<uintptr_t>(workspace) + alignedSize;
-    workspace = reinterpret_cast<void*>(newAddr);
+    workspace += alignedSize;
     return tensor;
 }
 

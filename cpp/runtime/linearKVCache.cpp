@@ -19,10 +19,9 @@
 #include "common/logger.h"
 
 #include "common/checkMacros.h"
-#include "common/cudaUtils.h"
+#include "common/cudaMacros.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include <cuda_bf16.h>
-#include <type_traits>
 
 using namespace nvinfer1;
 
@@ -34,37 +33,40 @@ namespace rt
 LinearKVCache::LinearKVCache(CacheConfig const& config, cudaStream_t stream)
     : mConfig(config)
 {
+    check::check(
+        mConfig.kvCacheTypeTRT == nvinfer1::DataType::kHALF || mConfig.kvCacheTypeTRT == nvinfer1::DataType::kFP8,
+        "Unsupported KV cache dtype.");
+    mDeviceKVCache = rt::Tensor({mConfig.numDecoderLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads,
+                                    mConfig.maxSequenceLength, mConfig.headDim},
+        DeviceType::kGPU, mConfig.kvCacheTypeTRT, "LinearKVCache::mDeviceKVCache");
     int64_t const kvCacheVolume = mConfig.numDecoderLayers * mConfig.maxBatchSize * 2 * mConfig.numKVHeads
         * mConfig.maxSequenceLength * mConfig.headDim;
-    CUDA_CHECK(cudaMalloc(&mDeviceKVCache, kvCacheVolume * sizeof(KVCacheType)));
-    LOG_DEBUG("KVCache of shape [%ld, %ld, %ld, %ld, %ld, %ld] allocated on GPU with size: %ld bytes (%.2f MB)",
-        mConfig.numDecoderLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength,
-        mConfig.headDim, kvCacheVolume * sizeof(KVCacheType),
-        static_cast<float>(kvCacheVolume * sizeof(KVCacheType)) / (1024.0 * 1024.0));
+    size_t const kvCacheElemSize = rt::utils::getTypeSize(mConfig.kvCacheTypeTRT);
+    char const* kvCacheTypeStr = (mConfig.kvCacheTypeTRT == nvinfer1::DataType::kHALF) ? "kHALF" : "kFP8";
+    LOG_DEBUG(
+        "KVCache(dtype=%s) of shape [%ld, %ld, %ld, %ld, %ld, %ld] allocated on GPU with size: %ld bytes (%.2f MB)",
+        kvCacheTypeStr, mConfig.numDecoderLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads,
+        mConfig.maxSequenceLength, mConfig.headDim, kvCacheVolume * static_cast<int64_t>(kvCacheElemSize),
+        static_cast<float>(kvCacheVolume * static_cast<int64_t>(kvCacheElemSize)) / (1024.0 * 1024.0));
     mDeviceKVCacheLengths = rt::Tensor(
         {mConfig.maxBatchSize}, DeviceType::kGPU, DataType::kINT32, "LinearKVCache::mDeviceKVCacheLengths");
     CUDA_CHECK(
         cudaMemsetAsync(mDeviceKVCacheLengths.rawPointer(), 0, mDeviceKVCacheLengths.getMemoryCapacity(), stream));
 }
 
-LinearKVCache::~LinearKVCache()
-{
-    CUDA_CHECK(cudaFree(mDeviceKVCache));
-    mDeviceKVCache = nullptr;
-}
+LinearKVCache::~LinearKVCache() {}
 
 LinearKVCache::LinearKVCache(LinearKVCache&& other) noexcept
 {
     mConfig = other.mConfig;
     mActiveBatchSize = other.mActiveBatchSize;
     mKVCacheAllEmpty = other.mKVCacheAllEmpty;
-    mDeviceKVCache = other.mDeviceKVCache;
+    mDeviceKVCache = std::move(other.mDeviceKVCache);
     mDeviceKVCacheLengths = std::move(other.mDeviceKVCacheLengths);
 
     other.mConfig = CacheConfig{};
     other.mActiveBatchSize = 0;
     other.mKVCacheAllEmpty = true;
-    other.mDeviceKVCache = nullptr;
 }
 
 LinearKVCache& LinearKVCache::operator=(LinearKVCache&& other) noexcept
@@ -72,17 +74,15 @@ LinearKVCache& LinearKVCache::operator=(LinearKVCache&& other) noexcept
     if (this != &other)
     {
         // Release current KVCache memory.
-        CUDA_CHECK(cudaFree(mDeviceKVCache));
         mConfig = other.mConfig;
         mKVCacheAllEmpty = other.mKVCacheAllEmpty;
         mActiveBatchSize = other.mActiveBatchSize;
-        mDeviceKVCache = other.mDeviceKVCache;
+        mDeviceKVCache = std::move(other.mDeviceKVCache);
         mDeviceKVCacheLengths = std::move(other.mDeviceKVCacheLengths);
 
         other.mConfig = CacheConfig{};
         other.mActiveBatchSize = 0;
         other.mKVCacheAllEmpty = true;
-        other.mDeviceKVCache = nullptr;
     }
     return *this;
 }
@@ -91,18 +91,21 @@ rt::Tensor LinearKVCache::getKVCacheForDecoderLayer(int32_t decoderLayerIdx)
 {
     int64_t const kvCacheOffset
         = decoderLayerIdx * mConfig.maxBatchSize * 2 * mConfig.numKVHeads * mConfig.maxSequenceLength * mConfig.headDim;
-    KVCacheType* kvCachePtr = mDeviceKVCache + kvCacheOffset;
+
+    size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheTypeTRT);
+    void* kvCachePtr = static_cast<void*>(static_cast<char*>(mDeviceKVCache.rawPointer()) + kvCacheOffset * elemSize);
+
     return rt::Tensor(kvCachePtr,
         {mConfig.maxBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength, mConfig.headDim}, DeviceType::kGPU,
-        KVCacheTypeTRT);
+        mConfig.kvCacheTypeTRT);
 }
 
 rt::Tensor LinearKVCache::getKVCacheBuffer()
 {
-    return rt::Tensor(mDeviceKVCache,
+    return rt::Tensor(mDeviceKVCache.rawPointer(),
         {mConfig.numDecoderLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength,
             mConfig.headDim},
-        DeviceType::kGPU, KVCacheTypeTRT);
+        DeviceType::kGPU, mConfig.kvCacheTypeTRT);
 }
 
 void LinearKVCache::resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, cudaStream_t stream)

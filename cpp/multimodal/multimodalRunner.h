@@ -85,7 +85,7 @@ public:
      * @return True on success, false on failure
      */
     virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
         = 0;
 
     /*!
@@ -97,7 +97,7 @@ public:
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
-    virtual bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
+    virtual bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
         rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream);
 
     /*!
@@ -111,9 +111,9 @@ public:
     //! @return Reference to output embedding tensor
     virtual rt::Tensor& getOutputEmbedding();
 
-    //! @brief Get extra visual features
-    //! @return Optional input tensors vector (e.g. deepstack features for Qwen3-VL)
-    virtual rt::OptionalInputTensors getExtraVisualFeatures();
+    //! @brief Get deepstack features for Qwen3-VL models
+    //! @return Optional deepstack features vector (raw features before embedding lookup)
+    virtual rt::OptionalInputTensors getDeepstackFeatures();
 
     /*!
      * @brief Validate and fill configuration from file
