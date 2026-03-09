@@ -1,127 +1,198 @@
-<div align="center">
+# Alpamayo Runtime Guide
 
-# TensorRT Edge-LLM
+This document summarizes the local build and run flow for the Alpamayo VLM setup integrated into `llm_inference`.
 
-**High-Performance Large Language Model Inference Framework for NVIDIA Edge Platforms**
+## What This Setup Does
 
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-Edge-LLM/)
-[![version](https://img.shields.io/badge/release-0.5.0-green)](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/tensorrt_edgellm/version.py)
-[![license](https://img.shields.io/badge/license-Apache%202-blue)](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/LICENSE)
+- Uses `llm_inference` as the single entry point
+- Loads image inputs from JSON
+- Loads ego history from `.npy`
+- Injects trajectory tokens inside `llm_inference`
+- Supports profile dump and KV-cache dump
 
-[Overview](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/overview.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/examples.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](https://nvidia.github.io/TensorRT-Edge-LLM/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Roadmap](https://github.com/NVIDIA/TensorRT-Edge-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3ARoadmap)
+## Runtime Layout
 
----
-<div align="left">
+All runtime assets are organized inside this repository:
 
-## Overview
+```text
+/root/TensorRT-Edge-LLM/
+  engines/
+    llm_kv/
+    visual/
+  input/
+    requests/
+      input_fixed_template.json
+      input_llm_inference_integrated.json
+    ego/
+      ego_history_xyz.npy
+      ego_history_rot.npy
+    images/
+      cam0_f0.png
+      ...
+      cam3_f3.png
+  output/
+    runs/
+    kv_cache/
+```
 
-TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large Language Models (LLMs) and Vision-Language Models (VLMs) on embedded platforms. It enables efficient deployment of state-of-the-art language models on resource-constrained devices such as NVIDIA Jetson and NVIDIA DRIVE platforms. TensorRT Edge-LLM provides convenient Python scripts to convert HuggingFace checkpoints to [ONNX](https://onnx.ai). Engine build and end-to-end inference runs entirely on Edge platforms.
+## Prerequisites
 
----
+- TensorRT installed and visible through `TRT_PACKAGE_DIR`
+- CUDA 13.0
+- A configured CMake build directory
 
-## Getting Started
+The current local build cache uses:
 
-For the supported platforms, models and precisions, see the [**Overview**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/overview.html). Get started with TensorRT Edge-LLM in <15 minutes. For complete installation and usage instructions, see the [**Quick Start Guide**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/quick-start-guide.html).
+```bash
+TRT_PACKAGE_DIR=/usr
+CUDA_VERSION=13.0
+```
 
----
+## Build
 
-## Documentation
+### Configure From Scratch
 
-### Introduction
+```bash
+cd /root/TensorRT-Edge-LLM
 
-- **[Overview](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/overview.html)** - What is TensorRT Edge-LLM and key features
-- **[Supported Models](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/supported-models.html)** - Complete model compatibility matrix
+cmake -S . -B build \
+  -DTRT_PACKAGE_DIR=/usr \
+  -DCUDA_VERSION=13.0
+```
 
-### User Guide
+### Build `llm_inference`
 
-- **[Installation](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/installation.html)** - Set up Python export pipeline and C++ runtime
-- **[Quick Start Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/quick-start-guide.html)** - Run your first inference in ~15 minutes
-- **[Examples](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/examples.html)** - End-to-end LLM, VLM, EAGLE, and LoRA workflows
-- **[Input Format Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/input-format.html)** - Request format and specifications
-- **[Chat Template Format](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/chat-template-format.html)** - Chat template configuration
+```bash
+cd /root/TensorRT-Edge-LLM
 
-### Developer Guide
+cmake --build build --target llm_inference -j$(nproc)
+```
 
-#### Software Design
+## Input Format
 
-- **[Python Export Pipeline](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/python-export-pipeline.html)** - Model export and quantization
-- **[Engine Builder](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/engine-builder.html)** - Building TensorRT engines
-- **[C++ Runtime Overview](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/cpp-runtime-overview.html)** - Runtime system architecture
-  - [LLM Inference Runtime](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/llm-inference-runtime.html)
-  - [LLM SpecDecode Runtime](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/llm-inference-specdecode-runtime.html)
+The runtime now supports request-level ego history fields:
 
-#### Advanced Topics
+```json
+{
+  "requests": [
+    {
+      "ego_history_xyz_npy": "/root/TensorRT-Edge-LLM/input/ego/ego_history_xyz.npy",
+      "ego_history_rot_npy": "/root/TensorRT-Edge-LLM/input/ego/ego_history_rot.npy",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a driving assistant that generates safe and accurate actions."
+        },
+        {
+          "role": "user",
+          "content": [
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam0_f0.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam0_f1.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam0_f2.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam0_f3.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam1_f0.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam1_f1.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam1_f2.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam1_f3.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam2_f0.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam2_f1.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam2_f2.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam2_f3.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam3_f0.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam3_f1.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam3_f2.png"},
+            {"type": "image", "image": "/root/TensorRT-Edge-LLM/input/images/cam3_f3.png"},
+            {
+              "type": "text",
+              "text": "<|traj_history_start|><|traj_history_end|>output the chain-of-thought reasoning of the driving process, then output the future trajectory."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
 
-- **[Customization Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/customization/customization-guide.html)** - Customizing TensorRT Edge-LLM for your needs
-- **[TensorRT Plugins](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/customization/tensorrt-plugins.html)** - Custom plugin development
-- **[Tests](tests/)** - Comprehensive test suite for contributors
+Notes:
 
----
+- Keep the trajectory placeholder:
+  - `<|traj_history_start|><|traj_history_end|>`
+- `llm_inference` will replace that region with generated `<i*>` tokens
+- `predict_yaw` defaults to `false`
 
-## Use Cases
+## Run
 
-**🚗 Automotive**
-- In-vehicle AI assistants
-- Voice-controlled interfaces
-- Scene understanding
-- Driver assistance systems
+### Standard Run
 
-**🤖 Robotics**
-- Natural language interaction
-- Task planning and reasoning
-- Visual question answering
-- Human-robot collaboration
+```bash
+cd /root/TensorRT-Edge-LLM
 
-**🏭 Industrial IoT**
-- Equipment monitoring with NLP
-- Automated inspection
-- Predictive maintenance
-- Voice-controlled machinery
+./build/examples/llm/llm_inference \
+  --engineDir /root/TensorRT-Edge-LLM/engines/llm_kv \
+  --multimodalEngineDir /root/TensorRT-Edge-LLM/engines/visual \
+  --inputFile /root/TensorRT-Edge-LLM/input/requests/input_fixed_template.json \
+  --outputFile /root/TensorRT-Edge-LLM/output/runs/output.json
+```
 
-**📱 Edge Devices**
-- On-device chatbots
-- Offline language processing
-- Privacy-preserving AI
-- Low-latency inference
+### Run With Profile + KV-Cache Dump
 
----
+```bash
+cd /root/TensorRT-Edge-LLM
 
-## Tech Blogs
+./build/examples/llm/llm_inference \
+  --engineDir /root/TensorRT-Edge-LLM/engines/llm_kv \
+  --multimodalEngineDir /root/TensorRT-Edge-LLM/engines/visual \
+  --inputFile /root/TensorRT-Edge-LLM/input/requests/input_fixed_template.json \
+  --outputFile /root/TensorRT-Edge-LLM/output/runs/output_internal_layout.json \
+  --dumpProfile \
+  --profileOutputFile /root/TensorRT-Edge-LLM/output/runs/profile_internal_layout.json \
+  --dumpKVCache \
+  --kvCacheOutputDir /root/TensorRT-Edge-LLM/output/kv_cache/internal_layout \
+  --warmup 0
+```
 
-*Coming soon*
+### CLI Override For Ego History
 
-Stay tuned for technical deep-dives, optimization guides, and deployment best practices.
+Use this if the JSON does not include `ego_history_xyz_npy` and `ego_history_rot_npy`:
 
----
+```bash
+cd /root/TensorRT-Edge-LLM
 
-## Latest News
+./build/examples/llm/llm_inference \
+  --engineDir /root/TensorRT-Edge-LLM/engines/llm_kv \
+  --multimodalEngineDir /root/TensorRT-Edge-LLM/engines/visual \
+  --inputFile /root/TensorRT-Edge-LLM/input/requests/input_fixed_template.json \
+  --outputFile /root/TensorRT-Edge-LLM/output/runs/output_cli_override.json \
+  --egoHistoryXYZNpy /root/TensorRT-Edge-LLM/input/ego/ego_history_xyz.npy
+```
 
-* [01/05] 🚀 Accelerate AI Inference for Edge and Robotics with NVIDIA Jetson T4000 and NVIDIA JetPack 7.1 ✨ [➡️ link](https://developer.nvidia.com/blog/accelerate-ai-inference-for-edge-and-robotics-with-nvidia-jetson-t4000-and-nvidia-jetpack-7-1/)
-* [01/05] 🚀 Accelerating LLM and VLM Inference for Automotive and Robotics with NVIDIA TensorRT Edge-LLM ✨ [➡️ link](https://developer.nvidia.com/blog/accelerating-llm-and-vlm-inference-for-automotive-and-robotics-with-nvidia-tensorrt-edge-llm/)
+If yaw tokenization is needed:
 
-Follow our [GitHub repository](https://github.com/NVIDIA/TensorRT-Edge-LLM) for the latest updates, releases, and announcements.
+```bash
+cd /root/TensorRT-Edge-LLM
 
----
+./build/examples/llm/llm_inference \
+  --engineDir /root/TensorRT-Edge-LLM/engines/llm_kv \
+  --multimodalEngineDir /root/TensorRT-Edge-LLM/engines/visual \
+  --inputFile /root/TensorRT-Edge-LLM/input/requests/input_fixed_template.json \
+  --outputFile /root/TensorRT-Edge-LLM/output/runs/output_cli_override_yaw.json \
+  --egoHistoryXYZNpy /root/TensorRT-Edge-LLM/input/ego/ego_history_xyz.npy \
+  --egoHistoryRotNpy /root/TensorRT-Edge-LLM/input/ego/ego_history_rot.npy \
+  --predictYaw
+```
 
-## Support
+## Outputs
 
-- **Documentation**: [Full Documentation](https://nvidia.github.io/TensorRT-Edge-LLM/)
-- **Examples**: [Code Examples](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/examples.html)
-- **Roadmap**: [Developer Roadmap](https://github.com/NVIDIA/TensorRT-Edge-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3ARoadmap)
-- **Issues**: [GitHub Issues](https://github.com/NVIDIA/TensorRT-Edge-LLM/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/NVIDIA/TensorRT-Edge-LLM/discussions)
-- **Forums**: [NVIDIA Developer Forums](https://forums.developer.nvidia.com/)
+Typical output files:
 
----
+- `/root/TensorRT-Edge-LLM/output/runs/output.json`
+- `/root/TensorRT-Edge-LLM/output/runs/profile.json`
+- `/root/TensorRT-Edge-LLM/output/kv_cache/<run_name>/kv_cache_request_0.bin`
+- `/root/TensorRT-Edge-LLM/output/kv_cache/<run_name>/kv_cache_request_0.json`
 
-## License
+## Notes
 
-[Apache License 2.0](LICENSE)
-
----
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
-
----
+- The current runtime uses copied engines inside this repo
+- The `models/` directory is reserved for future use and is currently not required for inference
+- The separate `traj_tokenize` tool is no longer required for the normal single-binary flow
