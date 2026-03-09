@@ -108,6 +108,43 @@ public:
         return mMultimodalRunner ? mMultimodalRunner->getMultimodalMetrics() : metrics::MultimodalMetrics{};
     }
 
+    /*! \brief Check whether the most recent request has VLM post-vision timing
+     *  \return True if latest request measured post-vision-to-output timing, false otherwise
+     */
+    bool hasLastVlmPostVisionToOutputTiming() const
+    {
+        return mHasLastVlmPostVisionToOutputTiming;
+    }
+
+    /*! \brief Get post-vision-to-output timing for the most recent request
+     *  \return Elapsed time in milliseconds
+     */
+    double getLastVlmPostVisionToOutputMs() const
+    {
+        return mLastVlmPostVisionToOutputMs;
+    }
+
+    /*! \brief Get a non-owned tensor view to the full KV-cache buffer.
+     *  Layout: [numDecoderLayers, maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
+     *  \return KV-cache buffer tensor on GPU
+     */
+    rt::Tensor getKVCacheBuffer();
+
+    /*! \brief Get a non-owned tensor view to KV-cache lengths.
+     *  \return KV-cache length tensor on GPU with shape [maxBatchSize]
+     */
+    rt::Tensor getKVCacheLengths();
+
+    /*! \brief Get multimodal text-model position IDs if available.
+     *  \return Optional tensor with shape [batch_size, 3, max_position_embeddings]
+     */
+    rt::OptionalInputTensor getPositionIds() const;
+
+    /*! \brief Get multimodal rope deltas if available.
+     *  \return Optional tensor with shape [batch_size, 1]
+     */
+    rt::OptionalInputTensor getRopeDeltas() const;
+
 private:
     /*! \brief Helper structure to hold token counting results
      */
@@ -142,14 +179,23 @@ private:
     rt::Tensor mSelectedIndices{};            //!< Selected token indices tensor
     rt::Tensor mHostSelectedTokenIds{};       //!< Host tensor for selected token IDs
     rt::Tensor mHostReuseKVCacheLengths{};    //!< Reuse KV cache lengths for prefill
+    rt::Tensor mTrajectoryModeFlags{};        //!< Trajectory mode flags per batch (0: NL/COT, 1: trajectory)
     rt::Tensor mVocabMappingTable{};          //!< Vocab mapping table for reduced vocab (empty if not used)
     std::string mEmptyLoraWeightsName{""};    //!< Empty LoRA weights name for default case
+
+    bool mEnableTrajectoryIndexTokenGating{false}; //!< Enable stateful gating for <i*> tokens
+    int32_t mIndexTokenIdStart{-1};                //!< Inclusive start token ID for <i0..> range
+    int32_t mIndexTokenIdEnd{-1};                  //!< Inclusive end token ID for <i0..> range
+    int32_t mTrajFutureStartTokenId{-1};           //!< Token ID for <|traj_future_start|>
+    int32_t mTrajFutureEndTokenId{-1};             //!< Token ID for <|traj_future_end|>
 
     LLMEngineRunnerConfig mEngineConfig{}; //!< Engine configuration
 
     metrics::LLMPrefillMetrics mPrefillMetrics; //!< Stage-specific metrics to store number of tokens in prefill
     metrics::LLMGenerationMetrics
         mGenerationMetrics; //!< Stage-specific metrics to store number of tokens in generation
+    bool mHasLastVlmPostVisionToOutputTiming{false}; //!< Whether latest request has VLM post-vision timing
+    double mLastVlmPostVisionToOutputMs{0.0};        //!< Latest request post-vision-to-output time in milliseconds
 
     //! Examine and validate the generation request.
     //! \param request The generation request to examine

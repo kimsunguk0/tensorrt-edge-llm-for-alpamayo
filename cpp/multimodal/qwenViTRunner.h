@@ -107,6 +107,14 @@ public:
     //! \return Optional input tensors vector containing deepstack features
     rt::OptionalInputTensors getDeepstackFeatures() override;
 
+    //! \brief Get cached multimodal position IDs used to construct mRoPE
+    //! \return Optional tensor reference with shape [batch_size, 3, max_position_embeddings]
+    rt::OptionalInputTensor getPositionIds() override;
+
+    //! \brief Get cached rope deltas matching the current request
+    //! \return Optional tensor reference with shape [batch_size, 1]
+    rt::OptionalInputTensor getRopeDeltas() override;
+
 private:
     //! \brief Calculate resized image dimensions based on dynamic resolution constraints
     //! \param[in] height Input image height
@@ -179,6 +187,7 @@ private:
     rt::imageUtils::ImageData mResizedImageHost{}; //!< Pre-allocated buffer for image resizing
     rt::Tensor mMropePositionIdsHost{};            //!< MRoPE position IDs host tensor
     rt::Tensor mMropePositionIdsDevice{};          //!< MRoPE position IDs device tensor
+    rt::Tensor mRopeDeltasHost{};                 //!< Rope deltas host tensor derived from active prompt positions
     rt::Tensor mCuSeqlensHost{};                   //!< Cumulative sequence lengths host tensor
     rt::Tensor mCuSeqlensDevice{};                 //!< Cumulative sequence lengths device tensor
     // Qwen2.5-VL

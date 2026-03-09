@@ -113,6 +113,16 @@ rt::OptionalInputTensors MultimodalRunner::getDeepstackFeatures()
     return {};
 }
 
+rt::OptionalInputTensor MultimodalRunner::getPositionIds()
+{
+    return std::nullopt;
+}
+
+rt::OptionalInputTensor MultimodalRunner::getRopeDeltas()
+{
+    return std::nullopt;
+}
+
 bool MultimodalRunner::preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
     rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {

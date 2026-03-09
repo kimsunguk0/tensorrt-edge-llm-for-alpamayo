@@ -1005,4 +1005,64 @@ void mapReducedVocabToFullVocab(rt::Tensor& vocabIds, rt::Tensor const& vocabMap
         vocabIds.dataPointer<int32_t>(), vocabMappingTable.dataPointer<int32_t>(), totalElements);
 }
 
+// =======================================================================================
+// PHASE-AWARE TOKEN RANGE MASKING KERNEL
+// =======================================================================================
+
+/*!
+ * \brief Mask logits in [tokenIdStart, tokenIdEnd] for batches that are not in allowedMode.
+ */
+__global__ void maskTokenRangeByModeKernel(float* logits, int8_t const* modeFlags, int32_t batchSize, int32_t vocabSize,
+    int32_t tokenIdStart, int32_t tokenCount, int8_t allowedMode)
+{
+    int32_t const tokenOffset = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    int32_t const batchIdx = static_cast<int32_t>(blockIdx.y);
+    if (batchIdx >= batchSize || tokenOffset >= tokenCount)
+    {
+        return;
+    }
+
+    if (modeFlags[batchIdx] == allowedMode)
+    {
+        return;
+    }
+
+    int32_t const tokenId = tokenIdStart + tokenOffset;
+    logits[batchIdx * vocabSize + tokenId] = -FLT_MAX;
+}
+
+void maskTokenRangeByMode(rt::Tensor& logits, rt::Tensor const& modeFlags, int32_t tokenIdStart, int32_t tokenIdEnd,
+    int8_t allowedMode, cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU && modeFlags.getDeviceType() == rt::DeviceType::kGPU,
+        "logits and modeFlags must be on GPU");
+    check::check(
+        logits.getDataType() == nvinfer1::DataType::kFLOAT && modeFlags.getDataType() == nvinfer1::DataType::kINT8,
+        "logits must be FLOAT and modeFlags must be INT8");
+
+    auto const logitsShape = logits.getShape();
+    auto const modeShape = modeFlags.getShape();
+    check::check(logitsShape.getNumDims() == 2, "logits must be 2D [batch, vocab]");
+    check::check(modeShape.getNumDims() == 1, "modeFlags must be 1D [batch]");
+
+    int32_t const batchSize = logitsShape[0];
+    int32_t const vocabSize = logitsShape[1];
+    check::check(modeShape[0] == batchSize, "modeFlags batch size mismatch");
+    check::check(tokenIdStart >= 0 && tokenIdEnd < vocabSize && tokenIdStart <= tokenIdEnd,
+        "Invalid token range for masking");
+
+    int32_t const tokenCount = tokenIdEnd - tokenIdStart + 1;
+    if (batchSize == 0 || tokenCount == 0)
+    {
+        return;
+    }
+
+    constexpr int32_t BLOCK_SIZE = 256;
+    dim3 const block(BLOCK_SIZE);
+    dim3 const grid((tokenCount + BLOCK_SIZE - 1) / BLOCK_SIZE, batchSize);
+    maskTokenRangeByModeKernel<<<grid, block, 0, stream>>>(
+        logits.dataPointer<float>(), modeFlags.dataPointer<int8_t>(), batchSize, vocabSize, tokenIdStart, tokenCount,
+        allowedMode);
+}
+
 } // namespace trt_edgellm

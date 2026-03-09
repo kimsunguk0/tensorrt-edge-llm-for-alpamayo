@@ -29,6 +29,7 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
+#include <chrono>
 #include <fstream>
 #include <functional>
 #include <string>
@@ -130,6 +131,8 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
             "LLMInferenceRuntime::mHostContextLengths");
         mHostReuseKVCacheLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU,
             DataType::kINT32, "LLMInferenceRuntime::mHostReuseKVCacheLengths");
+        mTrajectoryModeFlags = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT8,
+            "LLMInferenceRuntime::mTrajectoryModeFlags");
     }
     catch (std::exception const& e)
     {
@@ -145,6 +148,34 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     {
         LOG_ERROR("Failed to load tokenizer from model directory: %s", engineDir.c_str());
         throw std::runtime_error("Failed to load tokenizer from model directory: " + engineDir);
+    }
+
+    // Resolve token IDs used for trajectory-gated masking of index tokens (<i0..>).
+    tokenizer::Rank indexTokenIdStart{-1};
+    tokenizer::Rank indexTokenIdEnd{-1};
+    tokenizer::Rank trajFutureStartTokenId{-1};
+    tokenizer::Rank trajFutureEndTokenId{-1};
+    bool const hasIndexTokenRange = mTokenizer->getIndexTokenIdRange(indexTokenIdStart, indexTokenIdEnd);
+    bool const hasTrajFutureStart = mTokenizer->getSpecialTokenId("<|traj_future_start|>", trajFutureStartTokenId);
+    bool const hasTrajFutureEnd = mTokenizer->getSpecialTokenId("<|traj_future_end|>", trajFutureEndTokenId);
+
+    if (hasIndexTokenRange && hasTrajFutureStart && hasTrajFutureEnd && indexTokenIdStart >= 0
+        && indexTokenIdEnd < mEngineConfig.outputVocabSize)
+    {
+        mEnableTrajectoryIndexTokenGating = true;
+        mIndexTokenIdStart = indexTokenIdStart;
+        mIndexTokenIdEnd = indexTokenIdEnd;
+        mTrajFutureStartTokenId = trajFutureStartTokenId;
+        mTrajFutureEndTokenId = trajFutureEndTokenId;
+        LOG_INFO("Enabled trajectory-gated index-token mask: <i*> token IDs [%d, %d], start=%d, end=%d",
+            mIndexTokenIdStart, mIndexTokenIdEnd, mTrajFutureStartTokenId, mTrajFutureEndTokenId);
+    }
+    else
+    {
+        LOG_WARNING(
+            "Trajectory-gated index-token mask disabled (hasIndexRange=%s, hasStart=%s, hasEnd=%s, vocab=%d).",
+            hasIndexTokenRange ? "true" : "false", hasTrajFutureStart ? "true" : "false",
+            hasTrajFutureEnd ? "true" : "false", mEngineConfig.outputVocabSize);
     }
 
     // Optional: Load vocabulary mapping table if reduced vocabulary is used
@@ -317,9 +348,14 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
 bool LLMInferenceRuntime::handleRequest(
     LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream)
 {
+    mHasLastVlmPostVisionToOutputTiming = false;
+    mLastVlmPostVisionToOutputMs = 0.0;
+
     std::vector<std::vector<int32_t>> batchedInputIds;
     std::vector<std::string> batchSystemPrompts;
     std::string loraWeightsName = request.loraWeightsName;
+    bool hasVlmPostVisionStart = false;
+    std::chrono::steady_clock::time_point vlmPostVisionStart{};
 
     if (!examineRequest(request))
     {
@@ -392,6 +428,11 @@ bool LLMInferenceRuntime::handleRequest(
             LOG_ERROR("LLMInferenceRuntime(): Multimodal inference failed. This request cannot be handled.");
             return false;
         }
+
+        // Start VLM-only timing window after vision encoder is done.
+        // This captures: LLM token preparation/prefill/generation + output text decode.
+        vlmPostVisionStart = std::chrono::steady_clock::now();
+        hasVlmPostVisionStart = true;
     }
 
     // Conduct the preparation work to handle a new set of sequences, including inputIds packing, input/output tensor
@@ -423,13 +464,25 @@ bool LLMInferenceRuntime::handleRequest(
     int32_t generationIter{0};
     std::vector<std::vector<int32_t>> outputIds(activeBatchSize);
     std::vector<bool> finishedStates(activeBatchSize, false);
+    // 0: natural language / CoT (mask <i*>), 1: trajectory mode (allow <i*>)
+    std::vector<int8_t> trajectoryModeFlags(activeBatchSize, 0);
     mSelectedIndices.reshape({activeBatchSize, 1});
     mHostSelectedTokenIds.reshape({activeBatchSize});
+    mTrajectoryModeFlags.reshape({activeBatchSize});
     int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
 
     SamplingParams params(
         activeBatchSize, mEngineConfig.outputVocabSize, request.temperature, request.topK, request.topP);
-    auto sampleTokens = [&]() {
+    auto sampleTokens = [&]() -> bool {
+        // In natural language / CoT mode, forbid all <i0..> action tokens.
+        if (mEnableTrajectoryIndexTokenGating)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(mTrajectoryModeFlags.rawPointer(), trajectoryModeFlags.data(),
+                activeBatchSize * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
+            trt_edgellm::maskTokenRangeByMode(
+                mOutputLogits, mTrajectoryModeFlags, mIndexTokenIdStart, mIndexTokenIdEnd, 1, stream);
+        }
+
         trt_edgellm::topKtopPSamplingFromLogits(mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream);
         // Apply vocabulary mapping if reduced vocabulary is used
         if (mEngineConfig.reducedVocabSize > 0)
@@ -443,8 +496,22 @@ bool LLMInferenceRuntime::handleRequest(
         {
             if (!finishedStates[i])
             {
-                outputIds[i].push_back(hostSelectedTokenIdsData[i]);
-                finishedStates[i] = hostSelectedTokenIdsData[i] == mTokenizer->getEosId();
+                int32_t const selectedTokenId = hostSelectedTokenIdsData[i];
+                outputIds[i].push_back(selectedTokenId);
+
+                if (mEnableTrajectoryIndexTokenGating)
+                {
+                    if (selectedTokenId == mTrajFutureStartTokenId)
+                    {
+                        trajectoryModeFlags[i] = 1;
+                    }
+                    else if (selectedTokenId == mTrajFutureEndTokenId)
+                    {
+                        trajectoryModeFlags[i] = 0;
+                    }
+                }
+
+                finishedStates[i] = selectedTokenId == mTokenizer->getEosId();
                 if (finishedStates[i])
                 {
                     unFinishedBatchNum--;
@@ -452,6 +519,7 @@ bool LLMInferenceRuntime::handleRequest(
             }
         }
         ++generationIter;
+        return true;
     };
 
     // Perform embedding lookup for prefill
@@ -526,7 +594,11 @@ bool LLMInferenceRuntime::handleRequest(
                 "LLMInferenceRuntime(): Failed to execute prefill step. Cannot generate the KVCache for this prompt.");
             return false;
         }
-        sampleTokens();
+        if (!sampleTokens())
+        {
+            LOG_ERROR("LLMInferenceRuntime(): Failed to sample tokens during prefill.");
+            return false;
+        }
     }
 
     // Record prefill metrics
@@ -565,7 +637,11 @@ bool LLMInferenceRuntime::handleRequest(
                 return false;
             }
 
-            sampleTokens();
+            if (!sampleTokens())
+            {
+                LOG_ERROR("LLMInferenceRuntime(): Failed to sample tokens during generation.");
+                return false;
+            }
         }
     }
 
@@ -588,6 +664,14 @@ bool LLMInferenceRuntime::handleRequest(
     {
         response.outputIds.emplace_back(outputIds[i]);
         response.outputTexts.emplace_back(mTokenizer->decode(outputIds[i], true));
+    }
+
+    if (hasVlmPostVisionStart)
+    {
+        auto const vlmPostVisionEnd = std::chrono::steady_clock::now();
+        mLastVlmPostVisionToOutputMs
+            = std::chrono::duration<double, std::milli>(vlmPostVisionEnd - vlmPostVisionStart).count();
+        mHasLastVlmPostVisionToOutputTiming = true;
     }
 
     return true;
@@ -631,6 +715,28 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
             "LoRA weights.");
     }
     return captureStatus;
+}
+
+rt::Tensor LLMInferenceRuntime::getKVCacheBuffer()
+{
+    return mLLMEngineRunner->getLinearKVCache().getKVCacheBuffer();
+}
+
+rt::Tensor LLMInferenceRuntime::getKVCacheLengths()
+{
+    rt::Tensor& kvCacheLengths = mLLMEngineRunner->getLinearKVCache().getKVCacheLengths();
+    return rt::Tensor(kvCacheLengths.rawPointer(), kvCacheLengths.getShape(), kvCacheLengths.getDeviceType(),
+        kvCacheLengths.getDataType(), kvCacheLengths.getName());
+}
+
+rt::OptionalInputTensor LLMInferenceRuntime::getPositionIds() const
+{
+    return mMultimodalRunner ? mMultimodalRunner->getPositionIds() : std::nullopt;
+}
+
+rt::OptionalInputTensor LLMInferenceRuntime::getRopeDeltas() const
+{
+    return mMultimodalRunner ? mMultimodalRunner->getRopeDeltas() : std::nullopt;
 }
 
 LLMInferenceRuntime::TokenCountInfo LLMInferenceRuntime::calculateTokenCounts(

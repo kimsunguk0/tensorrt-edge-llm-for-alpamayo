@@ -42,7 +42,7 @@ constexpr int kReasonableMaxBatchSize = 16;
 // Validation limits for message parsing.
 constexpr size_t kMaxMessageContentSizeBytes = 128 * 1024; // 128KB per content item
 constexpr size_t kMaxMessagesPerRequest = 64;
-constexpr size_t kMaxContentItemsPerMessage = 16;
+constexpr size_t kMaxContentItemsPerMessage = 32;
 
 } // namespace security
 

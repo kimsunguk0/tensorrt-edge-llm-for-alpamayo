@@ -267,6 +267,8 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
         nvinfer1::DataType::kINT64, "QwenViTRunner::mMropePositionIdsHost");
     mMropePositionIdsDevice = rt::Tensor({mLLMMaxBatchSize, 3, mLLMMaxSequenceLength}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kINT64, "QwenViTRunner::mMropePositionIdsDevice");
+    mRopeDeltasHost = rt::Tensor(
+        {mLLMMaxBatchSize, 1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64, "QwenViTRunner::mRopeDeltasHost");
 
     // Pre-allocate tensors for cumulative sequence lengths.
     // The size of the tensor is maxNumImages + 1 because the first element is 0.
@@ -564,7 +566,34 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
     // Initialize mropePositionIds and copy to device
     mMropePositionIdsHost.reshape({activeBatchSize, 3, maxPositionEmbeddings});
     mMropePositionIdsDevice.reshape({activeBatchSize, 3, maxPositionEmbeddings});
+    mRopeDeltasHost.reshape({activeBatchSize, 1});
     getMRopePositionIds(batchInputIds, imageGridTHWs);
+
+    // Match Hugging Face rope_deltas semantics: max(active_position_ids) + 1 - input_length.
+    int64_t const* mropePositionIdsPtr = mMropePositionIdsHost.dataPointer<int64_t>();
+    int64_t* ropeDeltasPtr = mRopeDeltasHost.dataPointer<int64_t>();
+    for (int64_t batchIdx = 0; batchIdx < activeBatchSize; ++batchIdx)
+    {
+        int64_t const inputLength = static_cast<int64_t>(batchInputIds[batchIdx].size());
+        if (inputLength <= 0)
+        {
+            ropeDeltasPtr[batchIdx] = 0;
+            continue;
+        }
+
+        int64_t const batchOffset = batchIdx * 3 * maxPositionEmbeddings;
+        int64_t maxActivePositionId = 0;
+        for (int64_t axis = 0; axis < 3; ++axis)
+        {
+            int64_t const axisOffset = batchOffset + axis * maxPositionEmbeddings;
+            for (int64_t pos = 0; pos < inputLength; ++pos)
+            {
+                maxActivePositionId = std::max(maxActivePositionId, mropePositionIdsPtr[axisOffset + pos]);
+            }
+        }
+        ropeDeltasPtr[batchIdx] = maxActivePositionId + 1 - inputLength;
+    }
+
     CUDA_CHECK(cudaMemcpyAsync(mMropePositionIdsDevice.rawPointer(), mMropePositionIdsHost.rawPointer(),
         activeBatchSize * 3 * maxPositionEmbeddings * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
 
@@ -818,6 +847,16 @@ rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()
         refs.emplace_back(std::cref(tensor));
     }
     return refs;
+}
+
+rt::OptionalInputTensor QwenViTRunner::getPositionIds()
+{
+    return std::cref(mMropePositionIdsHost);
+}
+
+rt::OptionalInputTensor QwenViTRunner::getRopeDeltas()
+{
+    return std::cref(mRopeDeltasHost);
 }
 
 } // namespace rt

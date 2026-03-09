@@ -127,6 +127,14 @@ Each request in the `requests` array is an object with the following fields:
 
 - **`save_system_prompt_kv_cache`** (boolean, default: false): Whether to save the system prompt KV cache for later reuse. This is useful for optimizing performance when using the same system prompt across multiple requests, as it avoids recomputing the KV cache for the system prompt. Note: If any request in a batch sets this to `true`, all requests in that batch will cache the system prompt KV cache.
 
+- **`ego_history_xyz_npy`** (string): Optional path to a float32 `.npy` file containing a single ego history trajectory. If provided, `llm_inference` will load the array and inject trajectory tokens into any text content containing `<|traj_history_start|>...<|traj_history_end|>`.
+
+- **`ego_history_rot_npy`** (string): Optional path to a float32 `.npy` file containing ego history rotations. Required when `predict_yaw` is enabled for trajectory tokenization.
+
+- **`predict_yaw`** (boolean, default: false): Whether to tokenize yaw deltas in addition to XYZ deltas when generating trajectory tokens from `.npy` inputs.
+
+- **`traj_token_offset`** (integer, default: 3000): Offset added to generated trajectory token IDs before formatting them as `<i*>` tokens.
+
 ### Message Structure
 
 Each message object contains:

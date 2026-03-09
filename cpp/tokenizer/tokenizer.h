@@ -245,6 +245,22 @@ public:
         return mChatTemplate.defaultSystemPrompt;
     }
 
+    /**
+     * @brief Get a special token ID by exact token string
+     * @param token Special token text (e.g., "<|traj_future_start|>")
+     * @param tokenId Output token ID if found
+     * @return true if token exists in special token table, false otherwise
+     */
+    bool getSpecialTokenId(std::string const& token, Rank& tokenId) const noexcept;
+
+    /**
+     * @brief Get contiguous token ID range for index tokens in format "<iN>"
+     * @param rangeStart Output first token ID in range
+     * @param rangeEnd Output last token ID in range
+     * @return true if index tokens exist and IDs form a contiguous range, false otherwise
+     */
+    bool getIndexTokenIdRange(Rank& rangeStart, Rank& rangeEnd) const noexcept;
+
 protected:
     /**
      * @brief Parse tokenizer.json to extract configuration

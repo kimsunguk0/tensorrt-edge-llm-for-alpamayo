@@ -1,0 +1,91 @@
+{
+  "requests": [
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a driving assistant that generates safe and accurate actions."
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam0_f0.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam0_f1.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam0_f2.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam0_f3.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam1_f0.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam1_f1.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam1_f2.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam1_f3.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam2_f0.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam2_f1.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam2_f2.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam2_f3.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam3_f0.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam3_f1.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam3_f2.png"
+            },
+            {
+              "type": "image",
+              "image": "/root/TensorRT-Edge-LLM/input/images/cam3_f3.png"
+            },
+            {
+              "type": "text",
+              "text": "<|traj_history_start|><|traj_history_end|>output the chain-of-thought reasoning of the driving process, then output the future trajectory."
+            }
+          ]
+        }
+      ],
+      "max_generate_length": 256,
+      "temperature": 0.6,
+      "top_k": 50,
+      "top_p": 0.98,
+      "ego_history_xyz_npy": "/root/TensorRT-Edge-LLM/input/ego/ego_history_xyz.npy",
+      "ego_history_rot_npy": "/root/TensorRT-Edge-LLM/input/ego/ego_history_rot.npy"
+    }
+  ]
+}

@@ -115,6 +115,14 @@ public:
     //! @return Optional deepstack features vector (raw features before embedding lookup)
     virtual rt::OptionalInputTensors getDeepstackFeatures();
 
+    //! @brief Get current text-model position IDs used to build multimodal mRoPE inputs
+    //! @return Optional tensor view with shape [batch_size, 3, max_position_embeddings]
+    virtual rt::OptionalInputTensor getPositionIds();
+
+    //! @brief Get rope deltas matching the current multimodal request
+    //! @return Optional tensor view with shape [batch_size, 1]
+    virtual rt::OptionalInputTensor getRopeDeltas();
+
     /*!
      * @brief Validate and fill configuration from file
      * @param engineDir Path to engine directory

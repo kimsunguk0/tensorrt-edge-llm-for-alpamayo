@@ -23,3 +23,8 @@ target_include_directories(
   llm_inference PRIVATE ${COMMON_INCLUDE_DIRS}
                         ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(llm_inference)
+
+add_executable(traj_tokenize traj_tokenize.cpp)
+target_link_libraries(traj_tokenize PRIVATE edgellmCore commonLibraryExt)
+target_include_directories(traj_tokenize PRIVATE ${COMMON_INCLUDE_DIRS})
+add_cross_build_link_options(traj_tokenize)

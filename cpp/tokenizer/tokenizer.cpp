@@ -19,8 +19,10 @@
 #include "common/inputLimits.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizerUtils.h"
+#include <cctype>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -33,6 +35,28 @@ namespace tokenizer
 
 // Chat template role names
 constexpr char kRoleSystem[] = "system";
+
+bool parseIndexToken(std::string const& token, int32_t& indexValue)
+{
+    // Expected format: <i123>
+    if (token.size() < 4 || token[0] != '<' || token[1] != 'i' || token.back() != '>')
+    {
+        return false;
+    }
+
+    int32_t value = 0;
+    for (size_t i = 2; i + 1 < token.size(); ++i)
+    {
+        unsigned char c = static_cast<unsigned char>(token[i]);
+        if (!std::isdigit(c))
+        {
+            return false;
+        }
+        value = value * 10 + static_cast<int32_t>(c - '0');
+    }
+    indexValue = value;
+    return true;
+}
 
 Tokenizer::Tokenizer()
     : mNumVocab(0)
@@ -861,6 +885,55 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
 
     formattedRequest.formattedSystemPrompt = formattedPrefixSystemPrompt;
     formattedRequest.formattedCompleteRequest = formattedCompleteRequest;
+    return true;
+}
+
+bool Tokenizer::getSpecialTokenId(std::string const& token, Rank& tokenId) const noexcept
+{
+    auto const it = mSpecialTokensEncoder.find(token);
+    if (it == mSpecialTokensEncoder.end())
+    {
+        return false;
+    }
+    tokenId = it->second;
+    return true;
+}
+
+bool Tokenizer::getIndexTokenIdRange(Rank& rangeStart, Rank& rangeEnd) const noexcept
+{
+    Rank minTokenId = std::numeric_limits<Rank>::max();
+    Rank maxTokenId = std::numeric_limits<Rank>::lowest();
+    int64_t indexTokenCount = 0;
+
+    for (auto const& [token, tokenId] : mSpecialTokensEncoder)
+    {
+        int32_t indexValue = 0;
+        if (!parseIndexToken(token, indexValue))
+        {
+            continue;
+        }
+        minTokenId = std::min(minTokenId, tokenId);
+        maxTokenId = std::max(maxTokenId, tokenId);
+        indexTokenCount++;
+    }
+
+    if (indexTokenCount == 0)
+    {
+        return false;
+    }
+
+    // For fast masking we require index tokens to occupy a contiguous ID range.
+    int64_t const expectedCount = static_cast<int64_t>(maxTokenId) - static_cast<int64_t>(minTokenId) + 1;
+    if (expectedCount != indexTokenCount)
+    {
+        LOG_WARNING(
+            "Index tokens are not contiguous in token ID space (count=%lld, expected=%lld). Disable index-token mask.",
+            static_cast<long long>(indexTokenCount), static_cast<long long>(expectedCount));
+        return false;
+    }
+
+    rangeStart = minTokenId;
+    rangeEnd = maxTokenId;
     return true;
 }
 

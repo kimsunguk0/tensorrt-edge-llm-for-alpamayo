@@ -165,4 +165,20 @@ size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32
  */
 void mapReducedVocabToFullVocab(rt::Tensor& vocabIds, rt::Tensor const& vocabMappingTable, cudaStream_t stream);
 
+/*!
+ * \brief Mask token logits in a contiguous token ID range based on per-batch mode flags.
+ *
+ * For each batch element, if modeFlags[batch] != allowedMode, logits[batch, tokenRange] is set to -inf.
+ * This can enforce phase-specific token constraints (e.g., allow <i*> only in trajectory mode).
+ *
+ * \param[in,out] logits Logits tensor [GPU, Float] with shape [batch-size, vocab-size]
+ * \param[in] modeFlags Mode flag tensor [GPU, Int8] with shape [batch-size]
+ * \param[in] tokenIdStart Inclusive start token ID for masking range
+ * \param[in] tokenIdEnd Inclusive end token ID for masking range
+ * \param[in] allowedMode Mode value that is allowed to keep logits unmasked
+ * \param[in] stream CUDA stream to execute the kernel
+ */
+void maskTokenRangeByMode(rt::Tensor& logits, rt::Tensor const& modeFlags, int32_t tokenIdStart, int32_t tokenIdEnd,
+    int8_t allowedMode, cudaStream_t stream);
+
 } // namespace trt_edgellm
