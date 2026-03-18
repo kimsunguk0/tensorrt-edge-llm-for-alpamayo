@@ -2,6 +2,82 @@
 
 This document summarizes the local build and run flow for the Alpamayo VLM setup integrated into `llm_inference`.
 
+## Current Status
+
+This repository is a working Alpamayo-oriented fork of `TensorRT-Edge-LLM` based on the upstream `v0.5.0` codebase, with local integration work for:
+
+- multimodal Alpamayo VLM inference
+- ego-history injection inside `llm_inference`
+- runtime KV capture / debug tooling
+- CARLA live producer-consumer flow
+- integrated action-expert / flow-matching trajectory decode
+- result rendering and profiling output
+
+At the moment, the end-to-end runtime path works for:
+
+- offline image + ego-history inference
+- live CARLA sample ingestion on Jetson
+- integrated action-expert trajectory generation
+- PNG visualization with timing and memory breakdown
+
+## Known Unresolved Issues
+
+### 1. Prefill mismatch vs PyTorch is not fully resolved
+
+We traced the remaining mismatch to the TRT text prefill path.
+
+Current understanding:
+
+- visual preprocessing parity improved significantly after fixing the batched resize/H2D issue
+- `position_ids` and `rope_deltas` match PyTorch
+- the first meaningful divergence appears at `q_proj / k_proj / v_proj`
+- the drift becomes larger at `q_norm / k_norm`
+- the first major amplification happens at `layer 16 mlp_down`
+
+Current conclusion:
+
+- this does **not** look like an attention-plugin-first issue
+- this does **not** look like a RoPE-metadata issue
+- the most likely first source is the TRT projection GEMM path during prefill
+
+This issue is still open.
+
+### 2. Upgrading to upstream `v0.6.0` is not a drop-in update
+
+Upstream `v0.6.0` introduces breaking changes, especially around:
+
+- ViT Attention Plugin
+- split QKV changes
+- builder refactor (`builder.*` -> `llmBuilder.*`, `visualBuilder.*`, `builderUtils.*`)
+
+That means:
+
+- old ONNX artifacts should be considered incompatible
+- our current Alpamayo-specific runtime changes need manual porting
+- upgrading should be treated as a rebase/reintegration task, not a simple fast-forward merge
+
+### 3. Current precision recommendation
+
+Based on local testing:
+
+- FP16 is the current stable path
+- INT4 and FP8 paths showed quality problems on our Alpamayo setup
+- FP8 KV-cache has not yet been revalidated in this fork
+
+## Practical Recommendation
+
+If you need the system to run today, use:
+
+- upstream base: `v0.5.0`
+- text/vision runtime: FP16
+- live CARLA ingestion: queue mode
+- action-expert integration: current `cpp` path
+
+If you want to continue core engine work, focus next on:
+
+1. projection GEMM / prefill mismatch investigation
+2. planning a clean `v0.6.0` upgrade branch
+
 ## What This Setup Does
 
 - Uses `llm_inference` as the single entry point
@@ -350,4 +426,3 @@ Typical output files:
 - The current runtime uses copied engines inside this repo
 - The `models/` directory is reserved for future use and is currently not required for inference
 - The separate `traj_tokenize` tool is no longer required for the normal single-binary flow
-
