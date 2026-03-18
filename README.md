@@ -78,6 +78,30 @@ If you want to continue core engine work, focus next on:
 1. projection GEMM / prefill mismatch investigation
 2. planning a clean `v0.6.0` upgrade branch
 
+## Official TensorRT-Edge-LLM Documentation
+
+This repository README focuses on the Alpamayo-specific runtime integration and local workflow.
+
+For the upstream TensorRT-Edge-LLM workflows below, use the official NVIDIA documentation first:
+
+- model quantization
+- HuggingFace checkpoint to ONNX export
+- engine build
+- supported precision / model matrix
+
+Recommended official links:
+
+- [TensorRT-Edge-LLM Documentation Portal](https://nvidia.github.io/TensorRT-Edge-LLM/)
+- [Quick Start Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/quick-start-guide.html)
+- [Supported Models](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/supported-models.html)
+- [Python Export Pipeline](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/python-export-pipeline.html)
+- [Engine Builder](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/engine-builder.html)
+
+In other words:
+
+- if you are trying to export a new model, quantize weights, or regenerate ONNX/engine artifacts, follow the official upstream docs
+- use this README mainly for the Alpamayo-specific runtime, CARLA live flow, and local integration details
+
 ## What This Setup Does
 
 - Uses `llm_inference` as the single entry point
