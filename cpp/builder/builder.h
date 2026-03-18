@@ -46,6 +46,10 @@ struct LLMBuilderConfig
     int64_t maxKVCacheCapacity{4096}; //!< Maximum KV cache capacity (sequence length)
     int64_t maxVerifyTreeSize{60}; //!< Maximum length of input_ids passed into Eagle base model for tree verification
     int64_t maxDraftTreeSize{60};  //!< Maximum length of input_ids passed into Eagle draft model for draft generation
+    bool disableTF32{false};        //!< Disable TF32 in builder config to reduce numeric drift
+    bool disableTimingCache{false}; //!< Disable timing cache reuse for tactic experiments
+    int32_t builderOptimizationLevel{-1}; //!< Builder optimization level override (-1 = TensorRT default)
+    uint32_t tacticSourcesMask{0};       //!< Tactic source bitmask override (0 = TensorRT default)
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -58,6 +62,10 @@ struct LLMBuilderConfig
         json["max_batch_size"] = maxBatchSize;
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
+        json["disable_tf32"] = disableTF32;
+        json["disable_timing_cache"] = disableTimingCache;
+        json["builder_optimization_level"] = builderOptimizationLevel;
+        json["tactic_sources_mask"] = tacticSourcesMask;
         // Only include Eagle-specific fields when Eagle is enabled
         if (eagleBase)
         {
@@ -100,6 +108,22 @@ struct LLMBuilderConfig
         {
             config.maxKVCacheCapacity = json["max_kv_cache_capacity"];
         }
+        if (json.contains("disable_tf32"))
+        {
+            config.disableTF32 = json["disable_tf32"];
+        }
+        if (json.contains("disable_timing_cache"))
+        {
+            config.disableTimingCache = json["disable_timing_cache"];
+        }
+        if (json.contains("builder_optimization_level"))
+        {
+            config.builderOptimizationLevel = json["builder_optimization_level"];
+        }
+        if (json.contains("tactic_sources_mask"))
+        {
+            config.tacticSourcesMask = json["tactic_sources_mask"];
+        }
         if (json.contains("max_verify_tree_size"))
         {
             config.maxVerifyTreeSize = json["max_verify_tree_size"];
@@ -123,6 +147,10 @@ struct LLMBuilderConfig
         oss << "  maxBatchSize: " << maxBatchSize << "\n";
         oss << "  maxLoraRank: " << maxLoraRank << "\n";
         oss << "  maxKVCacheCapacity: " << maxKVCacheCapacity << "\n";
+        oss << "  disableTF32: " << (disableTF32 ? "true" : "false") << "\n";
+        oss << "  disableTimingCache: " << (disableTimingCache ? "true" : "false") << "\n";
+        oss << "  builderOptimizationLevel: " << builderOptimizationLevel << "\n";
+        oss << "  tacticSourcesMask: " << tacticSourcesMask << "\n";
         // Only show Eagle-specific fields when Eagle is enabled
         if (eagleBase)
         {

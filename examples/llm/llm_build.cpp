@@ -20,10 +20,13 @@
 #include "common/fileUtils.h"
 #include "common/logger.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 using namespace trt_edgellm;
@@ -42,7 +45,11 @@ enum LLMBuildOptionId : int
     EAGLE_DRAFT = 709,
     EAGLE_BASE = 710,
     MAX_VERIFY_TREE_SIZE = 711,
-    MAX_DRAFT_TREE_SIZE = 712
+    MAX_DRAFT_TREE_SIZE = 712,
+    DISABLE_TF32 = 713,
+    BUILDER_OPTIMIZATION_LEVEL = 714,
+    TACTIC_SOURCES = 715,
+    DISABLE_TIMING_CACHE = 716
 };
 
 struct LLMBuildArgs
@@ -59,7 +66,65 @@ struct LLMBuildArgs
     bool eagleBase{false};
     int64_t maxVerifyTreeSize{60};
     int64_t maxDraftTreeSize{60};
+    bool disableTF32{false};
+    bool disableTimingCache{false};
+    int32_t builderOptimizationLevel{-1};
+    uint32_t tacticSourcesMask{0};
 };
+
+uint32_t tacticSourceBit(char const* name)
+{
+    std::string value{name ? name : ""};
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    if (value == "CUBLAS")
+    {
+        return 1U << static_cast<uint32_t>(nvinfer1::TacticSource::kCUBLAS);
+    }
+    if (value == "CUBLAS_LT" || value == "CUBLASLT")
+    {
+        return 1U << static_cast<uint32_t>(nvinfer1::TacticSource::kCUBLAS_LT);
+    }
+    if (value == "CUDNN")
+    {
+        return 1U << static_cast<uint32_t>(nvinfer1::TacticSource::kCUDNN);
+    }
+    if (value == "EDGE_MASK" || value == "EDGE_MASK_CONVOLUTIONS")
+    {
+        return 1U << static_cast<uint32_t>(nvinfer1::TacticSource::kEDGE_MASK_CONVOLUTIONS);
+    }
+    if (value == "JIT" || value == "JIT_CONVOLUTIONS")
+    {
+        return 1U << static_cast<uint32_t>(nvinfer1::TacticSource::kJIT_CONVOLUTIONS);
+    }
+    return 0;
+}
+
+bool parseTacticSources(std::string const& arg, uint32_t& mask)
+{
+    if (arg.empty())
+    {
+        return false;
+    }
+    std::stringstream ss(arg);
+    std::string item;
+    uint32_t parsedMask = 0;
+    while (std::getline(ss, item, ','))
+    {
+        if (item.empty())
+        {
+            continue;
+        }
+        uint32_t const bit = tacticSourceBit(item.c_str());
+        if (bit == 0)
+        {
+            LOG_ERROR("Unknown tactic source '%s'. Supported values: CUBLAS, CUBLAS_LT, CUDNN, EDGE_MASK, JIT", item.c_str());
+            return false;
+        }
+        parsedMask |= bit;
+    }
+    mask = parsedMask;
+    return parsedMask != 0;
+}
 
 void printUsage(char const* programName)
 {
@@ -67,7 +132,8 @@ void printUsage(char const* programName)
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
                  "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
                  "[--eagleDraft] [--eagleBase] [--maxVerifyTreeSize <int>] "
-                 "[--maxDraftTreeSize <int>]"
+                 "[--maxDraftTreeSize <int>] [--disableTF32] [--builderOptimizationLevel <int>] "
+                 "[--tacticSources <csv>] [--disableTimingCache]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
@@ -91,6 +157,12 @@ void printUsage(char const* programName)
     std::cerr << "  --maxDraftTreeSize        Maximum input_ids tokens passed into Eagle draft model for draft "
                  "generation. Default = 60"
               << std::endl
+              << "  --disableTF32             Disable TF32 during engine build" << std::endl;
+    std::cerr << "  --builderOptimizationLevel Override TensorRT builder optimization level" << std::endl;
+    std::cerr << "  --tacticSources           Comma-separated tactic source override. Supported: "
+                 "CUBLAS,CUBLAS_LT,CUDNN,EDGE_MASK,JIT"
+              << std::endl;
+    std::cerr << "  --disableTimingCache      Disable TensorRT timing cache reuse during build" << std::endl
               << std::endl;
 }
 
@@ -107,7 +179,12 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"eagleDraft", no_argument, 0, LLMBuildOptionId::EAGLE_DRAFT},
         {"eagleBase", no_argument, 0, LLMBuildOptionId::EAGLE_BASE},
         {"maxVerifyTreeSize", required_argument, 0, LLMBuildOptionId::MAX_VERIFY_TREE_SIZE},
-        {"maxDraftTreeSize", required_argument, 0, LLMBuildOptionId::MAX_DRAFT_TREE_SIZE}, {0, 0, 0, 0}};
+        {"maxDraftTreeSize", required_argument, 0, LLMBuildOptionId::MAX_DRAFT_TREE_SIZE},
+        {"disableTF32", no_argument, 0, LLMBuildOptionId::DISABLE_TF32},
+        {"builderOptimizationLevel", required_argument, 0, LLMBuildOptionId::BUILDER_OPTIMIZATION_LEVEL},
+        {"tacticSources", required_argument, 0, LLMBuildOptionId::TACTIC_SOURCES},
+        {"disableTimingCache", no_argument, 0, LLMBuildOptionId::DISABLE_TIMING_CACHE},
+        {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", buildOptions, nullptr)) != -1)
@@ -176,6 +253,20 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.maxDraftTreeSize = std::stoi(optarg);
             }
             break;
+        case LLMBuildOptionId::DISABLE_TF32: args.disableTF32 = true; break;
+        case LLMBuildOptionId::BUILDER_OPTIMIZATION_LEVEL:
+            if (optarg)
+            {
+                args.builderOptimizationLevel = std::stoi(optarg);
+            }
+            break;
+        case LLMBuildOptionId::TACTIC_SOURCES:
+            if (optarg && !parseTacticSources(optarg, args.tacticSourcesMask))
+            {
+                return false;
+            }
+            break;
+        case LLMBuildOptionId::DISABLE_TIMING_CACHE: args.disableTimingCache = true; break;
         default: LOG_ERROR("Invalid Argument %c is %s.", opt, optarg); return false;
         }
     }
@@ -226,6 +317,10 @@ int main(int argc, char** argv)
     config.eagleBase = args.eagleBase;
     config.maxVerifyTreeSize = args.maxVerifyTreeSize;
     config.maxDraftTreeSize = args.maxDraftTreeSize;
+    config.disableTF32 = args.disableTF32;
+    config.disableTimingCache = args.disableTimingCache;
+    config.builderOptimizationLevel = args.builderOptimizationLevel;
+    config.tacticSourcesMask = args.tacticSourcesMask;
 
     // Create and run the builder
     builder::LLMBuilder llmBuilder(args.onnxDir, args.engineDir, config);

@@ -199,6 +199,41 @@ std::string printOptimizationProfile(nvinfer1::IOptimizationProfile const* profi
     }
     return oss.str();
 }
+
+void applyCommonBuilderConfigOverrides(
+    nvinfer1::IBuilderConfig& config, trt_edgellm::builder::LLMBuilderConfig const& builderConfig)
+{
+#if NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6
+    config.setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
+#endif
+    if (builderConfig.disableTF32)
+    {
+        config.clearFlag(nvinfer1::BuilderFlag::kTF32);
+        LOG_INFO("Builder override: disabled TF32");
+    }
+    if (builderConfig.disableTimingCache)
+    {
+        config.setFlag(nvinfer1::BuilderFlag::kDISABLE_TIMING_CACHE);
+        LOG_INFO("Builder override: disabled timing cache");
+    }
+    if (builderConfig.builderOptimizationLevel >= 0)
+    {
+        config.setBuilderOptimizationLevel(builderConfig.builderOptimizationLevel);
+        LOG_INFO("Builder override: builder optimization level = %d", builderConfig.builderOptimizationLevel);
+    }
+    if (builderConfig.tacticSourcesMask != 0)
+    {
+        bool const tacticStatus = config.setTacticSources(builderConfig.tacticSourcesMask);
+        if (!tacticStatus)
+        {
+            LOG_WARNING("Builder override: failed to set tactic sources mask = %u", builderConfig.tacticSourcesMask);
+        }
+        else
+        {
+            LOG_INFO("Builder override: tactic sources mask = %u", builderConfig.tacticSourcesMask);
+        }
+    }
+}
 } // namespace
 
 // LLMBuilder implementation
@@ -270,14 +305,12 @@ bool LLMBuilder::build()
 
     // Create builder config
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
-#if NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6
-    config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
-#endif
     if (!config)
     {
         LOG_ERROR("Failed to create builder config.");
         return false;
     }
+    applyCommonBuilderConfigOverrides(*config, mBuilderConfig);
 
     // Setup optimization profiles
     if (!setupLLMOptimizationProfiles(builder.get(), config.get(), network.get()))
