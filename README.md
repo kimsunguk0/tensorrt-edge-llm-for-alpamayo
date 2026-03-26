@@ -1,127 +1,203 @@
-<div align="center">
+# Alpamayo VLM on TensorRT-Edge-LLM v0.6.0
 
-# TensorRT Edge-LLM
+This fork layers an Alpamayo 1.5 post-VLM trajectory stack on top of NVIDIA TensorRT-Edge-LLM v0.6.0.
 
-**High-Performance Large Language Model Inference Framework for NVIDIA Edge Platforms**
+The main additions are:
+- native C++ post-VLM runtime for Alpamayo FM/action decoding
+- FM one-step ONNX export entrypoint inside the repo
+- live sample consumer for Alpamayo 1.5
+- persistent `llm_inference` mode for reusing loaded engines across live requests
 
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-Edge-LLM/)
-[![version](https://img.shields.io/badge/release-0.6.0-green)](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/tensorrt_edgellm/version.py)
-[![license](https://img.shields.io/badge/license-Apache%202-blue)](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/LICENSE)
+The original NVIDIA top-level README is preserved as [README_nvidia.md](README_nvidia.md).
 
-[Overview](https://nvidia.github.io/TensorRT-Edge-LLM/latest/overview.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Quick Start](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](https://nvidia.github.io/TensorRT-Edge-LLM/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Roadmap](https://github.com/NVIDIA/TensorRT-Edge-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3ARoadmap)
+## What This Fork Adds
 
----
-<div align="left">
+Key custom files:
+- `cpp/runtime/alpamayoFmRuntime.*`
+- `cpp/runtime/alpamayoPostVlmRuntime.*`
+- `cpp/common/deltaTrajectoryTokenizer.*`
+- `cpp/common/npyUtils.*`
+- `tensorrt_edgellm/onnx_export/fm_export.py`
+- `tensorrt_edgellm/scripts/export_fm.py`
+- `jetson_live_infer_alpamayo15.py`
 
-## Overview
+## Repository Layout
 
-TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large Language Models (LLMs) and Vision-Language Models (VLMs) on embedded platforms. It enables efficient deployment of state-of-the-art language models on resource-constrained devices such as NVIDIA Jetson and NVIDIA DRIVE platforms. TensorRT Edge-LLM provides convenient Python scripts to convert HuggingFace checkpoints to [ONNX](https://onnx.ai). Engine build and end-to-end inference runs entirely on Edge platforms.
+Important paths used in this fork:
+- `examples/llm/llm_inference.cpp`: main inference binary with Alpamayo post-VLM hooks
+- `jetson_live_infer_alpamayo15.py`: live HTTP sample consumer
+- `input/requests/`: request JSON inputs
+- `input/images/`, `input/ego/`: image and ego-history assets used by requests
+- `output/`: runtime outputs, profiles, trajectories, dashboards
 
----
+## Prerequisites
 
-## Getting Started
+This fork assumes the standard TensorRT-Edge-LLM build prerequisites plus:
+- TensorRT installation available through `TRT_PACKAGE_DIR`
+- CUDA toolkit available through `CUDA_DIR` or `CUDA_CTK_VERSION`
+- Alpamayo 1.5 Python source tree available separately for FM export
+- prebuilt Alpamayo VLM TensorRT engines for the VLM stage
 
-For the supported platforms, models and precisions, see the [**Overview**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/overview.html). Get started with TensorRT Edge-LLM in <15 minutes. For complete installation and usage instructions, see the [**Quick Start Guide**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html).
+Typical engine layout used during development:
+- LLM/VLM engine dir: `/alpamayo_vlm_engines/alpa1.5`
+- FM engine plan: `/root/test/output/alpamayo15_fm_one_step_fp16_true/alpamayo15_fm_one_step_fp16_true_thor.plan`
 
----
+## Build
 
-## Documentation
+Standard CMake configure:
 
-### Introduction
+```bash
+cd /root/TensorRT-Edge-LLM-v060
+cmake -S . -B build \
+  -DTRT_PACKAGE_DIR=/path/to/TensorRT \
+  -DCUDA_CTK_VERSION=12.8
+```
 
-- **[Overview](https://nvidia.github.io/TensorRT-Edge-LLM/latest/overview.html)** - What is TensorRT Edge-LLM and key features
-- **[Supported Models](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/supported-models.html)** - Complete model compatibility matrix
+Build the inference binary:
 
-### User Guide
+```bash
+cmake --build build --target llm_inference -j$(nproc)
+```
 
-- **[Installation](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/installation.html)** - Set up Python export pipeline and C++ runtime
-- **[Quick Start Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html)** - Run your first inference in ~15 minutes
-- **[Examples](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/examples/index.html)** - End-to-end workflows
-- **[Input Format Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/format/input-format.html)** - Request format and specifications
-- **[Chat Template Format](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/format/chat-template-format.html)** - Chat template configuration
+Notes:
+- the live Python runner expects the plugin library at `build/libNvInfer_edgellm_plugin.so`
+- if you run the binary manually from outside the repo root, set `EDGELLM_PLUGIN_PATH` explicitly
 
-### Developer Guide
+Example:
 
-#### Software Design
+```bash
+export EDGELLM_PLUGIN_PATH=/root/TensorRT-Edge-LLM-v060/build/libNvInfer_edgellm_plugin.so
+```
 
-- **[Python Export Pipeline](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/python-export-pipeline.html)** - Model export and quantization
-- **[Engine Builder](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/engine-builder.html)** - Building TensorRT engines
-- **[C++ Runtime Overview](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/cpp-runtime-overview.html)** - Runtime system architecture
-  - [LLM Inference Runtime](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/llm-inference-runtime.html)
-  - [LLM SpecDecode Runtime](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/llm-inference-specdecode-runtime.html)
+## Export FM ONNX
 
-#### Advanced Topics
+This fork includes an in-repo FM export CLI:
 
-- **[Customization Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/customization/customization-guide.html)** - Customizing TensorRT Edge-LLM for your needs
-- **[TensorRT Plugins](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/customization/tensorrt-plugins.html)** - Custom plugin development
-- **[Tests](tests/)** - Comprehensive test suite for contributors
+```bash
+PYTHONPATH=/root/TensorRT-Edge-LLM-v060 python -m tensorrt_edgellm.scripts.export_fm \
+  --model_dir /path/to/alpamayo/model \
+  --alpamayo_src_dir /path/to/alpamayo1.5/src \
+  --packet /path/to/replay_packet.pt \
+  --output_dir /path/to/export_dir \
+  --max_seq_len 8192 \
+  --dtype fp16
+```
 
----
+Useful options:
+- `--dtype {bf16,fp16}`
+- `--check_only` to validate wrapper wiring without exporting ONNX
 
-## Use Cases
+## Non-Live Inference
 
-**🚗 Automotive**
-- In-vehicle AI assistants
-- Voice-controlled interfaces
-- Scene understanding
-- Driver assistance systems
+The integrated Alpamayo path is driven through `llm_inference`.
 
-**🤖 Robotics**
-- Natural language interaction
-- Task planning and reasoning
-- Visual question answering
-- Human-robot collaboration
+Minimal example:
 
-**🏭 Industrial IoT**
-- Equipment monitoring with NLP
-- Automated inspection
-- Predictive maintenance
-- Voice-controlled machinery
+```bash
+/root/TensorRT-Edge-LLM-v060/build/examples/llm/llm_inference \
+  --engineDir /alpamayo_vlm_engines/alpa1.5 \
+  --multimodalEngineDir /alpamayo_vlm_engines/alpa1.5 \
+  --fmEngine /root/test/output/alpamayo15_fm_one_step_fp16_true/alpamayo15_fm_one_step_fp16_true_thor.plan \
+  --alpamayoPostVlmRuntime \
+  --inputFile /root/test/input/alpamayo15_b2_native_no_nav_request_with_fm.json \
+  --outputFile /tmp/alpamayo_output.json \
+  --warmup 0
+```
 
-**📱 Edge Devices**
-- On-device chatbots
-- Offline language processing
-- Privacy-preserving AI
-- Low-latency inference
+Optional flags:
+- `--alpamayoNavCfg` to enable guided/unguided nav CFG path
+- `--dumpProfile` and `--profileOutputFile <path>` for single-shot timing dumps
+- `--dumpKVCache` for KV cache export
 
----
+## Live Inference
 
-## Tech Blogs
+The live consumer polls an HTTP sample server that exposes Alpamayo-formatted NPZ payloads at `/latest`.
 
-*Coming soon*
+Basic run:
 
-Stay tuned for technical deep-dives, optimization guides, and deployment best practices.
+```bash
+python /root/TensorRT-Edge-LLM-v060/jetson_live_infer_alpamayo15.py \
+  --server-url http://<sample-server>:8765 \
+  --engine-dir /alpamayo_vlm_engines/alpa1.5 \
+  --multimodal-engine-dir /alpamayo_vlm_engines/alpa1.5 \
+  --fm-engine /root/test/output/alpamayo15_fm_one_step_fp16_true/alpamayo15_fm_one_step_fp16_true_thor.plan \
+  --once
+```
 
----
+Recommended live mode:
 
-## Latest News
+```bash
+python /root/TensorRT-Edge-LLM-v060/jetson_live_infer_alpamayo15.py \
+  --server-url http://<sample-server>:8765 \
+  --engine-dir /alpamayo_vlm_engines/alpa1.5 \
+  --multimodal-engine-dir /alpamayo_vlm_engines/alpa1.5 \
+  --fm-engine /root/test/output/alpamayo15_fm_one_step_fp16_true/alpamayo15_fm_one_step_fp16_true_thor.plan \
+  --persistent-llm-inference
+```
 
-* [01/05] 🚀 Accelerate AI Inference for Edge and Robotics with NVIDIA Jetson T4000 and NVIDIA JetPack 7.1 ✨ [➡️ link](https://developer.nvidia.com/blog/accelerate-ai-inference-for-edge-and-robotics-with-nvidia-jetson-t4000-and-nvidia-jetpack-7-1/)
-* [01/05] 🚀 Accelerating LLM and VLM Inference for Automotive and Robotics with NVIDIA TensorRT Edge-LLM ✨ [➡️ link](https://developer.nvidia.com/blog/accelerating-llm-and-vlm-inference-for-automotive-and-robotics-with-nvidia-tensorrt-edge-llm/)
+Useful live flags:
+- `--once`
+- `--dump-profile`
+- `--dump-kv-cache`
+- `--nav-text "..."`
+- `--dump-nav-dual-cache`
+- `--persistent-llm-inference`
 
-Follow our [GitHub repository](https://github.com/NVIDIA/TensorRT-Edge-LLM) for the latest updates, releases, and announcements.
+The live consumer writes:
+- run outputs: `output/runs/live_runtime/`
+- trajectories: `output/trajectories/live_runtime/`
+- dashboards: `output/dashboards/live_runtime/`
+- optional nav cache dumps: `output/nav_cache/live_runtime/`
 
----
+## Persistent `llm_inference` Mode
 
-## Support
+This fork adds `--persistentServer` to `llm_inference`.
 
-- **Documentation**: [Full Documentation](https://nvidia.github.io/TensorRT-Edge-LLM/)
-- **Quick Start**: [Quick Start Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html)
-- **Roadmap**: [Developer Roadmap](https://github.com/NVIDIA/TensorRT-Edge-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3ARoadmap)
-- **Issues**: [GitHub Issues](https://github.com/NVIDIA/TensorRT-Edge-LLM/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/NVIDIA/TensorRT-Edge-LLM/discussions)
-- **Forums**: [NVIDIA Developer Forums](https://forums.developer.nvidia.com/)
+In this mode the binary:
+- loads engines once
+- keeps runtime state alive
+- reads newline-delimited JSON commands from `stdin`
 
----
+Request command:
 
-## License
+```json
+{"input_file":"/path/request.json","output_file":"/path/output.json"}
+```
 
-[Apache License 2.0](LICENSE)
+Shutdown command:
 
----
+```json
+{"command":"shutdown"}
+```
 
-## Contributing
+Current limitation:
+- persistent mode disables per-request profile export through `--dumpProfile` / `--profileOutputFile`
 
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
+## Input Expectations
 
----
+The live consumer expects an NPZ sample containing:
+- `image_frames`
+- `camera_indices`
+- `ego_history_xyz`
+- `ego_history_rot`
+- `relative_timestamps`
+- `absolute_timestamps`
+- `t0_us`
+- `fixed_delta_seconds`
+- `clip_id`
+- `camera_order`
+
+Shapes used by the live path:
+- `image_frames`: `[Cam, T, C, H, W]`
+- `ego_history_xyz`: `[1, 1, 16, 3]`
+- `ego_history_rot`: `[1, 1, 16, 3, 3]`
+
+## Known Limitations
+
+- persistent server mode currently does not emit per-request profiler JSON
+- this repo does not include the external Alpamayo 1.5 source tree; FM export expects `--alpamayo_src_dir`
+- live mode is designed around an external sample server and does not include the producer implementation in this repo
+
+## Upstream Documentation
+
+For the original TensorRT-Edge-LLM overview, installation guide, and supported-platform matrix, see [README_nvidia.md](README_nvidia.md) and the upstream NVIDIA documentation linked there.
