@@ -120,6 +120,29 @@ public:
     //! @return Optional deepstack features vector (raw features before embedding lookup)
     virtual rt::OptionalInputTensors getDeepstackFeatures();
 
+    //! @brief Get cached multimodal position IDs if available
+    //! @return Optional tensor reference with shape [batch_size, 3, max_position_embeddings]
+    virtual rt::OptionalInputTensor getPositionIds();
+
+    //! @brief Get cached rope deltas if available
+    //! @return Optional tensor reference with shape [batch_size, 1]
+    virtual rt::OptionalInputTensor getRopeDeltas();
+
+    //! @brief Dump prepared multimodal debug inputs if supported by the runner.
+    //! @param requestDir Directory to write artifacts into
+    //! @param stream CUDA stream
+    //! @return True on success, false otherwise
+    virtual bool dumpDebugInputs(std::filesystem::path const& requestDir, cudaStream_t stream)
+    {
+        return true;
+    }
+
+    //! @brief Prepare multimodal debug dump before preprocess if supported by the runner.
+    //! @param requestDir Directory to write artifacts into
+    virtual void beginDebugInputsDump(std::filesystem::path const& requestDir)
+    {
+    }
+
     /*!
      * @brief Validate and fill configuration from file
      * @param engineDir Path to engine directory

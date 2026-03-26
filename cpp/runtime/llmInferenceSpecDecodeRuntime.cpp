@@ -411,7 +411,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     {
         // Apply chat template to populate both formatted system prompt and full formatted prompt
         mTokenizer->applyChatTemplate(request.requests[i], request.formattedRequests[i], request.applyChatTemplate,
-            request.addGenerationPrompt, request.enableThinking);
+            request.addGenerationPrompt, request.continueFinalMessage, request.enableThinking);
     }
 
     if (!mMultimodalRunner)

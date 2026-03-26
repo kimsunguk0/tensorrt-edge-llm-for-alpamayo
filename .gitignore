@@ -20,3 +20,9 @@ docs/build/
 docs/source/cpp_api/
 docs/source/cpp_api.rst
 docs/source/python_api.rst
+
+# Local runtime artifacts for Alpamayo live / debugging
+output/
+
+# Generated CuTe DSL artifacts are build outputs, not source
+cpp/kernels/contextAttentionKernels/cuteDSLArtifact/

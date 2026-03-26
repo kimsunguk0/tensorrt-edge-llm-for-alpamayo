@@ -24,10 +24,13 @@
 #include "profiling/timer.h"
 #include <cmath>
 #include <cstddef>
+#include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
 
@@ -37,6 +40,76 @@ namespace trt_edgellm
 {
 namespace rt
 {
+
+namespace
+{
+bool isDebugQwenTextPreprocessEnabled()
+{
+    char const* env = std::getenv("EDGELLM_DEBUG_QWEN_TEXTPRE");
+    return env != nullptr && std::strcmp(env, "0") != 0;
+}
+
+bool copyTensorToHostBytes(rt::Tensor const& tensor, std::vector<uint8_t>& hostData, cudaStream_t stream)
+{
+    size_t const byteSize = tensor.getShape().volume() * rt::utils::getTypeSize(tensor.getDataType());
+    hostData.resize(byteSize);
+    if (byteSize == 0)
+    {
+        return true;
+    }
+
+    if (tensor.getDeviceType() == rt::DeviceType::kGPU)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(hostData.data(), tensor.rawPointer(), byteSize, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    else
+    {
+        std::memcpy(hostData.data(), tensor.rawPointer(), byteSize);
+    }
+    return true;
+}
+
+std::string getDataTypeString(nvinfer1::DataType dataType)
+{
+    using DataType = nvinfer1::DataType;
+    switch (dataType)
+    {
+    case DataType::kFLOAT: return "FLOAT32";
+    case DataType::kHALF: return "FLOAT16";
+    case DataType::kBF16: return "BF16";
+    case DataType::kINT8: return "INT8";
+    case DataType::kINT32: return "INT32";
+    case DataType::kINT64: return "INT64";
+    case DataType::kBOOL: return "BOOL";
+    case DataType::kUINT8: return "UINT8";
+    case DataType::kFP8: return "FP8";
+    default: return "UNKNOWN";
+    }
+}
+
+std::vector<int64_t> coordsToVector(rt::Coords const& coords)
+{
+    std::vector<int64_t> values;
+    values.reserve(coords.getNumDims());
+    for (int32_t i = 0; i < coords.getNumDims(); ++i)
+    {
+        values.push_back(coords[i]);
+    }
+    return values;
+}
+
+bool writeBinaryFile(std::filesystem::path const& path, void const* data, size_t size)
+{
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs.is_open())
+    {
+        return false;
+    }
+    ofs.write(static_cast<char const*>(data), static_cast<std::streamsize>(size));
+    return ofs.good();
+}
+} // namespace
 
 QwenViTRunner::QwenViTRunner(
     std::string const& engineDir, int32_t llmMaxBatchSize, int32_t llmMaxSequenceLength, cudaStream_t stream)
@@ -280,6 +353,8 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
         nvinfer1::DataType::kINT64, "QwenViTRunner::mMropePositionIdsHost");
     mMropePositionIdsDevice = rt::Tensor({mLLMMaxBatchSize, 3, mLLMMaxSequenceLength}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kINT64, "QwenViTRunner::mMropePositionIdsDevice");
+    mRopeDeltasHost = rt::Tensor(
+        {mLLMMaxBatchSize, 1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64, "QwenViTRunner::mRopeDeltasHost");
 
     return true;
 }
@@ -326,15 +401,115 @@ void QwenViTRunner::formatPatch(rt::imageUtils::ImageData const& image,
             imageSize, cudaMemcpyHostToDevice, stream));
     }
 
+    // mResizedImageHost is reused across images. Ensure the H2D copy completes before the host buffer can be
+    // overwritten by the next resize operation.
+    if (image.buffer == mResizedImageHost.buffer)
+    {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    if (!mActiveDebugDumpDir.empty())
+    {
+        auto const imageDir = mActiveDebugDumpDir / format::fmtstr("preprocess_image_%02lld", mActiveDebugImageIndex);
+        std::error_code ec;
+        std::filesystem::create_directories(imageDir, ec);
+
+        Json hostMeta{
+            {"shape", std::vector<int64_t>{height, width, channels}},
+            {"dtype", "UINT8"},
+            {"file", "host_image.bin"},
+        };
+        writeBinaryFile(imageDir / "host_image.bin", imageData, static_cast<size_t>(imageSize));
+
+        std::vector<uint8_t> imageDeviceHost;
+        copyTensorToHostBytes(mImageDevice, imageDeviceHost, stream);
+        Json imageDeviceMeta{
+            {"shape", coordsToVector(mImageDevice.getShape())},
+            {"dtype", getDataTypeString(mImageDevice.getDataType())},
+            {"file", "image_device.bin"},
+        };
+        writeBinaryFile(imageDir / "image_device.bin", imageDeviceHost.data(), imageDeviceHost.size());
+
+        Json meta{
+            {"host_image", hostMeta},
+            {"image_device", imageDeviceMeta},
+        };
+        std::ofstream metaFile(imageDir / "preprocess_stage_meta_pre_norm.json");
+        metaFile << meta.dump(2);
+    }
+
     // Normalize image
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
+
+    if (!mActiveDebugDumpDir.empty())
+    {
+        auto const imageDir = mActiveDebugDumpDir / format::fmtstr("preprocess_image_%02lld", mActiveDebugImageIndex);
+        std::vector<uint8_t> normalizedHost;
+        copyTensorToHostBytes(mNormalizedImageDevice, normalizedHost, stream);
+        Json meta;
+        {
+            std::ifstream metaFileIn(imageDir / "preprocess_stage_meta_pre_norm.json");
+            if (metaFileIn.is_open())
+            {
+                meta = Json::parse(metaFileIn, nullptr, false);
+                if (meta.is_discarded())
+                {
+                    meta = Json::object();
+                }
+            }
+        }
+        meta["normalized_image"] = Json{
+            {"shape", coordsToVector(mNormalizedImageDevice.getShape())},
+            {"dtype", getDataTypeString(mNormalizedImageDevice.getDataType())},
+            {"file", "normalized_image.bin"},
+        };
+        writeBinaryFile(imageDir / "normalized_image.bin", normalizedHost.data(), normalizedHost.size());
+        std::ofstream metaFile(imageDir / "preprocess_stage_meta_pre_transpose.json");
+        metaFile << meta.dump(2);
+    }
 
     // Transpose to patch
     kernel::transposeToPatchQwenViT(mNormalizedImageDevice, mVitInput, prevCuSeqlen * mConfig.inputDim,
         mConfig.temporalPatchSize, mConfig.patchSize, mConfig.mergeSize, stream);
 
+    if (!mActiveDebugDumpDir.empty())
+    {
+        auto const imageDir = mActiveDebugDumpDir / format::fmtstr("preprocess_image_%02lld", mActiveDebugImageIndex);
+        int64_t const rawSeqLength = curSeqLength;
+        size_t const elemSize = rt::utils::getTypeSize(mVitInput.getDataType());
+        size_t const inputOffsetBytes = static_cast<size_t>(prevCuSeqlen * mConfig.inputDim) * elemSize;
+        size_t const sliceBytes = static_cast<size_t>(rawSeqLength * mConfig.inputDim) * elemSize;
+        std::vector<uint8_t> vitSliceHost(sliceBytes);
+        CUDA_CHECK(cudaMemcpyAsync(vitSliceHost.data(),
+            static_cast<std::byte const*>(mVitInput.rawPointer()) + inputOffsetBytes, sliceBytes, cudaMemcpyDeviceToHost,
+            stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        Json meta;
+        {
+            std::ifstream metaFileIn(imageDir / "preprocess_stage_meta_pre_transpose.json");
+            if (metaFileIn.is_open())
+            {
+                meta = Json::parse(metaFileIn, nullptr, false);
+                if (meta.is_discarded())
+                {
+                    meta = Json::object();
+                }
+            }
+        }
+        meta["vit_input_slice"] = Json{
+            {"shape", std::vector<int64_t>{rawSeqLength, mConfig.inputDim}},
+            {"dtype", getDataTypeString(mVitInput.getDataType())},
+            {"file", "vit_input_slice.bin"},
+        };
+        writeBinaryFile(imageDir / "vit_input_slice.bin", vitSliceHost.data(), vitSliceHost.size());
+        std::ofstream metaFile(imageDir / "preprocess_stage_meta.json");
+        metaFile << meta.dump(2);
+    }
+
     // Update sequence length
     cuSeqlensData[cuSeqlensSize++] = static_cast<int32_t>(prevCuSeqlen + curSeqLength);
+    ++mActiveDebugImageIndex;
 }
 
 std::tuple<int64_t, int64_t> QwenViTRunner::getResizedImageSize(
@@ -574,7 +749,34 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
     // Initialize mropePositionIds and copy to device
     check::check(mMropePositionIdsHost.reshape({activeBatchSize, 3, maxPositionEmbeddings}), "Tensor reshape failed");
     check::check(mMropePositionIdsDevice.reshape({activeBatchSize, 3, maxPositionEmbeddings}), "Tensor reshape failed");
+    check::check(mRopeDeltasHost.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     getMRopePositionIds(batchInputIds, imageGridTHWs);
+
+    // Match Hugging Face rope_deltas semantics: max(active_position_ids) + 1 - input_length.
+    int64_t const* mropePositionIdsPtr = mMropePositionIdsHost.dataPointer<int64_t>();
+    int64_t* ropeDeltasPtr = mRopeDeltasHost.dataPointer<int64_t>();
+    for (int64_t batchIdx = 0; batchIdx < activeBatchSize; ++batchIdx)
+    {
+        int64_t const inputLength = static_cast<int64_t>(batchInputIds[batchIdx].size());
+        if (inputLength <= 0)
+        {
+            ropeDeltasPtr[batchIdx] = 0;
+            continue;
+        }
+
+        int64_t const batchOffset = batchIdx * 3 * maxPositionEmbeddings;
+        int64_t maxActivePositionId = 0;
+        for (int64_t axis = 0; axis < 3; ++axis)
+        {
+            int64_t const axisOffset = batchOffset + axis * maxPositionEmbeddings;
+            for (int64_t pos = 0; pos < inputLength; ++pos)
+            {
+                maxActivePositionId = std::max(maxActivePositionId, mropePositionIdsPtr[axisOffset + pos]);
+            }
+        }
+        ropeDeltasPtr[batchIdx] = maxActivePositionId + 1 - inputLength;
+    }
+
     CUDA_CHECK(cudaMemcpyAsync(mMropePositionIdsDevice.rawPointer(), mMropePositionIdsHost.rawPointer(),
         activeBatchSize * 3 * maxPositionEmbeddings * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
 
@@ -681,6 +883,14 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     bool const isQwen3Omni = (mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER);
     int32_t nextImageTokenId = mConfig.vocabSize;
 
+    if (isDebugQwenTextPreprocessEnabled())
+    {
+        LOG_INFO(
+            "QwenViTRunner::textPreprocess debug: requests=%zu imageTokenId=%d videoTokenId=%d visionStart=%d visionEnd=%d vocabSize=%d isQwen3Omni=%d",
+            request.requests.size(), mConfig.imageTokenId, mConfig.videoTokenId, mConfig.visionStartTokenId,
+            mConfig.visionEndTokenId, mConfig.vocabSize, static_cast<int>(isQwen3Omni));
+    }
+
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
         std::vector<int32_t> ids;
@@ -697,8 +907,38 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         }
 
+        int64_t placeholderMatchCount = 0;
+        int64_t imagePadCount = 0;
+        int64_t visionStartCount = 0;
+        int64_t visionEndCount = 0;
+        int64_t videoTokenCount = 0;
+        for (auto const tokenId : ids)
+        {
+            if (tokenId == mConfig.imageTokenId || tokenId == mConfig.videoTokenId)
+            {
+                ++placeholderMatchCount;
+            }
+            if (tokenId == mConfig.imageTokenId)
+            {
+                ++imagePadCount;
+            }
+            if (tokenId == mConfig.visionStartTokenId)
+            {
+                ++visionStartCount;
+            }
+            if (tokenId == mConfig.visionEndTokenId)
+            {
+                ++visionEndCount;
+            }
+            if (tokenId == mConfig.videoTokenId)
+            {
+                ++videoTokenCount;
+            }
+        }
+
         // insert image tokens
         std::vector<int32_t> newIds;
+        size_t const imageIndexStart = static_cast<size_t>(imageIndex);
         for (size_t j = 0; j < ids.size(); ++j)
         {
             if (ids[j] == mConfig.imageTokenId || ids[j] == mConfig.videoTokenId)
@@ -731,6 +971,47 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             {
                 newIds.push_back(ids[j]);
             }
+        }
+
+        if (isDebugQwenTextPreprocessEnabled())
+        {
+            std::ostringstream lengthsStream;
+            size_t const imageCountForRequest = static_cast<size_t>(numImages.at(i));
+            for (size_t localIdx = 0; localIdx < imageCountForRequest; ++localIdx)
+            {
+                if (localIdx > 0)
+                {
+                    lengthsStream << ",";
+                }
+                lengthsStream << imageTokenLengths.at(imageIndexStart + localIdx);
+            }
+
+            int64_t postImagePadCount = 0;
+            int64_t postVisionStartCount = 0;
+            int64_t postVisionEndCount = 0;
+            for (auto const tokenId : newIds)
+            {
+                if (tokenId == mConfig.imageTokenId)
+                {
+                    ++postImagePadCount;
+                }
+                if (tokenId == mConfig.visionStartTokenId)
+                {
+                    ++postVisionStartCount;
+                }
+                if (tokenId == mConfig.visionEndTokenId)
+                {
+                    ++postVisionEndCount;
+                }
+            }
+
+            LOG_INFO(
+                "QwenViTRunner::textPreprocess req=%zu ids=%zu placeholderMatches=%lld imagePad=%lld video=%lld visionStart=%lld visionEnd=%lld numImages=%lld imageTokenLengths=[%s] newIds=%zu postImagePad=%lld postVisionStart=%lld postVisionEnd=%lld",
+                i, ids.size(), static_cast<long long>(placeholderMatchCount), static_cast<long long>(imagePadCount),
+                static_cast<long long>(videoTokenCount), static_cast<long long>(visionStartCount),
+                static_cast<long long>(visionEndCount), static_cast<long long>(numImages.at(i)),
+                lengthsStream.str().c_str(), newIds.size(), static_cast<long long>(postImagePadCount),
+                static_cast<long long>(postVisionStartCount), static_cast<long long>(postVisionEndCount));
         }
 
         // Update batchInputIds
@@ -870,6 +1151,75 @@ rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()
         refs.emplace_back(std::cref(tensor));
     }
     return refs;
+}
+
+rt::OptionalInputTensor QwenViTRunner::getPositionIds()
+{
+    return std::cref(mMropePositionIdsHost);
+}
+
+rt::OptionalInputTensor QwenViTRunner::getRopeDeltas()
+{
+    return std::cref(mRopeDeltasHost);
+}
+
+bool QwenViTRunner::dumpDebugInputs(std::filesystem::path const& requestDir, cudaStream_t stream)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(requestDir, ec);
+    if (ec)
+    {
+        LOG_ERROR(
+            "QwenViTRunner::dumpDebugInputs(): Failed to create dump directory '%s': %s", requestDir.c_str(),
+            ec.message().c_str());
+        return false;
+    }
+
+    auto dumpTensor = [&](rt::Tensor const& tensor, std::string const& fileName) -> nlohmann::json {
+        std::vector<uint8_t> hostData;
+        if (!copyTensorToHostBytes(tensor, hostData, stream))
+        {
+            throw std::runtime_error("Failed to copy tensor to host");
+        }
+        std::ofstream out(requestDir / fileName, std::ios::binary);
+        out.write(reinterpret_cast<char const*>(hostData.data()), static_cast<std::streamsize>(hostData.size()));
+        return {{"file", fileName},
+            {"shape", coordsToVector(tensor.getShape())},
+            {"dtype", getDataTypeString(tensor.getDataType())},
+            {"num_bytes", static_cast<int64_t>(hostData.size())}};
+    };
+
+    nlohmann::json meta;
+    meta["visual_input"] = dumpTensor(mVitInput, "visual_input_request_0.bin");
+    meta["rotary_pos_emb"] = dumpTensor(mRotaryPosEmb, "rotary_pos_emb_request_0.bin");
+    meta["cu_seqlens"] = dumpTensor(mCuSeqlens, "cu_seqlens_request_0.bin");
+    meta["max_seqlen_carrier"] = dumpTensor(mMaxSeqLenCarrier, "max_seqlen_carrier_request_0.bin");
+    meta["image_grid_thw"] = mLastImageGridTHWs;
+
+    if (mModelType == multimodal::ModelType::QWEN3_VL
+        || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
+    {
+        meta["fast_pos_embed_idx"] = dumpTensor(mFastPosEmbIdx, "fast_pos_embed_idx_request_0.bin");
+        meta["fast_pos_embed_weight"] = dumpTensor(mFastPosEmbWeight, "fast_pos_embed_weight_request_0.bin");
+    }
+
+    std::ofstream metaFile(requestDir / "visual_inputs_request_0.json");
+    metaFile << meta.dump(2);
+    return true;
+}
+
+void QwenViTRunner::beginDebugInputsDump(std::filesystem::path const& requestDir)
+{
+    mActiveDebugDumpDir.clear();
+    mActiveDebugImageIndex = 0;
+    if (char const* env = std::getenv("EDGELLM_DUMP_VIT_PREPROCESS_STAGES"))
+    {
+        if (std::strcmp(env, "0") != 0 && std::strlen(env) > 0)
+        {
+            mActiveDebugDumpDir = requestDir;
+        }
+    }
 }
 
 } // namespace rt

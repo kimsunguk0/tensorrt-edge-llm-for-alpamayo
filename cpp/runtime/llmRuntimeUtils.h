@@ -52,6 +52,17 @@ struct Message
  */
 struct LLMGenerationRequest
 {
+    struct ActionSpaceConstants
+    {
+        float accelMean{0.0F};
+        float accelStd{0.0F};
+        float curvatureMean{0.0F};
+        float curvatureStd{0.0F};
+        float dtValue{0.1F};
+        float vLambda{1.0e-6F};
+        float vRidge{1.0e-4F};
+    };
+
     //! \cond INTERNAL
     /*!
      * @brief Formatted request structure containing chat template output
@@ -69,6 +80,17 @@ struct LLMGenerationRequest
         std::vector<Message> messages; //!< Structured messages (required - use chat template format)
         std::vector<rt::imageUtils::ImageData> imageBuffers; //!< Optional image data for multimodal inputs
         std::vector<rt::audioUtils::AudioData> audioBuffers; //!< Optional audio data for multimodal inputs (Qwen3-Omni)
+
+        // Optional Alpamayo-specific metadata carried alongside the request. Generic runtimes may ignore these.
+        std::string egoHistoryXYZNpy{};               //!< Path to ego history xyz .npy (if provided)
+        std::string egoHistoryRotNpy{};               //!< Path to ego history rot .npy (if provided)
+        bool predictYaw{false};                       //!< Whether trajectory history includes yaw conditioning
+        int32_t trajTokenOffset{3000};                //!< Offset used when injecting fused trajectory history tokens
+        std::optional<std::string> navText{};         //!< Optional route/navigation instruction text
+        std::optional<float> navGuidanceWeight{};     //!< Optional nav CFG guidance weight
+        std::optional<ActionSpaceConstants> actionSpaceConstants{}; //!< Exact decode constants for action_to_traj
+        std::optional<uint64_t> diffusionSeed{};      //!< Optional FM diffusion seed
+        std::optional<int32_t> diffusionNumSteps{};   //!< Optional FM diffusion step count
 
         mutable FormattedRequest formatted; //!< Formatted request (populated by tokenizer or user-provided)
     };
@@ -89,6 +111,9 @@ struct LLMGenerationRequest
     // Whether to add generation prompt (e.g., assistant header) at the end. Only effective when
     // applyChatTemplate=true..
     bool addGenerationPrompt{true};
+    // Whether to keep the final assistant message open (HF continue_final_message semantics).
+    // When enabled, the last assistant message suffix is omitted during chat template formatting.
+    bool continueFinalMessage{false};
     // Whether to enable thinking mode for models that support it. Default is disabled.
     bool enableThinking{false};
     // Always disable speculative decoding for this request even if Eagle Draft engine is loaded.

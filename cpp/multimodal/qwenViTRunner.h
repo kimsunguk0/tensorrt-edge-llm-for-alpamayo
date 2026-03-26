@@ -113,6 +113,20 @@ public:
     //! \return Optional input tensors vector containing deepstack features
     rt::OptionalInputTensors getDeepstackFeatures() override;
 
+    //! \brief Get cached multimodal position IDs used to construct mRoPE
+    //! \return Optional tensor reference with shape [batch_size, 3, max_position_embeddings]
+    rt::OptionalInputTensor getPositionIds() override;
+
+    //! \brief Get cached rope deltas matching the current request
+    //! \return Optional tensor reference with shape [batch_size, 1]
+    rt::OptionalInputTensor getRopeDeltas() override;
+
+    //! \brief Dump current visual-engine boundary inputs for debugging
+    bool dumpDebugInputs(std::filesystem::path const& requestDir, cudaStream_t stream) override;
+
+    //! \brief Prepare per-image preprocess dumps before preprocess begins
+    void beginDebugInputsDump(std::filesystem::path const& requestDir) override;
+
 private:
     //! \brief Calculate resized image dimensions based on dynamic resolution constraints
     //! \param[in] height Input image height
@@ -200,6 +214,7 @@ private:
     rt::imageUtils::ImageData mResizedImageHost{}; //!< Pre-allocated buffer for image resizing
     rt::Tensor mMropePositionIdsHost{};            //!< MRoPE position IDs host tensor
     rt::Tensor mMropePositionIdsDevice{};          //!< MRoPE position IDs device tensor
+    rt::Tensor mRopeDeltasHost{};                  //!< Rope deltas host tensor derived from active prompt positions
     // Qwen2.5-VL
     rt::Tensor mCuWindowSeqlens{};          //!< Cumulative window sequence lengths device tensor
     rt::Tensor mCuWindowSeqlensHost{};      //!< Cumulative window sequence lengths host tensor
@@ -211,6 +226,8 @@ private:
     rt::Tensor mFastPosEmbIdx{};                  //!< Fast position embeddings index tensor
     rt::Tensor mFastPosEmbWeight{};               //!< Fast position embeddings weight tensor
     std::vector<rt::Tensor> mDeepstackFeatures{}; //!< Deepstack features tensors
+    std::filesystem::path mActiveDebugDumpDir{};  //!< Active debug dump dir for preprocess-stage artifacts
+    int64_t mActiveDebugImageIndex{0};            //!< Current image index for preprocess-stage artifacts
 
     int32_t mLLMMaxBatchSize{0};      //!< Maximum batch size from LLM engine
     int32_t mLLMMaxSequenceLength{0}; //!< Maximum sequence length from LLM engine

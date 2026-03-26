@@ -981,7 +981,8 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
     llmReq.messages = request.messages;
     LLMGenerationRequest::FormattedRequest formatted;
     if (!mTokenizer->applyChatTemplate(
-            llmReq, formatted, request.applyChatTemplate, request.addGenerationPrompt, request.enableThinking))
+            llmReq, formatted, request.applyChatTemplate, request.addGenerationPrompt, false,
+            request.enableThinking))
     {
         LOG_ERROR("Chat template failed");
         return false;

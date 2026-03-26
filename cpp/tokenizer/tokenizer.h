@@ -230,12 +230,13 @@ public:
      * @param applyChatTemplate Whether to apply full chat template formatting (with special tokens) or raw
      * concatenation
      * @param addGenerationPrompt Whether to add generation prompt at the end (only used when applyChatTemplate is true)
+     * @param continueFinalMessage Whether to keep the final assistant message open by omitting its suffix
      * @param enableThinking Whether to enable thinking mode for models that support it
      * @return true if chat template is applied successfully; false if encountered errors
      */
     bool applyChatTemplate(rt::LLMGenerationRequest::Request const& request,
         rt::LLMGenerationRequest::FormattedRequest& formattedRequest, bool applyChatTemplate = true,
-        bool addGenerationPrompt = true, bool enableThinking = false) const;
+        bool addGenerationPrompt = true, bool continueFinalMessage = false, bool enableThinking = false) const;
 
     /**
      * @brief Get default system prompt from chat template

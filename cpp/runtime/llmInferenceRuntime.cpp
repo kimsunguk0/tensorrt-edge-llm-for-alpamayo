@@ -32,9 +32,13 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 
 using namespace nvinfer1;
@@ -44,6 +48,146 @@ namespace trt_edgellm
 
 namespace
 {
+std::string getDataTypeString(nvinfer1::DataType dataType);
+bool copyTensorToHostBytes(rt::Tensor const& tensor, std::vector<uint8_t>& hostData, cudaStream_t stream);
+
+bool isDebugQwenTextPreprocessEnabled()
+{
+    char const* env = std::getenv("EDGELLM_DEBUG_QWEN_TEXTPRE");
+    return env != nullptr && std::strcmp(env, "0") != 0;
+}
+
+std::optional<std::filesystem::path> getDebugLogitsDir()
+{
+    char const* env = std::getenv("EDGELLM_DEBUG_LOGITS_DIR");
+    if (env == nullptr || *env == '\0')
+    {
+        return std::nullopt;
+    }
+    return std::filesystem::path(env);
+}
+
+void dumpTopKLogits(rt::Tensor const& logitsTensor, int32_t selectedTokenId, int32_t generationStep, cudaStream_t stream,
+    std::filesystem::path const& outputDir, int32_t topK = 10)
+{
+    if (logitsTensor.getDataType() != DataType::kFLOAT)
+    {
+        LOG_WARNING("Skipping logits dump because mOutputLogits dtype is %s, expected FLOAT32",
+            getDataTypeString(logitsTensor.getDataType()).c_str());
+        return;
+    }
+
+    auto const shape = logitsTensor.getShape();
+    check::check(shape.getNumDims() == 2, "Expected logits tensor to be 2D [B, vocab]");
+    int64_t const batchSize = shape[0];
+    int64_t const vocabSize = shape[1];
+    if (batchSize <= 0 || vocabSize <= 0)
+    {
+        return;
+    }
+
+    std::vector<uint8_t> hostBytes;
+    if (!copyTensorToHostBytes(logitsTensor, hostBytes, stream))
+    {
+        LOG_WARNING("Failed to copy logits tensor for debug dump");
+        return;
+    }
+
+    float const* logitsPtr = reinterpret_cast<float const*>(hostBytes.data());
+    std::vector<std::pair<float, int32_t>> top;
+    top.reserve(static_cast<size_t>(topK));
+    for (int64_t tokenId = 0; tokenId < vocabSize; ++tokenId)
+    {
+        float const score = logitsPtr[tokenId];
+        if (static_cast<int32_t>(top.size()) < topK)
+        {
+            top.emplace_back(score, static_cast<int32_t>(tokenId));
+            if (static_cast<int32_t>(top.size()) == topK)
+            {
+                std::sort(top.begin(), top.end(),
+                    [](auto const& a, auto const& b) { return a.first > b.first; });
+            }
+        }
+        else if (score > top.back().first)
+        {
+            top.back() = {score, static_cast<int32_t>(tokenId)};
+            std::sort(top.begin(), top.end(), [](auto const& a, auto const& b) { return a.first > b.first; });
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(outputDir, ec);
+    if (ec)
+    {
+        LOG_WARNING("Failed to create logits debug dir '%s': %s", outputDir.c_str(), ec.message().c_str());
+        return;
+    }
+
+    nlohmann::json record;
+    record["generation_step"] = generationStep;
+    record["selected_token_id"] = selectedTokenId;
+    record["selected_logit"] = logitsPtr[selectedTokenId];
+    record["topk"] = nlohmann::json::array();
+    for (auto const& [score, tokenId] : top)
+    {
+        record["topk"].push_back({{"token_id", tokenId}, {"logit", score}});
+    }
+
+    auto const filePath = outputDir / "step_logits.jsonl";
+    std::ofstream out(filePath, std::ios::app);
+    out << record.dump() << '\n';
+}
+
+bool copyTensorToHostBytes(rt::Tensor const& tensor, std::vector<uint8_t>& hostData, cudaStream_t stream)
+{
+    size_t const byteSize = tensor.getShape().volume() * rt::utils::getTypeSize(tensor.getDataType());
+    hostData.resize(byteSize);
+    if (byteSize == 0)
+    {
+        return true;
+    }
+
+    if (tensor.getDeviceType() == rt::DeviceType::kGPU)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(hostData.data(), tensor.rawPointer(), byteSize, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    else
+    {
+        std::memcpy(hostData.data(), tensor.rawPointer(), byteSize);
+    }
+    return true;
+}
+
+std::string getDataTypeString(nvinfer1::DataType dataType)
+{
+    using DataType = nvinfer1::DataType;
+    switch (dataType)
+    {
+    case DataType::kFLOAT: return "FLOAT32";
+    case DataType::kHALF: return "FLOAT16";
+    case DataType::kBF16: return "BF16";
+    case DataType::kINT8: return "INT8";
+    case DataType::kINT32: return "INT32";
+    case DataType::kINT64: return "INT64";
+    case DataType::kBOOL: return "BOOL";
+    case DataType::kUINT8: return "UINT8";
+    case DataType::kFP8: return "FP8";
+    default: return "UNKNOWN";
+    }
+}
+
+std::vector<int64_t> coordsToVector(rt::Coords const& coords)
+{
+    std::vector<int64_t> values;
+    values.reserve(coords.getNumDims());
+    for (int32_t i = 0; i < coords.getNumDims(); ++i)
+    {
+        values.push_back(coords[i]);
+    }
+    return values;
+}
+
 std::tuple<std::string, std::string> keySystemPromptWithLoraWeights(
     std::string const& systemPrompt, std::string const& loraWeightsName)
 {
@@ -491,7 +635,7 @@ bool LLMInferenceRuntime::handleRequest(
     {
         // Apply chat template
         mTokenizer->applyChatTemplate(request.requests[i], request.formattedRequests[i], request.applyChatTemplate,
-            request.addGenerationPrompt, request.enableThinking);
+            request.addGenerationPrompt, request.continueFinalMessage, request.enableThinking);
 
         // Extract system prompt
         batchSystemPrompts.emplace_back(request.formattedRequests[i].formattedSystemPrompt);
@@ -553,11 +697,36 @@ bool LLMInferenceRuntime::handleRequest(
         if (hasVision && mVisionRunner)
         {
             LOG_INFO("Processing vision inputs");
+            if (mDumpPreparedPrefillInputsEnabled)
+            {
+                auto const debugRequestDir
+                    = mDumpPreparedPrefillInputsDir / format::fmtstr("request_%zu", mPrefillInputDumpCounter);
+                mVisionRunner->beginDebugInputsDump(debugRequestDir);
+            }
             if (!mVisionRunner->preprocess(
                     request, batchedInputIds, mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream))
             {
                 LOG_ERROR("LLMInferenceRuntime(): Vision preprocessing failed. This request cannot be handled.");
                 return false;
+            }
+
+            if (isDebugQwenTextPreprocessEnabled())
+            {
+                for (size_t reqIdx = 0; reqIdx < batchedInputIds.size(); ++reqIdx)
+                {
+                    LOG_INFO("LLMInferenceRuntime debug: batchedInputIds[%zu].size() after vision preprocess = %zu",
+                        reqIdx, batchedInputIds[reqIdx].size());
+                }
+            }
+
+            if (mDumpPreparedPrefillInputsEnabled)
+            {
+                auto const debugRequestDir
+                    = mDumpPreparedPrefillInputsDir / format::fmtstr("request_%zu", mPrefillInputDumpCounter);
+                if (!mVisionRunner->dumpDebugInputs(debugRequestDir, stream))
+                {
+                    LOG_WARNING("Failed to dump visual debug inputs. Continuing without visual debug artifacts.");
+                }
             }
 
             if (!mVisionRunner->infer(stream))
@@ -618,6 +787,7 @@ bool LLMInferenceRuntime::handleRequest(
 
     SamplingParams params(
         activeBatchSize, mEngineConfig.outputVocabSize, request.temperature, request.topK, request.topP);
+    auto const debugLogitsDir = getDebugLogitsDir();
     auto sampleTokens = [&]() {
         trt_edgellm::topKtopPSamplingFromLogits(mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream);
         // Apply vocabulary mapping if reduced vocabulary is used
@@ -628,6 +798,10 @@ bool LLMInferenceRuntime::handleRequest(
         CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mSelectedIndices.rawPointer(),
             activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (debugLogitsDir.has_value() && activeBatchSize > 0)
+        {
+            dumpTopKLogits(mOutputLogits, hostSelectedTokenIdsData[0], generationIter, stream, *debugLogitsDir);
+        }
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
             if (!finishedStates[i])
@@ -653,6 +827,7 @@ bool LLMInferenceRuntime::handleRequest(
         = mVisionRunner ? std::optional{std::ref(mVisionRunner->getOutputEmbedding())} : std::nullopt;
     rt::OptionalInputTensor audioEmbeddings
         = mAudioRunner ? std::optional{std::ref(mAudioRunner->getOutputEmbedding())} : std::nullopt;
+    rt::OptionalInputTensor multimodalEmbeddings = visionEmbeddings.has_value() ? visionEmbeddings : audioEmbeddings;
 
     if (audioEmbeddings.has_value())
     {
@@ -694,9 +869,10 @@ bool LLMInferenceRuntime::handleRequest(
     // Process deepstack features: perform embedding assembly if vision runner is available
     // Note: Deepstack features are only provided by VisionRunner, not Qwen3OmniAudioRunner
     rt::OptionalInputTensors deepstackEmbeds{};
+    rt::OptionalInputTensors deepstackFeatures{};
     if (mEngineConfig.numDeepstackFeatures > 0 && mVisionRunner)
     {
-        rt::OptionalInputTensors deepstackFeatures = mVisionRunner->getDeepstackFeatures();
+        deepstackFeatures = mVisionRunner->getDeepstackFeatures();
 
         // Prepare multimodal indices for deepstack assembly (needed when imageTokenId < vocabSize)
         rt::OptionalInputTensor deepstackMultimodalIndices{std::nullopt};
@@ -718,6 +894,15 @@ bool LLMInferenceRuntime::handleRequest(
 
             // Add to output vector (engine will bind by index)
             deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
+        }
+    }
+
+    if (mDumpPreparedPrefillInputsEnabled)
+    {
+        if (!dumpPreparedPrefillInputs(
+                activeBatchSize, prefillSequenceLength, multimodalEmbeddings, deepstackFeatures, deepstackEmbeds, stream))
+        {
+            LOG_WARNING("Failed to dump prepared prefill inputs");
         }
     }
 
@@ -851,6 +1036,34 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
             "LoRA weights.");
     }
     return captureStatus;
+}
+
+rt::Tensor LLMInferenceRuntime::getKVCacheBuffer()
+{
+    return mLLMEngineRunner->getLinearKVCache().getKVCacheBuffer();
+}
+
+rt::Tensor LLMInferenceRuntime::getKVCacheLengths()
+{
+    rt::Tensor& kvCacheLengths = mLLMEngineRunner->getLinearKVCache().getKVCacheLengths();
+    return rt::Tensor(kvCacheLengths.rawPointer(), kvCacheLengths.getShape(), kvCacheLengths.getDeviceType(),
+        kvCacheLengths.getDataType(), kvCacheLengths.getName());
+}
+
+rt::OptionalInputTensor LLMInferenceRuntime::getPositionIds() const
+{
+    return mVisionRunner ? mVisionRunner->getPositionIds() : std::nullopt;
+}
+
+rt::OptionalInputTensor LLMInferenceRuntime::getRopeDeltas() const
+{
+    return mVisionRunner ? mVisionRunner->getRopeDeltas() : std::nullopt;
+}
+
+std::string LLMInferenceRuntime::decodeTokenIds(std::vector<int32_t> const& tokenIds, bool skipSpecialTokens) const
+{
+    std::vector<tokenizer::Rank> ranks(tokenIds.begin(), tokenIds.end());
+    return mTokenizer->decode(ranks, skipSpecialTokens);
 }
 
 LLMInferenceRuntime::TokenCountInfo LLMInferenceRuntime::calculateTokenCounts(
@@ -1039,6 +1252,76 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     CUDA_CHECK(cudaStreamSynchronize(stream));
     LOG_DEBUG("LLMInferenceRuntime(): The KVCache is saved for the prompt: {%s}", prompt.c_str());
 
+    return true;
+}
+
+bool LLMInferenceRuntime::dumpPreparedPrefillInputs(int32_t activeBatchSize, int32_t prefillSequenceLength,
+    rt::OptionalInputTensor const& multimodalEmbeddings, rt::OptionalInputTensors const& deepstackFeatures,
+    rt::OptionalInputTensors const& deepstackEmbeds, cudaStream_t stream)
+{
+    namespace fs = std::filesystem;
+    fs::path const requestDir = mDumpPreparedPrefillInputsDir / format::fmtstr("request_%zu", mPrefillInputDumpCounter++);
+    std::error_code ec;
+    fs::create_directories(requestDir, ec);
+    if (ec)
+    {
+        LOG_ERROR("Failed to create prefill input dump directory '%s': %s", requestDir.c_str(), ec.message().c_str());
+        return false;
+    }
+
+    auto dumpTensor = [&](rt::Tensor const& tensor, std::string const& fileName) -> nlohmann::json {
+        std::vector<uint8_t> hostData;
+        if (!copyTensorToHostBytes(tensor, hostData, stream))
+        {
+            throw std::runtime_error("Failed to copy tensor to host for debug dump");
+        }
+        std::ofstream out(requestDir / fileName, std::ios::binary);
+        out.write(reinterpret_cast<char const*>(hostData.data()), static_cast<std::streamsize>(hostData.size()));
+        return {{"file", fileName},
+            {"shape", coordsToVector(tensor.getShape())},
+            {"dtype", getDataTypeString(tensor.getDataType())},
+            {"num_bytes", static_cast<int64_t>(hostData.size())}};
+    };
+
+    nlohmann::json meta;
+    meta["input_ids"] = dumpTensor(mInputIds, "input_ids_request_0.bin");
+    meta["inputs_embeds"] = dumpTensor(mInputsEmbeds, "inputs_embeds_request_0.bin");
+
+    if (mMultimodalIndices.getShape().volume() > 0)
+    {
+        meta["multimodal_indices"] = dumpTensor(mMultimodalIndices, "multimodal_indices_request_0.bin");
+    }
+
+    if (multimodalEmbeddings.has_value())
+    {
+        meta["multimodal_output_embedding"]
+            = dumpTensor(multimodalEmbeddings.value().get(), "multimodal_output_embedding_request_0.bin");
+    }
+
+    nlohmann::json deepstackFeatureEntries = nlohmann::json::array();
+    for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
+    {
+        auto entry = dumpTensor(
+            deepstackFeatures[idx].get(), format::fmtstr("deepstack_feature_raw_%d_request_0.bin", idx));
+        entry["index"] = idx;
+        deepstackFeatureEntries.push_back(entry);
+    }
+    meta["deepstack_features"] = deepstackFeatureEntries;
+
+    nlohmann::json deepstackEmbedEntries = nlohmann::json::array();
+    for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackEmbeds.size()); ++idx)
+    {
+        auto entry = dumpTensor(deepstackEmbeds[idx].get(), format::fmtstr("deepstack_embed_%d_request_0.bin", idx));
+        entry["index"] = idx;
+        deepstackEmbedEntries.push_back(entry);
+    }
+    meta["deepstack_embeds"] = deepstackEmbedEntries;
+
+    meta["active_batch_size"] = activeBatchSize;
+    meta["prefill_sequence_length"] = prefillSequenceLength;
+
+    std::ofstream metaFile(requestDir / "prefill_inputs_request_0.json");
+    metaFile << meta.dump(2);
     return true;
 }
 

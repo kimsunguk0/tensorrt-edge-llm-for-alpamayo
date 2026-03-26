@@ -733,7 +733,7 @@ bool Tokenizer::loadChatTemplate(std::filesystem::path const& chatTemplateFile)
 
 bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& request,
     rt::LLMGenerationRequest::FormattedRequest& formattedRequest, bool applyChatTemplate, bool addGenerationPrompt,
-    bool enableThinking) const
+    bool continueFinalMessage, bool enableThinking) const
 {
     if (request.messages.empty())
     {
@@ -842,8 +842,13 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
             }
         }
 
-        // Add role suffix only in chat template mode
-        if (applyChatTemplate)
+        bool const isLastMessage = (i + 1 == request.messages.size());
+        bool const keepAssistantOpen
+            = applyChatTemplate && continueFinalMessage && isLastMessage && message.role == "assistant";
+
+        // Add role suffix only in chat template mode, unless the caller wants to continue
+        // the final assistant message like HF apply_chat_template(..., continue_final_message=True).
+        if (applyChatTemplate && !keepAssistantOpen)
         {
             formattedMessage += roleIt->second.suffix;
         }

@@ -28,6 +28,21 @@ namespace trt_edgellm
 namespace plugins
 {
 
+inline bool useCuteDslLlMFmhaFromEnv()
+{
+#ifdef CUTE_DSL_FMHA_ENABLED
+    // Allow experimenting with the LLM attention path independently from ViT attention.
+    // If the LLM-specific switch is not set, keep the historical global behavior.
+    if (std::getenv("DISABLE_CUTE_DSL_LLM_FMHA"))
+    {
+        return false;
+    }
+    return !std::getenv("DISABLE_CUTE_DSL_FMHA");
+#else
+    return false;
+#endif
+}
+
 //! \brief TensorRT plugin for attention operations (context and decode)
 //!
 //! This plugin implements efficient attention mechanisms including context attention (prefill)
@@ -183,8 +198,10 @@ protected:
     int32_t mSlidingWindowSize = -1;
 
 #ifdef CUTE_DSL_FMHA_ENABLED
-    //! Use CuTe DSL FMHA. Enabled by default on SM100+; set DISABLE_CUTE_DSL_FMHA=1 to fall back to FMHA_v2.
-    bool mUseCuteDslFMHA{!std::getenv("DISABLE_CUTE_DSL_FMHA")};
+    //! Use CuTe DSL FMHA. Enabled by default on SM100+.
+    //! Set DISABLE_CUTE_DSL_LLM_FMHA=1 to fall back to FMHA_v2 for LLM attention only.
+    //! DISABLE_CUTE_DSL_FMHA=1 still disables CuTe DSL globally for both LLM and ViT attention.
+    bool mUseCuteDslFMHA{useCuteDslLlMFmhaFromEnv()};
 #else
     bool mUseCuteDslFMHA{false};
 #endif

@@ -24,6 +24,7 @@
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -117,6 +118,41 @@ public:
                              : metrics::MultimodalMetrics{};
     }
 
+    /*! \brief Get a non-owned tensor view to the full KV-cache buffer.
+     *  Layout: [numDecoderLayers, maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
+     *  \return KV-cache buffer tensor on GPU
+     */
+    rt::Tensor getKVCacheBuffer();
+
+    /*! \brief Get a non-owned tensor view to KV-cache lengths.
+     *  \return KV-cache length tensor on GPU with shape [maxBatchSize]
+     */
+    rt::Tensor getKVCacheLengths();
+
+    /*! \brief Get multimodal text-model position IDs if available.
+     *  \return Optional tensor with shape [batch_size, 3, max_position_embeddings]
+     */
+    rt::OptionalInputTensor getPositionIds() const;
+
+    /*! \brief Get multimodal rope deltas if available.
+     *  \return Optional tensor with shape [batch_size, 1]
+     */
+    rt::OptionalInputTensor getRopeDeltas() const;
+
+    /*! \brief Decode token IDs using the loaded tokenizer.
+     *  \param tokenIds Token IDs to decode
+     *  \param skipSpecialTokens Whether to skip special tokens in the decoded text
+     *  \return Decoded text
+     */
+    std::string decodeTokenIds(std::vector<int32_t> const& tokenIds, bool skipSpecialTokens = false) const;
+
+    //! \brief Enable dumping prepared prefill inputs for debugging.
+    void enablePrefillInputDump(std::filesystem::path const& outputDir)
+    {
+        mDumpPreparedPrefillInputsEnabled = true;
+        mDumpPreparedPrefillInputsDir = outputDir;
+    }
+
 private:
     /*! \brief Helper structure to hold token counting results
      */
@@ -176,6 +212,14 @@ private:
     //! \throws std::runtime_error if system prompt is malformed, or a CUDA operation fails
     bool setUpForPrefillExecution(std::vector<std::vector<int32_t>> const& batchedInputIds,
         std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName, cudaStream_t stream);
+
+    bool dumpPreparedPrefillInputs(int32_t activeBatchSize, int32_t prefillSequenceLength,
+        rt::OptionalInputTensor const& multimodalEmbeddings, rt::OptionalInputTensors const& deepstackFeatures,
+        rt::OptionalInputTensors const& deepstackEmbeds, cudaStream_t stream);
+
+    bool mDumpPreparedPrefillInputsEnabled{false};
+    std::filesystem::path mDumpPreparedPrefillInputsDir{};
+    size_t mPrefillInputDumpCounter{0};
 };
 } // namespace rt
 } // namespace trt_edgellm

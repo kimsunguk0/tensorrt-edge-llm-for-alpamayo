@@ -89,9 +89,14 @@ bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char const*
         LOG_INFO("setOptimizationProfile: %s is not valid", inputName);
         return false;
     }
-    return profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, minDims)
-        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT, optDims)
-        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX, maxDims);
+    bool const okMin = profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, minDims);
+    bool const okOpt = profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT, optDims);
+    bool const okMax = profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX, maxDims);
+    if (!(okMin && okOpt && okMax))
+    {
+        LOG_ERROR("setOptimizationProfile failed for input %s (min=%d opt=%d max=%d)", inputName, okMin, okOpt, okMax);
+    }
+    return okMin && okOpt && okMax;
 }
 //! Print detailed information about the TensorRT network.
 //! Shows input and output tensor names and shapes for debugging purposes.

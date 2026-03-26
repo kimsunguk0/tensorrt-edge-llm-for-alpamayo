@@ -119,11 +119,17 @@ void resizeImage(ImageData const& image, ImageData& resizedImage, int64_t newWid
     resizedImage.width = newWidth;
     resizedImage.channels = image.channels;
 
-    // Resize the image into the pre-allocated buffer
+    // Resize the image into the pre-allocated buffer.
+    // Qwen/HF preprocessing uses bicubic resampling; use a cubic filter here instead of bilinear.
     constexpr int32_t kINPUT_STRIDE_BYTES{0};
     constexpr int32_t kOUTPUT_STRIDE_BYTES{0};
-    stbir_resize_uint8_linear(image.data(), image.width, image.height, kINPUT_STRIDE_BYTES, resizedImage.data(),
-        newWidth, newHeight, kOUTPUT_STRIDE_BYTES, STBIR_RGB);
+    void* result = stbir_resize(image.data(), image.width, image.height, kINPUT_STRIDE_BYTES, resizedImage.data(),
+        newWidth, newHeight, kOUTPUT_STRIDE_BYTES, STBIR_RGB, STBIR_TYPE_UINT8, STBIR_EDGE_CLAMP,
+        STBIR_FILTER_CATMULLROM);
+    if (result == nullptr)
+    {
+        throw std::runtime_error("Failed to resize image with bicubic filter");
+    }
 }
 
 } // namespace imageUtils

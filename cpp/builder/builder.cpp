@@ -1175,20 +1175,26 @@ bool VisualBuilder::setupQwenViTProfile(
         createDims({optHW, inputDim}), createDims({maxHW, inputDim}));
     result &= setOptimizationProfile(profile, binding_names::kRotaryPosEmb, createDims({minHW, ropeEmbedSize}),
         createDims({optHW, ropeEmbedSize}), createDims({maxHW, ropeEmbedSize}));
-    result &= setOptimizationProfile(profile, binding_names::kAttentionMask, createDims({1, minHW, minHW}),
-        createDims({1, optHW, optHW}), createDims({1, maxHW, maxHW}));
+    int64_t maxNumImages = std::max<int64_t>(1, mBuilderConfig.maxImageTokens / mBuilderConfig.minImageTokens);
+    result &= setOptimizationProfile(profile, binding_names::kCuSeqlens, createDims({2}),
+        createDims({maxNumImages + 1}), createDims({maxNumImages + 1}));
+    int32_t maxSeqLen = static_cast<int32_t>(mBuilderConfig.maxImageTokensPerImage * 4);
+    result &= setOptimizationProfile(profile, binding_names::kMaxSeqLenCarrier, createDims({1}),
+        createDims({maxSeqLen / 2}), createDims({maxSeqLen}));
 
     // Additional inputs
     if (mModelType == multimodal::ModelType::QWEN2_5_VL)
     {
-        result &= setOptimizationProfile(profile, binding_names::kWindowAttentionMask, createDims({1, minHW, minHW}),
-            createDims({1, optHW, optHW}), createDims({1, maxHW, maxHW}));
+        // Use maxImageTokens as a safe upper bound for cumulative window sequence lengths.
+        result &= setOptimizationProfile(profile, binding_names::kCuWindowSeqlens, createDims({2}),
+            createDims({mBuilderConfig.maxImageTokens}), createDims({mBuilderConfig.maxImageTokens}));
         result &= setOptimizationProfile(profile, binding_names::kWindowIndex, createDims({minHW / 4}),
             createDims({optHW / 4}), createDims({maxHW / 4}));
         result &= setOptimizationProfile(profile, binding_names::kReverseWindowIndex, createDims({minHW / 4}),
             createDims({optHW / 4}), createDims({maxHW / 4}));
     }
-    else if (mModelType == multimodal::ModelType::QWEN3_VL)
+    else if (mModelType == multimodal::ModelType::QWEN3_VL
+        || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         result &= setOptimizationProfile(profile, binding_names::kFastPosEmbIdx, createDims({4, minHW}),
             createDims({4, optHW}), createDims({4, maxHW}));
