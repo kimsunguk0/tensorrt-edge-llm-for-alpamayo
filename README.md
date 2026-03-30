@@ -21,6 +21,12 @@ Key custom files:
 - `tensorrt_edgellm/scripts/export_fm.py`
 - `jetson_live_infer_alpamayo15.py`
 
+## CARLA Live Sample
+
+Example live dashboard generated from a CARLA sample pull:
+
+![CARLA live sample dashboard](docs/images/carla_live_sample_dashboard.png)
+
 ## Repository Layout
 
 Important paths used in this fork:
