@@ -21,8 +21,52 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import modelopt.torch.quantization as mtq
 import torch
 from transformers.cache_utils import DynamicCache
+
+from ..llm_models.model_utils import set_dynamic_quant
+from ..onnx_export.onnx_utils import export_onnx
+
+
+def maybe_use_system_ptxas_for_blackwell_quantization(*, quantization: str | None, device: torch.device) -> dict[str, Any] | None:
+    """Prefer the system CUDA ptxas for Blackwell-family quantization kernels when available.
+
+    Triton's bundled `ptxas-blackwell` in this environment rejects `sm_110a`, while the
+    system CUDA 13.0 `ptxas` accepts it. Override the tool path before ModelOpt/Triton
+    compiles fake-quant kernels so NVFP4 export can proceed on Thor.
+    """
+    if quantization not in {"nvfp4", "mxfp8"}:
+        return None
+    if device.type != "cuda":
+        return None
+
+    capability = torch.cuda.get_device_capability(device)
+    if capability[0] < 10:
+        return None
+
+    system_ptxas = Path("/usr/local/cuda/bin/ptxas")
+    if not system_ptxas.exists():
+        return None
+
+    import triton.knobs as triton_knobs
+
+    original_path = triton_knobs.nvidia.ptxas_blackwell.path
+    if original_path == str(system_ptxas):
+        return {
+            "applied": False,
+            "reason": "system ptxas already configured",
+            "path": str(system_ptxas),
+        }
+
+    triton_knobs.nvidia.ptxas_blackwell.path = str(system_ptxas)
+    return {
+        "applied": True,
+        "reason": "override bundled ptxas-blackwell with system CUDA ptxas",
+        "original_path": original_path,
+        "new_path": str(system_ptxas),
+        "capability": list(capability),
+    }
 
 
 def pad_packet_for_static_engine(packet: dict[str, Any], *, max_seq_len: int) -> dict[str, Any]:
@@ -78,6 +122,10 @@ class FmOneStepExportWrapper(torch.nn.Module):
         self.forward_kwargs: dict[str, Any] = {}
         if model.config.expert_non_causal_attention:
             self.forward_kwargs["is_causal"] = False
+        try:
+            self.model_compute_dtype = next(model.parameters()).dtype
+        except StopIteration:
+            self.model_compute_dtype = torch.float16
 
     @staticmethod
     def _dense_kv_to_dynamic_cache(kv_cache: torch.Tensor) -> DynamicCache:
@@ -100,24 +148,28 @@ class FmOneStepExportWrapper(torch.nn.Module):
         prompt_cache = self._dense_kv_to_dynamic_cache(kv_cache)
         prefill_seq_len = prompt_cache.get_seq_length()
 
-        future_token_embeds = self.model.action_in_proj(x, t)
-        if future_token_embeds.dim() == 2:
-            future_token_embeds = future_token_embeds.view(x.shape[0], self.n_diffusion_tokens, -1)
+        x_model = x.to(self.model_compute_dtype)
+        t_model = t.to(self.model_compute_dtype)
+        use_autocast = x.is_cuda and self.model_compute_dtype in (torch.float16, torch.bfloat16)
+        with torch.autocast(device_type="cuda", dtype=self.model_compute_dtype, enabled=use_autocast):
+            future_token_embeds = self.model.action_in_proj(x_model, t_model)
+            if future_token_embeds.dim() == 2:
+                future_token_embeds = future_token_embeds.view(x.shape[0], self.n_diffusion_tokens, -1)
 
-        expert_out = self.model.expert(
-            inputs_embeds=future_token_embeds,
-            position_ids=position_ids,
-            past_key_values=prompt_cache,
-            attention_mask=attention_mask,
-            use_cache=True,
-            **self.forward_kwargs,
-        )
-        prompt_cache.crop(prefill_seq_len)
+            expert_out = self.model.expert(
+                inputs_embeds=future_token_embeds,
+                position_ids=position_ids,
+                past_key_values=prompt_cache,
+                attention_mask=attention_mask,
+                use_cache=True,
+                **self.forward_kwargs,
+            )
+            prompt_cache.crop(prefill_seq_len)
 
-        last_hidden = expert_out.last_hidden_state[:, -self.n_diffusion_tokens :]
-        v = self.model.action_out_proj(last_hidden).view(
-            -1, *self.model.action_space.get_action_space_dims()
-        )
+            last_hidden = expert_out.last_hidden_state[:, -self.n_diffusion_tokens :]
+            v = self.model.action_out_proj(last_hidden).view(
+                -1, *self.model.action_space.get_action_space_dims()
+            )
         v = v.to(torch.float32)
         next_x = x.to(torch.float32) + dt.to(torch.float32) * v
         return next_x, v, future_token_embeds.to(torch.float32)
@@ -133,15 +185,44 @@ def summarize_tensor(t: torch.Tensor) -> dict[str, Any]:
     }
 
 
+def disable_incompatible_quant_layers(model: torch.nn.Module, quantization: str) -> list[dict[str, Any]]:
+    block_size = {"mxfp8": 32, "nvfp4": 16}.get(quantization)
+    if block_size is None:
+        return []
+
+    disabled: list[dict[str, Any]] = []
+    for name, module in model.named_modules():
+        if not (hasattr(module, "weight") and hasattr(module, "weight_quantizer") and hasattr(module, "input_quantizer")):
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None or weight.ndim < 2:
+            continue
+        in_dim = int(weight.shape[-1])
+        if in_dim % block_size == 0:
+            continue
+        module.weight_quantizer.disable()
+        module.input_quantizer.disable()
+        disabled.append(
+            {
+                "module": name,
+                "weight_shape": list(weight.shape),
+                "reason": f"in_dim {in_dim} not divisible by block_size {block_size}",
+            }
+        )
+    return disabled
+
+
 def export_fm_model(
     *,
     model_dir: str,
     output_dir: str,
     alpamayo_src_dir: str,
     packet_path: str,
+    calib_packet_paths: list[str] | None = None,
     max_seq_len: int = 8192,
     device: str = "cuda",
     dtype: str = "bf16",
+    quantization: str | None = None,
     check_only: bool = False,
 ) -> dict[str, Any]:
     """Export Alpamayo 1.5 FM one-step graph to ONNX."""
@@ -168,6 +249,10 @@ def export_fm_model(
         local_files_only=True,
     ).to(torch_device)
     model.eval()
+    ptxas_override = maybe_use_system_ptxas_for_blackwell_quantization(
+        quantization=quantization,
+        device=torch_device,
+    )
 
     wrapper = FmOneStepExportWrapper(model).to(torch_device)
     wrapper.eval()
@@ -215,6 +300,51 @@ def export_fm_model(
     check_summary = workdir / "check_summary.json"
     check_summary.write_text(json.dumps(check, indent=2))
 
+    if quantization is not None:
+        supported_quant = {
+            "fp8": mtq.FP8_DEFAULT_CFG.copy(),
+            "mxfp8": mtq.MXFP8_DEFAULT_CFG.copy(),
+            "nvfp4": mtq.NVFP4_DEFAULT_CFG.copy(),
+        }
+        if quantization not in supported_quant:
+            raise ValueError(
+                f"Unsupported quantization={quantization}; expected one of {sorted(supported_quant)}"
+            )
+
+        calib_paths = calib_packet_paths or [packet_path]
+        calib_packets = [torch.load(path, map_location="cpu") for path in calib_paths]
+
+        def calibrate_loop(export_wrapper: torch.nn.Module) -> None:
+            with torch.no_grad():
+                for raw_packet in calib_packets:
+                    padded = pad_packet_for_static_engine(raw_packet, max_seq_len=max_seq_len)
+                    x_cal = padded["x0"].to(device=torch_device, dtype=torch.float32).contiguous()
+                    t_cal = torch.zeros((1, 1, 1), device=torch_device, dtype=torch.float32)
+                    dt_cal = torch.full(
+                        (1, 1, 1),
+                        float(raw_packet["action_space_constants"]["dt_value"]),
+                        device=torch_device,
+                        dtype=torch.float32,
+                    )
+                    kv_cal = padded["kv_cache"].to(device=torch_device, dtype=model_dtype).contiguous()
+                    mask_cal = padded["attention_mask"].to(device=torch_device, dtype=torch.float32).contiguous()
+                    pos_cal = padded["position_ids"].to(device=torch_device, dtype=torch.int64).contiguous()
+                    with torch.autocast("cuda", dtype=model_dtype):
+                        export_wrapper(x_cal, t_cal, dt_cal, kv_cal, mask_cal, pos_cal)
+
+        quant_cfg = supported_quant[quantization]
+        mtq.quantize(wrapper, quant_cfg, forward_loop=calibrate_loop)
+        set_dynamic_quant(wrapper, "fp16" if dtype == "fp16" else "bf16")
+        disabled_layers = disable_incompatible_quant_layers(wrapper, quantization)
+        quant_meta = {
+            "quantization": quantization,
+            "num_calib_packets": len(calib_paths),
+            "calib_packet_paths": [str(path) for path in calib_paths],
+            "disabled_layers": disabled_layers,
+            "ptxas_override": ptxas_override,
+        }
+        (workdir / "quant_summary.json").write_text(json.dumps(quant_meta, indent=2))
+
     if check_only:
         result = {
             "workspace_dir": str(workdir),
@@ -223,23 +353,38 @@ def export_fm_model(
         }
         return result
 
-    onnx_path = workdir / f"alpamayo15_fm_one_step_{dtype}.onnx"
-    torch.onnx.export(
-        wrapper,
-        (x, t, dt, kv_cache, attention_mask, position_ids),
-        str(onnx_path),
-        input_names=["x", "t", "dt", "kv_cache", "attention_mask", "position_ids"],
-        output_names=["next_x", "v", "future_token_embeds"],
-        opset_version=18,
-        do_constant_folding=False,
-        export_params=True,
-        external_data=True,
-    )
+    if quantization is None:
+        onnx_path = workdir / f"alpamayo15_fm_one_step_{dtype}.onnx"
+        torch.onnx.export(
+            wrapper,
+            (x, t, dt, kv_cache, attention_mask, position_ids),
+            str(onnx_path),
+            input_names=["x", "t", "dt", "kv_cache", "attention_mask", "position_ids"],
+            output_names=["next_x", "v", "future_token_embeds"],
+            opset_version=18,
+            do_constant_folding=False,
+            export_params=True,
+            external_data=True,
+        )
+        external_data_exists = onnx_path.exists() and (workdir / f"alpamayo15_fm_one_step_{dtype}.onnx.data").exists()
+    else:
+        export_onnx(
+            wrapper,
+            (x, t, dt, kv_cache, attention_mask, position_ids),
+            str(workdir),
+            ["x", "t", "dt", "kv_cache", "attention_mask", "position_ids"],
+            ["next_x", "v", "future_token_embeds"],
+            None,
+            None,
+        )
+        onnx_path = workdir / "model.onnx"
+        external_data_exists = onnx_path.exists() and (workdir / "onnx_model.data").exists()
 
     result = {
         "onnx_path": str(onnx_path),
-        "external_data_exists": onnx_path.exists() and (workdir / f"alpamayo15_fm_one_step_{dtype}.onnx.data").exists(),
+        "external_data_exists": external_data_exists,
         "check_summary": str(check_summary),
+        "quantization": quantization,
     }
     export_summary = workdir / "export_summary.json"
     export_summary.write_text(json.dumps(result, indent=2))

@@ -59,6 +59,28 @@ def main() -> None:
         help="Data type for export",
     )
     parser.add_argument(
+        "--quantization",
+        type=str,
+        required=False,
+        choices=["fp8", "mxfp8", "nvfp4"],
+        default=None,
+        help="Optional FM quantization mode applied before ONNX export",
+    )
+    parser.add_argument(
+        "--calib_packet_glob",
+        type=str,
+        required=False,
+        default=None,
+        help="Optional glob for calibration replay_packet.pt files used during quantization",
+    )
+    parser.add_argument(
+        "--num_calib_packets",
+        type=int,
+        required=False,
+        default=8,
+        help="Maximum number of calibration packets to use when quantization is enabled",
+    )
+    parser.add_argument(
         "--check_only",
         action="store_true",
         help="Run wrapper validation and write check_summary.json without exporting ONNX",
@@ -67,14 +89,23 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
+        calib_packet_paths = None
+        if args.calib_packet_glob:
+            from pathlib import Path
+            calib_packet_paths = sorted(str(path) for path in Path("/").glob(args.calib_packet_glob.lstrip("/")))
+            calib_packet_paths = calib_packet_paths[: args.num_calib_packets]
+            if not calib_packet_paths:
+                raise ValueError(f"No calibration packets matched glob: {args.calib_packet_glob}")
         result = export_fm_model(
             model_dir=args.model_dir,
             output_dir=args.output_dir,
             alpamayo_src_dir=args.alpamayo_src_dir,
             packet_path=args.packet,
+            calib_packet_paths=calib_packet_paths,
             max_seq_len=args.max_seq_len,
             device=args.device,
             dtype=args.dtype,
+            quantization=args.quantization,
             check_only=args.check_only,
         )
         print(json.dumps(result, indent=2))
