@@ -21,6 +21,7 @@ namespace rt
 
 struct AlpamayoFmBranchSnapshot
 {
+    Tensor kvCacheTensor{};
     std::vector<uint8_t> kvCacheBytes;
     Coords kvCacheShape;
     nvinfer1::DataType kvCacheDataType{nvinfer1::DataType::kHALF};
@@ -79,13 +80,15 @@ public:
     bool runNoNav(AlpamayoFmBranchSnapshot const& branch, LLMGenerationRequest::ActionSpaceConstants const& constants,
         std::vector<float> const& egoHistoryXyz, std::vector<int64_t> const& egoHistoryXyzShape,
         std::vector<float> const& egoHistoryRot, std::vector<int64_t> const& egoHistoryRotShape, AlpamayoFmRunConfig const& config,
-        AlpamayoFmRunResult& result);
+        AlpamayoFmRunResult& result, cudaStream_t stream);
 
     bool runNavCfg(AlpamayoFmBranchSnapshot const& guided, AlpamayoFmBranchSnapshot const& unguided,
         LLMGenerationRequest::ActionSpaceConstants const& constants, std::vector<float> const& egoHistoryXyz,
         std::vector<int64_t> const& egoHistoryXyzShape, std::vector<float> const& egoHistoryRot,
-        std::vector<int64_t> const& egoHistoryRotShape, AlpamayoFmRunConfig const& config, AlpamayoFmRunResult& result);
+        std::vector<int64_t> const& egoHistoryRotShape, AlpamayoFmRunConfig const& config, AlpamayoFmRunResult& result,
+        cudaStream_t stream);
 
+    nvinfer1::DataType kvCacheDataType() const noexcept;
     int32_t maxSeqLen() const noexcept;
     int32_t horizon() const noexcept;
     std::string const& enginePath() const noexcept;

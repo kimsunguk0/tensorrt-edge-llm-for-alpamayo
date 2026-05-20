@@ -264,4 +264,3 @@ def unpack_packet(data: bytes) -> dict[str, Any]:
         },
         "points": points,
     }
-

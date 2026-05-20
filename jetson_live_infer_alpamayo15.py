@@ -16,9 +16,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
+
+from fm_model_defaults import first_existing_fm_engine
 
 
 CAMERA_DISPLAY_NAMES = {
@@ -69,7 +70,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fm-engine",
         type=Path,
-        default=Path("/root/test/output/alpamayo15_fm_one_step_fp16_true/alpamayo15_fm_one_step_fp16_true_thor.plan"),
+        default=first_existing_fm_engine(
+            extra_candidates=[
+                Path("/root/test/output/alpamayo15_fm_one_step_fp16_true/alpamayo15_fm_one_step_fp16_true_thor.plan"),
+                Path("/root/test/output/alpamayo15_fm_one_step_mxfp8/alpamayo15_fm_one_step_mxfp8_thor.plan"),
+            ]
+        ),
         help="Path to the FM TRT engine",
     )
     parser.add_argument(
@@ -148,7 +154,12 @@ def parse_args() -> argparse.Namespace:
         help="Discrete trajectory token offset used by Alpamayo 1.5",
     )
     parser.add_argument("--diffusion-seed", type=int, default=42, help="Seed for the post-VLM FM diffusion loop")
-    parser.add_argument("--diffusion-num-steps", type=int, default=10, help="Number of FM diffusion steps")
+    parser.add_argument("--diffusion-num-steps", type=int, default=2, help="Number of FM diffusion steps")
+    parser.add_argument(
+        "--alpamayo-fm-use-prefill-kv",
+        action="store_true",
+        help="Feed backbone prefill KV directly into FM and skip CoT decode in llm_inference",
+    )
     parser.add_argument("--action-space-constants-json", type=Path, default=None, help="Optional JSON file overriding action-space constants")
 
     parser.add_argument("--nav-text", type=str, default=None, help="Optional navigation instruction")
@@ -225,7 +236,7 @@ def write_sample_files(sample: dict[str, Any], image_dir: Path, ego_dir: Path) -
         for step_idx in range(num_steps):
             image_hwc = np.transpose(image_frames[cam_pos, step_idx], (1, 2, 0))
             image_path = image_dir / f"cam{cam_id}_f{step_idx}.png"
-            Image.fromarray(image_hwc).save(image_path)
+            Image.fromarray(image_hwc).save(image_path, compress_level=0)
             image_paths.append(image_path)
 
     xyz_path = ego_dir / "ego_history_xyz.npy"
@@ -353,6 +364,7 @@ class PersistentLLMInferenceClient:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.process: subprocess.Popen[str] | None = None
+        self.quiet_logs = bool(getattr(args, "quiet_llm_logs", False))
 
     def _build_env(self) -> dict[str, str]:
         env = dict(os.environ)
@@ -378,6 +390,8 @@ class PersistentLLMInferenceClient:
             "--warmup",
             str(self.args.warmup),
         ]
+        if self.args.alpamayo_fm_use_prefill_kv:
+            cmd.append("--alpamayoFmUsePrefillKv")
         if self.args.nav_text:
             cmd.append("--alpamayoNavCfg")
         return cmd
@@ -399,7 +413,8 @@ class PersistentLLMInferenceClient:
             try:
                 obj = json.loads(text)
             except json.JSONDecodeError:
-                print(f">> llm_inference: {text}")
+                if not self.quiet_logs:
+                    print(f">> llm_inference: {text}")
                 continue
             if isinstance(obj, dict) and "status" in obj:
                 return obj
@@ -411,8 +426,9 @@ class PersistentLLMInferenceClient:
         if self.args.dump_profile:
             print(">> Warning: --dump-profile is not supported in persistent llm_inference mode yet; ignoring profile output.")
         cmd = self._build_cmd()
-        print(">> Starting persistent llm_inference")
-        print("   " + " ".join(cmd))
+        if not self.quiet_logs:
+            print(">> Starting persistent llm_inference")
+            print("   " + " ".join(cmd))
         self.process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -425,7 +441,8 @@ class PersistentLLMInferenceClient:
         ready = self._read_status(timeout_sec=120.0)
         if ready.get("status") != "ready":
             raise RuntimeError(f"Persistent llm_inference did not become ready: {ready}")
-        print(">> Persistent llm_inference ready")
+        if not self.quiet_logs:
+            print(">> Persistent llm_inference ready")
 
     def run(self, request_path: Path, output_file: Path) -> None:
         self.start()
@@ -496,6 +513,9 @@ def run_llm_inference(
     if args.nav_text:
         cmd.append("--alpamayoNavCfg")
 
+    if args.alpamayo_fm_use_prefill_kv:
+        cmd.append("--alpamayoFmUsePrefillKv")
+
     if args.dump_profile:
         cmd.extend(["--dumpProfile", "--profileOutputFile", str(profile_file)])
 
@@ -546,8 +566,17 @@ def extract_cot_text(output_text: str | None) -> str:
     if not output_text:
         return ""
     text = str(output_text)
+    if "<|cot_end|>" not in text:
+        return ""
+    return text.split("<|cot_end|>", 1)[0].strip()
+
+
+def extract_final_text(output_text: str | None) -> str:
+    if not output_text:
+        return ""
+    text = str(output_text)
     if "<|cot_end|>" in text:
-        text = text.split("<|cot_end|>", 1)[0]
+        text = text.split("<|cot_end|>", 1)[1]
     return text.strip()
 
 
@@ -569,10 +598,24 @@ def summarize_dashboard_timing(
     preprocess_est = None
     if guided_pass_ms is not None and vision_ms is not None and prefill_ms is not None and generation_ms is not None:
         preprocess_est = max(float(guided_pass_ms) - vision_ms - prefill_ms - generation_ms, 0.0)
+    llm_total_ms = None
+    if prefill_ms is not None or generation_ms is not None:
+        llm_total_ms = float(prefill_ms or 0.0) + float(generation_ms or 0.0)
+    fm_total_ms = None
+    if "fm_wall_ms" in post_timing:
+        fm_total_ms = float(post_timing["fm_wall_ms"])
 
     lines = []
     if preprocess_est is not None:
-        lines.append(f"preprocess est: {preprocess_est:.2f} ms")
+        lines.append(f"preprocess: {preprocess_est:.2f} ms")
+    if vision_ms is not None:
+        lines.append(f"vit: {vision_ms:.2f} ms")
+    if llm_total_ms is not None:
+        lines.append(f"llm: {llm_total_ms:.2f} ms")
+    if fm_total_ms is not None:
+        lines.append(f"fm: {fm_total_ms:.2f} ms")
+    if preprocess_est is not None or vision_ms is not None or llm_total_ms is not None or fm_total_ms is not None:
+        lines.append("---")
     if vision_ms is not None:
         lines.append(f"vision_encoder: {vision_ms:.2f} ms")
     if prefill_ms is not None:
@@ -603,6 +646,9 @@ def save_live_dashboard(
     run_name: str,
     metadata: dict[str, Any],
 ) -> Path:
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MultipleLocator
+
     result = json.loads(output_file.read_text())
     response = result["responses"][0]
     post_vlm = response["alpamayo_post_vlm"]
@@ -615,10 +661,11 @@ def save_live_dashboard(
     imgs = np.asarray(sample["image_frames"], dtype=np.uint8)[:, -1]
     camera_titles = [str(x).replace("_", " ").title() for x in sample["camera_order"]]
     cot_text = extract_cot_text(response.get("output_text"))
+    final_text = extract_final_text(response.get("output_text"))
     timing_lines = summarize_dashboard_timing(response=response, profile_file=profile_file)
 
-    fig = plt.figure(figsize=(18, 11), constrained_layout=True)
-    gs = fig.add_gridspec(3, 3, height_ratios=[1.0, 1.0, 1.25], width_ratios=[1.0, 1.0, 1.1])
+    fig = plt.figure(figsize=(18.6, 11.4), constrained_layout=True)
+    gs = fig.add_gridspec(3, 3, height_ratios=[1.0, 1.0, 1.05], width_ratios=[1.0, 1.0, 1.18])
 
     image_axes = [
         fig.add_subplot(gs[0, 0]),
@@ -631,8 +678,11 @@ def save_live_dashboard(
         ax.set_title(title, fontsize=12, fontweight="bold")
         ax.axis("off")
 
-    ax_text = fig.add_subplot(gs[0:2, 2])
-    ax_text.axis("off")
+    right_gs = gs[0:2, 2].subgridspec(2, 1, height_ratios=[1.28, 0.92], hspace=0.12)
+    ax_traj = fig.add_subplot(right_gs[0, 0])
+    ax_cot = fig.add_subplot(right_gs[1, 0])
+    ax_cot.axis("off")
+
     header_lines = [
         f"sequence: {int(metadata['sequence'])}",
         f"clip_id: {metadata['clip_id']}",
@@ -643,26 +693,21 @@ def save_live_dashboard(
     nav_info = post_vlm.get("nav")
     if nav_info:
         header_lines.append(f"nav: {json.dumps(nav_info, ensure_ascii=False)}")
-    wrapped_cot = textwrap.fill(cot_text if cot_text else "(empty)", width=42)
-    wrapped_timing = "\n".join(timing_lines) if timing_lines else "timing unavailable"
-    text_block = (
-        "Live Alpamayo 1.5 Dashboard\n\n"
-        + "\n".join(header_lines)
-        + "\n\nCoC / CoT:\n"
-        + wrapped_cot
-        + "\n\nTiming:\n"
-        + wrapped_timing
-    )
-    ax_text.text(0.0, 1.0, text_block, fontsize=11, va="top", family="monospace")
 
-    ax_traj = fig.add_subplot(gs[2, :])
-    ax_traj.plot(hist_xyz[:, 0], hist_xyz[:, 1], color="#1f77b4", linewidth=2.0, alpha=0.8, label="ego history")
+    hist_display_x = hist_xyz[:, 1]
+    hist_display_y = hist_xyz[:, 0]
+    pred_display_x = pred_xyz[:, 1]
+    pred_display_y = pred_xyz[:, 0]
+    pred_path_display = np.vstack([hist_xyz[-1:, 1], hist_xyz[-1:, 0]]).T
+    pred_path_display = np.vstack([pred_path_display, np.stack([pred_xyz[:, 1], pred_xyz[:, 0]], axis=1)])
+
+    ax_traj.plot(hist_display_x, hist_display_y, color="#1f77b4", linewidth=2.0, alpha=0.8, label="ego history")
     hist_step = 3
     ax_traj.quiver(
-        hist_xyz[::hist_step, 0],
-        hist_xyz[::hist_step, 1],
-        hist_rot[::hist_step, 0, 0],
+        hist_display_x[::hist_step],
+        hist_display_y[::hist_step],
         hist_rot[::hist_step, 1, 0],
+        hist_rot[::hist_step, 0, 0],
         color="#1f77b4",
         angles="xy",
         scale_units="xy",
@@ -671,14 +716,22 @@ def save_live_dashboard(
         alpha=0.6,
     )
 
-    pred_path = np.vstack([hist_xyz[-1:], pred_xyz])
-    ax_traj.plot(pred_path[:, 0], pred_path[:, 1], color="#2ca02c", linestyle="--", linewidth=2.0, marker="o", markersize=3, label="pred trajectory")
+    ax_traj.plot(
+        pred_path_display[:, 0],
+        pred_path_display[:, 1],
+        color="#2ca02c",
+        linestyle="--",
+        linewidth=2.0,
+        marker="o",
+        markersize=3,
+        label="pred trajectory",
+    )
     pred_step = 4
     ax_traj.quiver(
-        pred_xyz[::pred_step, 0],
-        pred_xyz[::pred_step, 1],
-        pred_rot[::pred_step, 0, 0],
+        pred_display_x[::pred_step],
+        pred_display_y[::pred_step],
         pred_rot[::pred_step, 1, 0],
+        pred_rot[::pred_step, 0, 0],
         color="#2ca02c",
         angles="xy",
         scale_units="xy",
@@ -687,12 +740,75 @@ def save_live_dashboard(
         alpha=0.6,
     )
     ax_traj.scatter([0.0], [0.0], color="black", marker="x", s=90, label="current t0")
+
+    route_display = np.concatenate(
+        [
+            np.stack([hist_xyz[:, 1], hist_xyz[:, 0]], axis=1),
+            pred_path_display,
+            np.zeros((1, 2), dtype=np.float32),
+        ],
+        axis=0,
+    )
+    x_min, y_min = np.min(route_display, axis=0)
+    x_max, y_max = np.max(route_display, axis=0)
+    span = max(float(x_max - x_min), float(y_max - y_min), 4.0)
+    half_extent = 0.5 * span + 0.6
+    x_center = 0.5 * float(x_min + x_max)
+    y_center = 0.5 * float(y_min + y_max)
+    ax_traj.set_xlim(x_center - half_extent, x_center + half_extent)
+    ax_traj.set_ylim(y_center - half_extent, y_center + half_extent)
     ax_traj.set_aspect("equal")
-    ax_traj.set_xlabel("Local X (Forward) [m]")
-    ax_traj.set_ylabel("Local Y [m]")
-    ax_traj.set_title("Ego history and predicted trajectory", fontsize=13, fontweight="bold")
-    ax_traj.grid(True, alpha=0.3, linestyle=":")
+    ax_traj.set_xlabel("Local Y (Right) [m]")
+    ax_traj.set_ylabel("Local X (Forward) [m]")
+    ax_traj.set_title("Top-Down Local Trajectory", fontsize=13, fontweight="bold")
+    ax_traj.xaxis.set_major_locator(MultipleLocator(1.0))
+    ax_traj.yaxis.set_major_locator(MultipleLocator(1.0))
+    ax_traj.xaxis.set_minor_locator(MultipleLocator(0.1))
+    ax_traj.yaxis.set_minor_locator(MultipleLocator(0.1))
+    ax_traj.grid(which="major", color="#8091a7", alpha=0.34, linewidth=0.9)
+    ax_traj.grid(which="minor", color="#c3cfdd", alpha=0.20, linewidth=0.45)
     ax_traj.legend(loc="upper left")
+
+    cot_block = textwrap.fill(cot_text if cot_text else "(no CoT captured)", width=38)
+    ax_cot.text(
+        0.0,
+        1.0,
+        "CoT\n\n" + cot_block,
+        fontsize=11,
+        va="top",
+        family="monospace",
+    )
+
+    bottom_gs = gs[2, :].subgridspec(1, 3, width_ratios=[1.0, 1.1, 1.2], wspace=0.16)
+    ax_summary = fig.add_subplot(bottom_gs[0, 0])
+    ax_decision = fig.add_subplot(bottom_gs[0, 1])
+    ax_timing = fig.add_subplot(bottom_gs[0, 2])
+    for ax in (ax_summary, ax_decision, ax_timing):
+        ax.axis("off")
+
+    horizon_s = float(pred_xyz.shape[0]) * float(fm["action_space_constants"]["dt_value"])
+    summary_block = (
+        "Live Alpamayo 1.5 Dashboard\n\n"
+        + "\n".join(header_lines)
+        + f"\nplan_points: {int(pred_xyz.shape[0])}"
+        + f"\nplan_horizon_s: {horizon_s:.2f}"
+        + f"\nfixed_delta_s: {float(sample['fixed_delta_seconds']):.3f}"
+        + "\n\ncameras:\n"
+        + "\n".join([f"- {title}" for title in camera_titles])
+    )
+    ax_summary.text(0.0, 1.0, summary_block, fontsize=10.5, va="top", family="monospace")
+
+    decision_lines = []
+    if nav_info:
+        decision_lines.append("Nav")
+        decision_lines.append(textwrap.fill(json.dumps(nav_info, ensure_ascii=False), width=44))
+        decision_lines.append("")
+    decision_lines.append("Final Output")
+    decision_lines.append(textwrap.fill(final_text if final_text else "(empty)", width=44))
+    ax_decision.text(0.0, 1.0, "\n".join(decision_lines), fontsize=10.5, va="top", family="monospace")
+
+    wrapped_timing = "\n".join(timing_lines) if timing_lines else "timing unavailable"
+    ax_timing.text(0.0, 1.0, "Timing\n\n" + wrapped_timing, fontsize=10.5, va="top", family="monospace")
 
     ensure_dir(dashboard_dir)
     dashboard_path = dashboard_dir / f"dashboard_{run_name}.png"

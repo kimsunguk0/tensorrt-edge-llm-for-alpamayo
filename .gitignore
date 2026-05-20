@@ -12,6 +12,7 @@ data/
 data.tar
 *.csv
 *.tar.gz
+fm/*.tar
 internal/
 *.log
 .DS_Store/

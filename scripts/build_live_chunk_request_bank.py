@@ -197,6 +197,26 @@ def safe_symlink(target: Path, link_path: Path) -> None:
     link_path.symlink_to(rel)
 
 
+def select_pose_gnss_rows(gnss: pd.DataFrame) -> pd.DataFrame:
+    base = gnss.dropna(subset=["timestamp_utc_ns", "lat", "lon", "alt"]).copy()
+    if base.empty:
+        raise RuntimeError("No GNSS rows with timestamp, lat, lon, and alt")
+
+    quality_mask = np.zeros(len(base), dtype=bool)
+    if "num_sats" in base.columns:
+        quality_mask |= base["num_sats"].notna().to_numpy()
+    if "hdop" in base.columns:
+        quality_mask |= base["hdop"].notna().to_numpy()
+    if int(quality_mask.sum()) >= 2:
+        base = base.loc[quality_mask].copy()
+
+    base = base.sort_values(["timestamp_utc_ns", "row_id"] if "row_id" in base.columns else ["timestamp_utc_ns"])
+    base = base.drop_duplicates(subset=["timestamp_utc_ns"], keep="last")
+    if len(base) < 2:
+        raise RuntimeError("Need at least two unique GNSS timestamps for pose history")
+    return base.reset_index(drop=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build per-sample runtime requests for one raw live chunk.")
     parser.add_argument("--dataset-root", default="/root/live_dataset/2025-03-31-test2")
@@ -213,7 +233,7 @@ def main() -> None:
     parser.add_argument("--nav-text", type=str, default=None)
     parser.add_argument("--traj-token-offset", type=int, default=3000)
     parser.add_argument("--diffusion-seed", type=int, default=42)
-    parser.add_argument("--diffusion-num-steps", type=int, default=10)
+    parser.add_argument("--diffusion-num-steps", type=int, default=2)
     parser.add_argument("--max-generate-length", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -253,7 +273,7 @@ def main() -> None:
         raise RuntimeError(f"No samples found for chunk {args.chunk_id}")
 
     gnss = pd.read_parquet(dataset_root / "sensors" / "gnss_ins" / "gnss_ins.parquet")
-    gnss_valid = gnss[gnss["lat"].notna() & gnss["lon"].notna() & gnss["alt"].notna()].copy().sort_values("timestamp_utc_ns")
+    gnss_valid = select_pose_gnss_rows(gnss)
     utc = gnss_valid["timestamp_utc_ns"].to_numpy(dtype=np.int64)
     lat = gnss_valid["lat"].to_numpy(dtype=np.float64)
     lon = gnss_valid["lon"].to_numpy(dtype=np.float64)
@@ -414,6 +434,9 @@ def main() -> None:
             for semantic_name, _, _, cam_id in selected_camera_order
         ],
         "chunk_ref_lla": [float(x) for x in ref_lla],
+        "gnss_pose_rows": int(len(gnss_valid)),
+        "gnss_pose_t_start_utc_ns": int(gnss_valid["timestamp_utc_ns"].min()),
+        "gnss_pose_t_end_utc_ns": int(gnss_valid["timestamp_utc_ns"].max()),
         "output_root": str(out_root),
         "request_root": str(request_root),
         "image_root": str(image_root),

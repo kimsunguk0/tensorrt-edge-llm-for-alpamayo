@@ -24,6 +24,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -65,6 +66,27 @@ float elapsedMs(SteadyClock::time_point const& start, SteadyClock::time_point co
 {
     return std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(end - start).count();
 }
+
+struct PositionIdsCacheKey
+{
+    int32_t activeLen{0};
+    int64_t ropeDelta{0};
+
+    bool operator==(PositionIdsCacheKey const& other) const noexcept
+    {
+        return activeLen == other.activeLen && ropeDelta == other.ropeDelta;
+    }
+};
+
+struct PositionIdsCacheKeyHash
+{
+    size_t operator()(PositionIdsCacheKey const& key) const noexcept
+    {
+        size_t const activeHash = std::hash<int32_t>{}(key.activeLen);
+        size_t const ropeHash = std::hash<int64_t>{}(key.ropeDelta);
+        return activeHash ^ (ropeHash + 0x9e3779b9 + (activeHash << 6) + (activeHash >> 2));
+    }
+};
 
 struct CudaBuffer
 {
@@ -118,6 +140,21 @@ struct CudaBuffer
             ptr = nullptr;
             bytes = 0;
         }
+    }
+
+    bool ensureSize(size_t size)
+    {
+        if (bytes >= size)
+        {
+            return false;
+        }
+        reset();
+        bytes = size;
+        if (bytes > 0)
+        {
+            CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        }
+        return true;
     }
 };
 
@@ -184,6 +221,12 @@ void memcpyToHost(void* dst, void const* src, size_t bytes)
     CUDA_CHECK(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost));
 }
 
+bool hasDeviceKvSnapshot(AlpamayoFmBranchSnapshot const& snapshot)
+{
+    return !snapshot.kvCacheTensor.isEmpty() && snapshot.kvCacheTensor.getDeviceType() == DeviceType::kGPU
+        && snapshot.kvCacheTensor.rawPointer() != nullptr;
+}
+
 std::vector<float> makeNormalX0(int32_t horizon, int32_t actionDim, uint64_t seed)
 {
     std::mt19937_64 rng(seed);
@@ -206,15 +249,81 @@ std::vector<uint8_t> convertHalfBytesToBf16Bytes(std::vector<uint8_t> const& src
     {
         __half_raw raw{};
         raw.x = srcWords[i];
-        __half halfValue = *reinterpret_cast<__half*>(&raw);
+        __half halfValue{raw};
         float f = __half2float(halfValue);
         __nv_bfloat16 bf = __float2bfloat16(f);
-        auto const* bfRaw = reinterpret_cast<uint16_t const*>(&bf);
-        dstWords[i] = *bfRaw;
+        dstWords[i] = static_cast<__nv_bfloat16_raw>(bf).x;
     }
     std::vector<uint8_t> bytes(dstWords.size() * sizeof(uint16_t));
     std::memcpy(bytes.data(), dstWords.data(), bytes.size());
     return bytes;
+}
+
+bool kvShapesMatchExceptSeqLen(Coords const& snapshotShape, nvinfer1::Dims const& engineShape)
+{
+    if (snapshotShape.getNumDims() != engineShape.nbDims)
+    {
+        return false;
+    }
+    for (int32_t i = 0; i < engineShape.nbDims; ++i)
+    {
+        if (i == 4)
+        {
+            continue;
+        }
+        if (snapshotShape[i] != engineShape.d[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<uint8_t> truncateKvCachePrefix(std::vector<uint8_t> const& src, Coords const& snapshotShape, int32_t activeLen,
+    int32_t targetSeqLen, size_t elementBytes)
+{
+    check::check(snapshotShape.getNumDims() == 6, "FM KV snapshot rank must be 6");
+    check::check(snapshotShape[4] >= targetSeqLen, "Target FM kv_cache length exceeds snapshot length");
+    check::check(activeLen >= 0 && activeLen <= targetSeqLen, "FM active KV length exceeds target engine length");
+    int64_t const outerCount = snapshotShape[0] * snapshotShape[1] * snapshotShape[2] * snapshotShape[3];
+    int64_t const snapshotSeqLen = snapshotShape[4];
+    int64_t const headDim = snapshotShape[5];
+    size_t const srcBlockBytes = static_cast<size_t>(snapshotSeqLen) * headDim * elementBytes;
+    size_t const dstBlockBytes = static_cast<size_t>(targetSeqLen) * headDim * elementBytes;
+    size_t const copyBytes = static_cast<size_t>(activeLen) * headDim * elementBytes;
+    size_t const expectedSrcBytes = static_cast<size_t>(outerCount) * srcBlockBytes;
+    check::check(src.size() == expectedSrcBytes, "Unexpected FM snapshot byte size for kv_cache truncation");
+
+    std::vector<uint8_t> dst(static_cast<size_t>(outerCount) * dstBlockBytes, 0);
+    for (int64_t idx = 0; idx < outerCount; ++idx)
+    {
+        auto const* srcPtr = src.data() + static_cast<size_t>(idx) * srcBlockBytes;
+        auto* dstPtr = dst.data() + static_cast<size_t>(idx) * dstBlockBytes;
+        std::memcpy(dstPtr, srcPtr, copyBytes);
+    }
+    return dst;
+}
+
+void copyKvCachePrefixDeviceToDevice(
+    void* dst, Coords const& dstShape, void const* src, Coords const& srcShape, int32_t activeLen, size_t elementBytes,
+    cudaStream_t stream)
+{
+    check::check(srcShape.getNumDims() == 6 && dstShape.getNumDims() == 6, "FM KV snapshot rank must be 6");
+    check::check(activeLen >= 0 && activeLen <= dstShape[4], "FM active KV length exceeds target device KV length");
+    check::check(srcShape[4] >= dstShape[4], "Source FM KV device snapshot is shorter than target");
+    int64_t const outerCount = srcShape[0] * srcShape[1] * srcShape[2] * srcShape[3];
+    int64_t const headDim = srcShape[5];
+    size_t const srcPitch = static_cast<size_t>(srcShape[4]) * headDim * elementBytes;
+    size_t const dstPitch = static_cast<size_t>(dstShape[4]) * headDim * elementBytes;
+    size_t const totalDstBytes = static_cast<size_t>(outerCount) * dstPitch;
+    size_t const copyWidth = static_cast<size_t>(activeLen) * headDim * elementBytes;
+    CUDA_CHECK(cudaMemsetAsync(dst, 0, totalDstBytes, stream));
+    if (copyWidth == 0)
+    {
+        return;
+    }
+    CUDA_CHECK(cudaMemcpy2DAsync(
+        dst, dstPitch, src, srcPitch, copyWidth, static_cast<size_t>(outerCount), cudaMemcpyDeviceToDevice, stream));
 }
 
 std::vector<float> extractLastHistoryXYZ(std::vector<float> const& data, std::vector<int64_t> const& shape)
@@ -455,6 +564,36 @@ double estimateV0One(std::vector<float> const& histXyz, std::vector<float> const
     return velocity.back();
 }
 
+double computePlanarHistoryTravel(std::vector<float> const& histXyz, int historyLen)
+{
+    if (historyLen < 2)
+    {
+        return 0.0;
+    }
+
+    double travel = 0.0;
+    for (int t = 1; t < historyLen; ++t)
+    {
+        double const dx = static_cast<double>(histXyz[static_cast<size_t>(t * 3 + 0)]
+            - histXyz[static_cast<size_t>((t - 1) * 3 + 0)]);
+        double const dy = static_cast<double>(histXyz[static_cast<size_t>(t * 3 + 1)]
+            - histXyz[static_cast<size_t>((t - 1) * 3 + 1)]);
+        travel += std::hypot(dx, dy);
+    }
+    return travel;
+}
+
+double sanitizeInitialForwardSpeed(double v0, std::vector<float> const& histXyz, int historyLen)
+{
+    double const clampedV0 = std::max(0.0, v0);
+    double const historyTravel = computePlanarHistoryTravel(histXyz, historyLen);
+    if (historyTravel <= 0.20 || clampedV0 <= 0.25)
+    {
+        return 0.0;
+    }
+    return clampedV0;
+}
+
 void actionToTrajExact(std::vector<float> const& action, int horizon, std::vector<float> const& histXyz,
     int historyLen, std::vector<float> const& histRot, LLMGenerationRequest::ActionSpaceConstants const& constants,
     std::vector<float>& predXyz, std::vector<float>& predRot)
@@ -462,7 +601,10 @@ void actionToTrajExact(std::vector<float> const& action, int horizon, std::vecto
     predXyz.assign(static_cast<size_t>(horizon) * 3, 0.0F);
     predRot.assign(static_cast<size_t>(horizon) * 9, 0.0F);
 
-    double const v0 = estimateV0One(histXyz, histRot, historyLen, constants.dtValue, constants.vLambda, constants.vRidge);
+    double const v0
+        = sanitizeInitialForwardSpeed(estimateV0One(histXyz, histRot, historyLen, constants.dtValue, constants.vLambda,
+                                         constants.vRidge),
+            histXyz, historyLen);
     std::vector<double> velocity(static_cast<size_t>(horizon) + 1, 0.0);
     std::vector<double> theta(static_cast<size_t>(horizon) + 1, 0.0);
     velocity[0] = v0;
@@ -473,9 +615,12 @@ void actionToTrajExact(std::vector<float> const& action, int horizon, std::vecto
         double accel = static_cast<double>(action[static_cast<size_t>(t * 2 + 0)]) * constants.accelStd + constants.accelMean;
         double kappa = static_cast<double>(action[static_cast<size_t>(t * 2 + 1)]) * constants.curvatureStd
             + constants.curvatureMean;
-        velocity[static_cast<size_t>(t + 1)] = velocity[static_cast<size_t>(t)] + accel * constants.dtValue;
-        theta[static_cast<size_t>(t + 1)] = theta[static_cast<size_t>(t)] + kappa * velocity[static_cast<size_t>(t)] * constants.dtValue
-            + kappa * accel * 0.5 * constants.dtValue * constants.dtValue;
+        double const vPrev = velocity[static_cast<size_t>(t)];
+        double const vNext = std::max(0.0, vPrev + accel * constants.dtValue);
+        velocity[static_cast<size_t>(t + 1)] = vNext;
+        double const avgForwardSpeed = 0.5 * (vPrev + vNext);
+        theta[static_cast<size_t>(t + 1)]
+            = theta[static_cast<size_t>(t)] + kappa * avgForwardSpeed * constants.dtValue;
     }
 
     double xCum = 0.0;
@@ -515,9 +660,17 @@ struct AlpamayoFmRuntime::Impl
 {
     struct DeviceBranch
     {
+        void* kvCachePtr{nullptr};
+        void* attentionMaskPtr{nullptr};
+        void* positionIdsPtr{nullptr};
+    };
+
+    struct BranchWorkspace
+    {
         CudaBuffer kvCache;
-        CudaBuffer attentionMask;
         CudaBuffer positionIds;
+        std::vector<float> attentionMaskHost;
+        std::vector<int64_t> positionIdsHost;
     };
 
     explicit Impl(std::string path)
@@ -544,6 +697,7 @@ struct AlpamayoFmRuntime::Impl
         vDims = engine->getTensorShape("v");
         futureDims = engine->getTensorShape("future_token_embeds");
         kvDims = engine->getTensorShape("kv_cache");
+        kvDataType = engine->getTensorDataType("kv_cache");
         maskDims = engine->getTensorShape("attention_mask");
         posDims = engine->getTensorShape("position_ids");
 
@@ -562,87 +716,148 @@ struct AlpamayoFmRuntime::Impl
         futureBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(futureDims)) * dataTypeSize(engine->getTensorDataType("future_token_embeds")));
     }
 
-    DeviceBranch makeDeviceBranch(AlpamayoFmBranchSnapshot const& snapshot, AlpamayoFmRunResult::Timing& timing)
+    DeviceBranch makeDeviceBranch(AlpamayoFmBranchSnapshot const& snapshot, BranchWorkspace& workspace,
+        AlpamayoFmRunResult::Timing& timing, cudaStream_t stream)
     {
-        auto const engineKvType = engine->getTensorDataType("kv_cache");
+        auto const engineKvType = kvDataType;
+        auto const engineKvShape = Coords(kvDims);
         check::check(snapshot.kvCacheDataType == nvinfer1::DataType::kHALF,
             "Current native Alpamayo FM runtime supports FLOAT16 VLM KV snapshots only. Got "
                 + dataTypeName(snapshot.kvCacheDataType));
         check::check(engineKvType == nvinfer1::DataType::kHALF || engineKvType == nvinfer1::DataType::kBF16,
             "Current native Alpamayo FM runtime only supports FLOAT16/BF16 FM kv_cache inputs. Got "
                 + dataTypeName(engineKvType));
-        check::check(snapshot.kvCacheShape == Coords(kvDims), "KV snapshot shape does not match FM engine kv_cache input shape");
         check::check(snapshot.activeLen > 0 && snapshot.activeLen <= maxSeqLen, "Invalid FM active KV length");
 
-        auto const kvConvertStart = SteadyClock::now();
-        size_t kvBytesSize = snapshot.kvCacheBytes.size();
-        uint8_t const* kvBytesPtr = snapshot.kvCacheBytes.data();
-        std::vector<uint8_t> convertedKvBytes;
-        if (engineKvType == nvinfer1::DataType::kBF16)
-        {
-            convertedKvBytes = convertHalfBytesToBf16Bytes(snapshot.kvCacheBytes);
-            kvBytesSize = convertedKvBytes.size();
-            kvBytesPtr = convertedKvBytes.data();
-        }
-        timing.kvConvertMs += ::trt_edgellm::rt::elapsedMs(kvConvertStart, SteadyClock::now());
         DeviceBranch branch;
-        auto const kvAllocStart = SteadyClock::now();
-        branch.kvCache = CudaBuffer(kvBytesSize);
-        timing.kvAllocMs += ::trt_edgellm::rt::elapsedMs(kvAllocStart, SteadyClock::now());
-        auto const kvCopyStart = SteadyClock::now();
-        memcpyToDevice(branch.kvCache.ptr, kvBytesPtr, kvBytesSize);
-        timing.kvCopyMs += ::trt_edgellm::rt::elapsedMs(kvCopyStart, SteadyClock::now());
-
-        auto const maskBuildStart = SteadyClock::now();
-        std::vector<float> attentionMask(static_cast<size_t>(dimsVolume(maskDims)), 0.0F);
-        float const maskValue = std::numeric_limits<float>::lowest();
-        int32_t const totalKv = maskDims.d[3];
-        check::check(totalKv == maxSeqLen + nDiffusionTokens, "Unexpected FM attention mask width");
-        for (int32_t q = 0; q < nDiffusionTokens; ++q)
+        bool const canUseDeviceSnapshot = hasDeviceKvSnapshot(snapshot) && snapshot.kvCacheDataType == engineKvType;
+        if (canUseDeviceSnapshot && snapshot.kvCacheShape == engineKvShape)
         {
-            size_t const rowBase = static_cast<size_t>(q) * totalKv;
-            for (int32_t k = snapshot.activeLen; k < maxSeqLen; ++k)
-            {
-                attentionMask[rowBase + k] = maskValue;
-            }
+            branch.kvCachePtr = const_cast<void*>(snapshot.kvCacheTensor.rawPointer());
         }
-        timing.maskBuildMs += ::trt_edgellm::rt::elapsedMs(maskBuildStart, SteadyClock::now());
-        auto const maskAllocStart = SteadyClock::now();
-        branch.attentionMask = CudaBuffer(attentionMask.size() * sizeof(float));
-        timing.maskAllocMs += ::trt_edgellm::rt::elapsedMs(maskAllocStart, SteadyClock::now());
-        auto const maskCopyStart = SteadyClock::now();
-        memcpyToDevice(branch.attentionMask.ptr, attentionMask.data(), attentionMask.size() * sizeof(float));
-        timing.maskCopyMs += ::trt_edgellm::rt::elapsedMs(maskCopyStart, SteadyClock::now());
-
-        auto const posBuildStart = SteadyClock::now();
-        std::vector<int64_t> positionIds(static_cast<size_t>(dimsVolume(posDims)), 0);
-        for (int32_t c = 0; c < posDims.d[0]; ++c)
+        else
         {
-            for (int32_t i = 0; i < posDims.d[2]; ++i)
+            auto const kvConvertStart = SteadyClock::now();
+            std::vector<uint8_t> kvHostBytes;
+            bool const useDeviceTruncation
+                = canUseDeviceSnapshot && kvShapesMatchExceptSeqLen(snapshot.kvCacheShape, kvDims) && snapshot.kvCacheShape[4] >= maxSeqLen;
+            if (!useDeviceTruncation)
             {
-                size_t const idx = static_cast<size_t>(c) * posDims.d[1] * posDims.d[2] + i;
-                positionIds[idx] = snapshot.ropeDelta + snapshot.activeLen + i;
+                if (snapshot.kvCacheShape == engineKvShape)
+                {
+                    kvHostBytes = snapshot.kvCacheBytes;
+                }
+                else if (kvShapesMatchExceptSeqLen(snapshot.kvCacheShape, kvDims) && snapshot.kvCacheShape[4] >= maxSeqLen)
+                {
+                    kvHostBytes = truncateKvCachePrefix(
+                        snapshot.kvCacheBytes, snapshot.kvCacheShape, snapshot.activeLen, maxSeqLen, sizeof(uint16_t));
+                }
+                else
+                {
+                    throw std::runtime_error(
+                        "KV snapshot shape does not match FM engine kv_cache input shape: snapshot="
+                        + snapshot.kvCacheShape.formatString() + " engine=" + engineKvShape.formatString());
+                }
+                if (engineKvType == nvinfer1::DataType::kBF16)
+                {
+                    kvHostBytes = convertHalfBytesToBf16Bytes(kvHostBytes);
+                }
             }
+            timing.kvConvertMs += ::trt_edgellm::rt::elapsedMs(kvConvertStart, SteadyClock::now());
+
+            size_t const kvBytesSize = static_cast<size_t>(engineKvShape.volume()) * dataTypeSize(engineKvType);
+            auto const kvAllocStart = SteadyClock::now();
+            bool const kvAllocated = workspace.kvCache.ensureSize(kvBytesSize);
+            if (kvAllocated)
+            {
+                timing.kvAllocMs += ::trt_edgellm::rt::elapsedMs(kvAllocStart, SteadyClock::now());
+            }
+            auto const kvCopyStart = SteadyClock::now();
+            if (useDeviceTruncation)
+            {
+                copyKvCachePrefixDeviceToDevice(workspace.kvCache.ptr, engineKvShape, snapshot.kvCacheTensor.rawPointer(),
+                    snapshot.kvCacheShape, snapshot.activeLen, sizeof(uint16_t), stream);
+            }
+            else
+            {
+                memcpyToDevice(workspace.kvCache.ptr, kvHostBytes.data(), kvHostBytes.size());
+            }
+            timing.kvCopyMs += ::trt_edgellm::rt::elapsedMs(kvCopyStart, SteadyClock::now());
+            branch.kvCachePtr = workspace.kvCache.ptr;
         }
-        timing.positionBuildMs += ::trt_edgellm::rt::elapsedMs(posBuildStart, SteadyClock::now());
-        auto const posAllocStart = SteadyClock::now();
-        branch.positionIds = CudaBuffer(positionIds.size() * sizeof(int64_t));
-        timing.positionAllocMs += ::trt_edgellm::rt::elapsedMs(posAllocStart, SteadyClock::now());
-        auto const posCopyStart = SteadyClock::now();
-        memcpyToDevice(branch.positionIds.ptr, positionIds.data(), positionIds.size() * sizeof(int64_t));
-        timing.positionCopyMs += ::trt_edgellm::rt::elapsedMs(posCopyStart, SteadyClock::now());
+
+        auto maskCacheIt = attentionMaskCache.find(snapshot.activeLen);
+        if (maskCacheIt == attentionMaskCache.end())
+        {
+            auto const maskBuildStart = SteadyClock::now();
+            size_t const attentionMaskElems = static_cast<size_t>(dimsVolume(maskDims));
+            workspace.attentionMaskHost.assign(attentionMaskElems, 0.0F);
+            float const maskValue = std::numeric_limits<float>::lowest();
+            int32_t const totalKv = maskDims.d[3];
+            check::check(totalKv == maxSeqLen + nDiffusionTokens, "Unexpected FM attention mask width");
+            for (int32_t q = 0; q < nDiffusionTokens; ++q)
+            {
+                size_t const rowBase = static_cast<size_t>(q) * totalKv;
+                for (int32_t k = snapshot.activeLen; k < maxSeqLen; ++k)
+                {
+                    workspace.attentionMaskHost[rowBase + k] = maskValue;
+                }
+            }
+            timing.maskBuildMs += ::trt_edgellm::rt::elapsedMs(maskBuildStart, SteadyClock::now());
+
+            auto const [cacheIt, inserted] = attentionMaskCache.try_emplace(snapshot.activeLen);
+            (void) inserted;
+            auto const maskAllocStart = SteadyClock::now();
+            bool const maskAllocated = cacheIt->second.ensureSize(attentionMaskElems * sizeof(float));
+            if (maskAllocated)
+            {
+                timing.maskAllocMs += ::trt_edgellm::rt::elapsedMs(maskAllocStart, SteadyClock::now());
+            }
+
+            auto const maskCopyStart = SteadyClock::now();
+            memcpyToDevice(cacheIt->second.ptr, workspace.attentionMaskHost.data(), attentionMaskElems * sizeof(float));
+            timing.maskCopyMs += ::trt_edgellm::rt::elapsedMs(maskCopyStart, SteadyClock::now());
+            maskCacheIt = cacheIt;
+        }
+        branch.attentionMaskPtr = maskCacheIt->second.ptr;
+
+        PositionIdsCacheKey const positionKey{snapshot.activeLen, snapshot.ropeDelta};
+        auto positionCacheIt = positionIdsCache.find(positionKey);
+        if (positionCacheIt == positionIdsCache.end())
+        {
+            auto const posBuildStart = SteadyClock::now();
+            size_t const positionIdsElems = static_cast<size_t>(dimsVolume(posDims));
+            workspace.positionIdsHost.assign(positionIdsElems, 0);
+            for (int32_t c = 0; c < posDims.d[0]; ++c)
+            {
+                for (int32_t i = 0; i < posDims.d[2]; ++i)
+                {
+                    size_t const idx = static_cast<size_t>(c) * posDims.d[1] * posDims.d[2] + i;
+                    workspace.positionIdsHost[idx] = snapshot.ropeDelta + snapshot.activeLen + i;
+                }
+            }
+            timing.positionBuildMs += ::trt_edgellm::rt::elapsedMs(posBuildStart, SteadyClock::now());
+
+            auto const [cacheIt, inserted] = positionIdsCache.try_emplace(positionKey);
+            (void) inserted;
+            auto const posAllocStart = SteadyClock::now();
+            bool const positionAllocated = cacheIt->second.ensureSize(positionIdsElems * sizeof(int64_t));
+            if (positionAllocated)
+            {
+                timing.positionAllocMs += ::trt_edgellm::rt::elapsedMs(posAllocStart, SteadyClock::now());
+            }
+
+            auto const posCopyStart = SteadyClock::now();
+            memcpyToDevice(cacheIt->second.ptr, workspace.positionIdsHost.data(), positionIdsElems * sizeof(int64_t));
+            timing.positionCopyMs += ::trt_edgellm::rt::elapsedMs(posCopyStart, SteadyClock::now());
+            positionCacheIt = cacheIt;
+        }
+        branch.positionIdsPtr = positionCacheIt->second.ptr;
         return branch;
     }
 
-    bool runOneStep(DeviceBranch const& branch, std::vector<float> const& x, float t, float dt, std::vector<float>& nextX,
-        std::vector<float>& v, float* elapsedMsOut = nullptr)
+    bool enqueueOneStep(DeviceBranch const& branch, void* xPtr, void* nextXPtr, float t, float dt, cudaStream_t stream)
     {
-        auto const stepStart = SteadyClock::now();
-        check::check(static_cast<int32_t>(x.size()) == horizon * actionDim, "Input x size mismatch for FM one-step");
-        nextX.resize(static_cast<size_t>(horizon) * actionDim);
-        v.resize(static_cast<size_t>(horizon) * actionDim);
-
-        memcpyToDevice(xBuffer.ptr, x.data(), x.size() * sizeof(float));
         memcpyToDevice(tBuffer.ptr, &t, sizeof(float));
         memcpyToDevice(dtBuffer.ptr, &dt, sizeof(float));
 
@@ -653,24 +868,34 @@ struct AlpamayoFmRuntime::Impl
         context->setInputShape("attention_mask", maskDims);
         context->setInputShape("position_ids", posDims);
 
-        check::check(context->setTensorAddress("x", xBuffer.ptr), "Failed to bind FM input x");
+        check::check(context->setTensorAddress("x", xPtr), "Failed to bind FM input x");
         check::check(context->setTensorAddress("t", tBuffer.ptr), "Failed to bind FM input t");
         check::check(context->setTensorAddress("dt", dtBuffer.ptr), "Failed to bind FM input dt");
-        check::check(context->setTensorAddress("kv_cache", branch.kvCache.ptr), "Failed to bind FM input kv_cache");
-        check::check(context->setTensorAddress("attention_mask", branch.attentionMask.ptr),
+        check::check(context->setTensorAddress("kv_cache", branch.kvCachePtr), "Failed to bind FM input kv_cache");
+        check::check(context->setTensorAddress("attention_mask", branch.attentionMaskPtr),
             "Failed to bind FM input attention_mask");
-        check::check(context->setTensorAddress("position_ids", branch.positionIds.ptr),
+        check::check(context->setTensorAddress("position_ids", branch.positionIdsPtr),
             "Failed to bind FM input position_ids");
-        check::check(context->setTensorAddress("next_x", nextXBuffer.ptr), "Failed to bind FM output next_x");
+        check::check(context->setTensorAddress("next_x", nextXPtr), "Failed to bind FM output next_x");
         check::check(context->setTensorAddress("v", vBuffer.ptr), "Failed to bind FM output v");
         check::check(context->setTensorAddress("future_token_embeds", futureBuffer.ptr),
             "Failed to bind FM output future_token_embeds");
 
-        check::check(context->enqueueV3(0), "FM TensorRT enqueueV3 failed");
-        CUDA_CHECK(cudaDeviceSynchronize());
+        check::check(context->enqueueV3(stream), "FM TensorRT enqueueV3 failed");
+        return true;
+    }
 
+    bool runOneStepToHost(DeviceBranch const& branch, std::vector<float> const& x, float t, float dt, std::vector<float>& nextX,
+        cudaStream_t stream, float* elapsedMsOut = nullptr)
+    {
+        auto const stepStart = SteadyClock::now();
+        check::check(static_cast<int32_t>(x.size()) == horizon * actionDim, "Input x size mismatch for FM one-step");
+        nextX.resize(static_cast<size_t>(horizon) * actionDim);
+
+        memcpyToDevice(xBuffer.ptr, x.data(), x.size() * sizeof(float));
+        check::check(enqueueOneStep(branch, xBuffer.ptr, nextXBuffer.ptr, t, dt, stream), "FM TensorRT enqueueV3 failed");
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         memcpyToHost(nextX.data(), nextXBuffer.ptr, nextX.size() * sizeof(float));
-        memcpyToHost(v.data(), vBuffer.ptr, v.size() * sizeof(float));
         if (elapsedMsOut != nullptr)
         {
             *elapsedMsOut = ::trt_edgellm::rt::elapsedMs(stepStart, SteadyClock::now());
@@ -678,32 +903,32 @@ struct AlpamayoFmRuntime::Impl
         return true;
     }
 
-    bool runSingleBranch(AlpamayoFmBranchSnapshot const& snapshot, AlpamayoFmRunConfig const& config,
-        std::vector<float>& x0, std::vector<float>& xFinal, AlpamayoFmRunResult::Timing& timing)
+    bool runSingleBranch(AlpamayoFmBranchSnapshot const& snapshot, AlpamayoFmRunConfig const& config, std::vector<float>& x0,
+        std::vector<float>& xFinal, AlpamayoFmRunResult::Timing& timing, cudaStream_t stream)
     {
         auto const totalStart = SteadyClock::now();
         auto const branchStart = SteadyClock::now();
-        DeviceBranch branch = makeDeviceBranch(snapshot, timing);
+        DeviceBranch branch = makeDeviceBranch(snapshot, singleBranchWorkspace, timing, stream);
         timing.branchPrepareMs = ::trt_edgellm::rt::elapsedMs(branchStart, SteadyClock::now());
 
         auto const x0Start = SteadyClock::now();
         x0 = makeNormalX0(horizon, actionDim, config.seed);
         timing.x0InitMs = ::trt_edgellm::rt::elapsedMs(x0Start, SteadyClock::now());
-        xFinal = x0;
-        std::vector<float> nextX;
-        std::vector<float> v;
+        xFinal.resize(x0.size());
         float const dt = 1.0F / static_cast<float>(config.numSteps);
+        memcpyToDevice(xBuffer.ptr, x0.data(), x0.size() * sizeof(float));
+        void* currentXPtr = xBuffer.ptr;
+        void* nextXPtr = nextXBuffer.ptr;
         auto const diffusionStart = SteadyClock::now();
         for (int32_t step = 0; step < config.numSteps; ++step)
         {
             float const t = static_cast<float>(step) * dt;
-            float stepMs = 0.0F;
-            runOneStep(branch, xFinal, t, dt, nextX, v, &stepMs);
-            timing.engineStepTotalMs += stepMs;
-            xFinal = nextX;
+            check::check(enqueueOneStep(branch, currentXPtr, nextXPtr, t, dt, stream), "FM TensorRT enqueueV3 failed");
+            std::swap(currentXPtr, nextXPtr);
         }
-        float const diffusionMs = ::trt_edgellm::rt::elapsedMs(diffusionStart, SteadyClock::now());
-        (void) diffusionMs;
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        timing.engineStepTotalMs = ::trt_edgellm::rt::elapsedMs(diffusionStart, SteadyClock::now());
+        memcpyToHost(xFinal.data(), currentXPtr, xFinal.size() * sizeof(float));
         timing.numSteps = config.numSteps;
         timing.numBranches = 1;
         timing.engineStepAvgMs = config.numSteps > 0 ? timing.engineStepTotalMs / static_cast<float>(config.numSteps) : 0.0F;
@@ -713,12 +938,12 @@ struct AlpamayoFmRuntime::Impl
 
     bool runDualBranch(AlpamayoFmBranchSnapshot const& guidedSnapshot, AlpamayoFmBranchSnapshot const& unguidedSnapshot,
         AlpamayoFmRunConfig const& config, std::vector<float>& x0, std::vector<float>& xFinal,
-        AlpamayoFmRunResult::Timing& timing)
+        AlpamayoFmRunResult::Timing& timing, cudaStream_t stream)
     {
         auto const totalStart = SteadyClock::now();
         auto const branchStart = SteadyClock::now();
-        DeviceBranch guided = makeDeviceBranch(guidedSnapshot, timing);
-        DeviceBranch unguided = makeDeviceBranch(unguidedSnapshot, timing);
+        DeviceBranch guided = makeDeviceBranch(guidedSnapshot, guidedBranchWorkspace, timing, stream);
+        DeviceBranch unguided = makeDeviceBranch(unguidedSnapshot, unguidedBranchWorkspace, timing, stream);
         timing.branchPrepareMs = ::trt_edgellm::rt::elapsedMs(branchStart, SteadyClock::now());
 
         auto const x0Start = SteadyClock::now();
@@ -727,8 +952,6 @@ struct AlpamayoFmRuntime::Impl
         xFinal = x0;
         std::vector<float> guidedNext;
         std::vector<float> unguidedNext;
-        std::vector<float> guidedV;
-        std::vector<float> unguidedV;
         float const dt = 1.0F / static_cast<float>(config.numSteps);
         auto const diffusionStart = SteadyClock::now();
         for (int32_t step = 0; step < config.numSteps; ++step)
@@ -736,17 +959,16 @@ struct AlpamayoFmRuntime::Impl
             float const t = static_cast<float>(step) * dt;
             float guidedStepMs = 0.0F;
             float unguidedStepMs = 0.0F;
-            runOneStep(guided, xFinal, t, dt, guidedNext, guidedV, &guidedStepMs);
-            runOneStep(unguided, xFinal, t, dt, unguidedNext, unguidedV, &unguidedStepMs);
+            runOneStepToHost(guided, xFinal, t, dt, guidedNext, stream, &guidedStepMs);
+            runOneStepToHost(unguided, xFinal, t, dt, unguidedNext, stream, &unguidedStepMs);
             timing.engineStepTotalMs += guidedStepMs + unguidedStepMs;
             for (size_t i = 0; i < xFinal.size(); ++i)
             {
-                float const vCfg = (1.0F - config.guidanceWeight) * unguidedV[i] + config.guidanceWeight * guidedV[i];
-                xFinal[i] = xFinal[i] + dt * vCfg;
+                xFinal[i] = (1.0F - config.guidanceWeight) * unguidedNext[i] + config.guidanceWeight * guidedNext[i];
             }
         }
-        float const diffusionMs = ::trt_edgellm::rt::elapsedMs(diffusionStart, SteadyClock::now());
-        (void) diffusionMs;
+        timing.engineStepTotalMs = std::max(
+            timing.engineStepTotalMs, ::trt_edgellm::rt::elapsedMs(diffusionStart, SteadyClock::now()));
         timing.numSteps = config.numSteps;
         timing.numBranches = 2;
         timing.engineStepAvgMs = config.numSteps > 0 ? timing.engineStepTotalMs / static_cast<float>(config.numSteps) : 0.0F;
@@ -765,6 +987,7 @@ struct AlpamayoFmRuntime::Impl
     nvinfer1::Dims vDims{};
     nvinfer1::Dims futureDims{};
     nvinfer1::Dims kvDims{};
+    nvinfer1::DataType kvDataType{nvinfer1::DataType::kHALF};
     nvinfer1::Dims maskDims{};
     nvinfer1::Dims posDims{};
     int32_t horizon{0};
@@ -778,6 +1001,11 @@ struct AlpamayoFmRuntime::Impl
     CudaBuffer nextXBuffer;
     CudaBuffer vBuffer;
     CudaBuffer futureBuffer;
+    std::unordered_map<int32_t, CudaBuffer> attentionMaskCache;
+    std::unordered_map<PositionIdsCacheKey, CudaBuffer, PositionIdsCacheKeyHash> positionIdsCache;
+    BranchWorkspace singleBranchWorkspace;
+    BranchWorkspace guidedBranchWorkspace;
+    BranchWorkspace unguidedBranchWorkspace;
 };
 
 AlpamayoFmRuntime::AlpamayoFmRuntime(std::string enginePath)
@@ -790,12 +1018,13 @@ AlpamayoFmRuntime::~AlpamayoFmRuntime() = default;
 bool AlpamayoFmRuntime::runNoNav(AlpamayoFmBranchSnapshot const& branch,
     LLMGenerationRequest::ActionSpaceConstants const& constants, std::vector<float> const& egoHistoryXyz,
     std::vector<int64_t> const& egoHistoryXyzShape, std::vector<float> const& egoHistoryRot,
-    std::vector<int64_t> const& egoHistoryRotShape, AlpamayoFmRunConfig const& config, AlpamayoFmRunResult& result)
+    std::vector<int64_t> const& egoHistoryRotShape, AlpamayoFmRunConfig const& config, AlpamayoFmRunResult& result,
+    cudaStream_t stream)
 {
     auto const totalStart = SteadyClock::now();
     std::vector<float> x0;
     std::vector<float> xFinal;
-    check::check(mImpl->runSingleBranch(branch, config, x0, xFinal, result.timing), "Failed to run native no-nav FM TRT");
+    check::check(mImpl->runSingleBranch(branch, config, x0, xFinal, result.timing, stream), "Failed to run native no-nav FM TRT");
 
     std::vector<float> histXyz = extractLastHistoryXYZ(egoHistoryXyz, egoHistoryXyzShape);
     std::vector<float> histRot = extractLastHistoryRot(egoHistoryRot, egoHistoryRotShape);
@@ -819,13 +1048,15 @@ bool AlpamayoFmRuntime::runNoNav(AlpamayoFmBranchSnapshot const& branch,
 bool AlpamayoFmRuntime::runNavCfg(AlpamayoFmBranchSnapshot const& guided, AlpamayoFmBranchSnapshot const& unguided,
     LLMGenerationRequest::ActionSpaceConstants const& constants, std::vector<float> const& egoHistoryXyz,
     std::vector<int64_t> const& egoHistoryXyzShape, std::vector<float> const& egoHistoryRot,
-    std::vector<int64_t> const& egoHistoryRotShape, AlpamayoFmRunConfig const& config, AlpamayoFmRunResult& result)
+    std::vector<int64_t> const& egoHistoryRotShape, AlpamayoFmRunConfig const& config, AlpamayoFmRunResult& result,
+    cudaStream_t stream)
 {
     auto const totalStart = SteadyClock::now();
     std::vector<float> x0;
     std::vector<float> xFinal;
     check::check(
-        mImpl->runDualBranch(guided, unguided, config, x0, xFinal, result.timing), "Failed to run native nav CFG FM TRT");
+        mImpl->runDualBranch(guided, unguided, config, x0, xFinal, result.timing, stream),
+        "Failed to run native nav CFG FM TRT");
 
     std::vector<float> histXyz = extractLastHistoryXYZ(egoHistoryXyz, egoHistoryXyzShape);
     std::vector<float> histRot = extractLastHistoryRot(egoHistoryRot, egoHistoryRotShape);
@@ -844,6 +1075,11 @@ bool AlpamayoFmRuntime::runNavCfg(AlpamayoFmBranchSnapshot const& guided, Alpama
     result.horizon = mImpl->horizon;
     result.actionDim = mImpl->actionDim;
     return true;
+}
+
+nvinfer1::DataType AlpamayoFmRuntime::kvCacheDataType() const noexcept
+{
+    return mImpl->kvDataType;
 }
 
 int32_t AlpamayoFmRuntime::maxSeqLen() const noexcept

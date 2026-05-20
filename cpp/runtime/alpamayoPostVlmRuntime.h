@@ -21,6 +21,7 @@ namespace rt
 struct AlpamayoPostVlmOptions
 {
     bool enableNavCfg{false};
+    bool usePrefillKvForFm{false};
     bool dumpNavDualCache{false};
     std::filesystem::path navCacheOutputDir{"./output/nav_dual_cache"};
     std::string fmEngine{};
@@ -61,8 +62,8 @@ private:
     static bool loadEgoHistory(LLMGenerationRequest const& request, std::vector<float>& egoHistoryXyz,
         std::vector<int64_t>& egoHistoryXyzShape, std::vector<float>& egoHistoryRot, std::vector<int64_t>& egoHistoryRotShape);
     static nlohmann::json tensorToJson(std::vector<float> const& values, std::vector<int64_t> const& shape);
-    static std::optional<AlpamayoFmBranchSnapshot> captureFmSnapshot(LLMInferenceRuntime& runtime, size_t activeBatchSize,
-        cudaStream_t stream);
+    std::optional<AlpamayoFmBranchSnapshot> captureFmSnapshot(
+        LLMInferenceRuntime& runtime, size_t activeBatchSize, cudaStream_t stream, bool requireOwnedDeviceCopy);
 
     static bool dumpKvSnapshot(LLMInferenceRuntime& runtime, std::filesystem::path const& outputDir, size_t requestIdx,
         size_t activeBatchSize, cudaStream_t stream);

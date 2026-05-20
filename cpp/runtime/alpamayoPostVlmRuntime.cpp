@@ -88,6 +88,47 @@ bool copyTensorToHostBytes(rt::Tensor const& tensor, std::vector<uint8_t>& hostD
     return true;
 }
 
+bool copyKvCachePrefixDeviceToDevice(
+    rt::Tensor const& srcTensor, rt::Tensor& dstTensor, int32_t activeLen, cudaStream_t stream)
+{
+    Coords const srcShape = srcTensor.getShape();
+    Coords const dstShape = dstTensor.getShape();
+    if (srcShape.getNumDims() != 6 || dstShape.getNumDims() != 6)
+    {
+        LOG_ERROR("FM KV device snapshot rank must be 6");
+        return false;
+    }
+    if (srcTensor.getDeviceType() != rt::DeviceType::kGPU || dstTensor.getDeviceType() != rt::DeviceType::kGPU)
+    {
+        LOG_ERROR("FM KV device snapshot copy requires GPU tensors");
+        return false;
+    }
+    if (srcTensor.getDataType() != dstTensor.getDataType())
+    {
+        LOG_ERROR("FM KV device snapshot dtype mismatch");
+        return false;
+    }
+    if (srcShape[4] < dstShape[4] || activeLen < 0 || activeLen > dstShape[4])
+    {
+        LOG_ERROR("FM KV device snapshot prefix copy shape mismatch");
+        return false;
+    }
+
+    size_t const elementSize = rt::utils::getTypeSize(srcTensor.getDataType());
+    int64_t const outerCount = srcShape[0] * srcShape[1] * srcShape[2] * srcShape[3];
+    int64_t const headDim = srcShape[5];
+    size_t const srcPitch = static_cast<size_t>(srcShape[4]) * headDim * elementSize;
+    size_t const dstPitch = static_cast<size_t>(dstShape[4]) * headDim * elementSize;
+    size_t const copyWidth = static_cast<size_t>(activeLen) * headDim * elementSize;
+    CUDA_CHECK(cudaMemsetAsync(dstTensor.rawPointer(), 0, static_cast<size_t>(dstShape.volume()) * elementSize, stream));
+    if (copyWidth > 0)
+    {
+        CUDA_CHECK(cudaMemcpy2DAsync(dstTensor.rawPointer(), dstPitch, srcTensor.rawPointer(), srcPitch, copyWidth,
+            static_cast<size_t>(outerCount), cudaMemcpyDeviceToDevice, stream));
+    }
+    return true;
+}
+
 std::string fmtRequestSuffix(size_t requestIdx)
 {
     std::ostringstream oss;
@@ -246,7 +287,7 @@ int32_t AlpamayoPostVlmRuntime::readActiveKvLength(
 }
 
 std::optional<AlpamayoFmBranchSnapshot> AlpamayoPostVlmRuntime::captureFmSnapshot(
-    LLMInferenceRuntime& runtime, size_t activeBatchSize, cudaStream_t stream)
+    LLMInferenceRuntime& runtime, size_t activeBatchSize, cudaStream_t stream, bool requireOwnedDeviceCopy)
 {
     rt::Tensor kvCacheBuffer = runtime.getKVCacheBuffer();
     rt::OptionalInputTensor ropeDeltas = runtime.getRopeDeltas();
@@ -256,7 +297,6 @@ std::optional<AlpamayoFmBranchSnapshot> AlpamayoPostVlmRuntime::captureFmSnapsho
     snapshot.kvCacheShape = kvCacheBuffer.getShape();
     snapshot.kvCacheDataType = kvCacheBuffer.getDataType();
     snapshot.activeLen = readActiveKvLength(runtime, activeBatchSize, stream);
-    check::check(copyTensorToHostBytes(kvCacheBuffer, snapshot.kvCacheBytes, stream), "Failed to capture FM KV snapshot");
 
     std::vector<uint8_t> ropeBytes;
     check::check(copyTensorToHostBytes(ropeDeltas.value().get(), ropeBytes, stream), "Failed to capture FM rope_deltas");
@@ -264,6 +304,41 @@ std::optional<AlpamayoFmBranchSnapshot> AlpamayoPostVlmRuntime::captureFmSnapsho
         "FM rope_deltas must be INT64");
     check::check(ropeBytes.size() >= sizeof(int64_t), "FM rope_deltas payload is too small");
     snapshot.ropeDelta = *reinterpret_cast<int64_t const*>(ropeBytes.data());
+
+    bool const canUseDeviceSnapshot = mFmRuntime != nullptr && kvCacheBuffer.getDeviceType() == rt::DeviceType::kGPU
+        && kvCacheBuffer.getDataType() == nvinfer1::DataType::kHALF
+        && mFmRuntime->kvCacheDataType() == nvinfer1::DataType::kHALF;
+    if (canUseDeviceSnapshot)
+    {
+        if (requireOwnedDeviceCopy)
+        {
+            int32_t const targetSeqLen = mFmRuntime->maxSeqLen();
+            check::check(targetSeqLen > 0, "FM target sequence length must be positive");
+            check::check(snapshot.activeLen <= targetSeqLen,
+                "FM active KV length exceeds FM engine max sequence length during device snapshot capture");
+            Coords targetShape = snapshot.kvCacheShape;
+            targetShape[4] = targetSeqLen;
+            snapshot.kvCacheTensor = rt::Tensor(targetShape, rt::DeviceType::kGPU, snapshot.kvCacheDataType, "fm_kv_snapshot");
+            if (targetShape == kvCacheBuffer.getShape())
+            {
+                CUDA_CHECK(cudaMemcpyAsync(snapshot.kvCacheTensor.rawPointer(), kvCacheBuffer.rawPointer(),
+                    snapshot.kvCacheTensor.getMemoryCapacity(), cudaMemcpyDeviceToDevice, stream));
+            }
+            else
+            {
+                check::check(copyKvCachePrefixDeviceToDevice(kvCacheBuffer, snapshot.kvCacheTensor, snapshot.activeLen, stream),
+                    "Failed to capture FM KV device prefix snapshot");
+            }
+            snapshot.kvCacheShape = targetShape;
+        }
+        else
+        {
+            snapshot.kvCacheTensor = std::move(kvCacheBuffer);
+        }
+        return snapshot;
+    }
+
+    check::check(copyTensorToHostBytes(kvCacheBuffer, snapshot.kvCacheBytes, stream), "Failed to capture FM KV snapshot");
     return snapshot;
 }
 
@@ -397,6 +472,10 @@ AlpamayoPostVlmRuntime::BranchArtifacts AlpamayoPostVlmRuntime::runGuidedPass(LL
     out.request = request;
     out.request.continueFinalMessage = true;
     out.request.addGenerationPrompt = false;
+    if (mOptions.usePrefillKvForFm)
+    {
+        out.request.maxGenerateLength = 0;
+    }
 
     check::check(out.request.requests.size() == 1,
         "AlpamayoPostVlmRuntime currently supports batch_size=1 only during native nav bring-up.");
@@ -424,10 +503,19 @@ AlpamayoPostVlmRuntime::BranchArtifacts AlpamayoPostVlmRuntime::runGuidedPass(LL
 
     check::check(runtime.handleRequest(out.request, out.response, stream), "Guided VLM pass failed");
     out.kvActiveLen = readActiveKvLength(runtime, out.request.requests.size(), stream);
-    out.decodedPrefixText = runtime.decodeTokenIds(out.response.outputIds.at(0), false);
+    if (!mOptions.usePrefillKvForFm)
+    {
+        out.decodedPrefixText = runtime.decodeTokenIds(out.response.outputIds.at(0), false);
+    }
     if (mFmRuntime)
     {
-        out.fmSnapshot = captureFmSnapshot(runtime, out.request.requests.size(), stream);
+        bool const requireOwnedDeviceCopy = !navText.empty() && mOptions.enableNavCfg;
+        out.fmSnapshot = captureFmSnapshot(runtime, out.request.requests.size(), stream, requireOwnedDeviceCopy);
+    }
+    if (mOptions.usePrefillKvForFm)
+    {
+        out.response.outputIds.assign(out.request.requests.size(), {});
+        out.response.outputTexts.assign(out.request.requests.size(), {});
     }
     if (mOptions.dumpNavDualCache)
     {
@@ -471,7 +559,12 @@ AlpamayoPostVlmRuntime::BranchArtifacts AlpamayoPostVlmRuntime::runUnguidedRepla
     out.kvActiveLen = readActiveKvLength(runtime, out.request.requests.size(), stream);
     if (mFmRuntime)
     {
-        out.fmSnapshot = captureFmSnapshot(runtime, out.request.requests.size(), stream);
+        out.fmSnapshot = captureFmSnapshot(runtime, out.request.requests.size(), stream, false);
+    }
+    if (mOptions.usePrefillKvForFm)
+    {
+        out.response.outputIds.assign(out.request.requests.size(), {});
+        out.response.outputTexts.assign(out.request.requests.size(), {});
     }
     if (mOptions.dumpNavDualCache)
     {
@@ -500,10 +593,12 @@ bool AlpamayoPostVlmRuntime::handleRequest(LLMInferenceRuntime& runtime, LLMGene
 
     responseJson["mode"] = "alpamayo_post_vlm";
     responseJson["fm_engine"] = mOptions.fmEngine;
+    responseJson["fm_kv_source"] = mOptions.usePrefillKvForFm ? "backbone_prefill" : "post_decode";
     responseJson["guided"] = {
         {"output_text", guided.response.outputTexts.empty() ? std::string{} : guided.response.outputTexts[0]},
         {"output_token_ids", guided.response.outputIds.empty() ? std::vector<int32_t>{} : guided.response.outputIds[0]},
         {"kv_active_len", guided.kvActiveLen},
+        {"used_prefill_kv_for_fm", mOptions.usePrefillKvForFm},
         {"formatted_system_prompt",
             guided.request.formattedRequests.empty() ? std::string{}
                                                      : guided.request.formattedRequests[0].formattedSystemPrompt},
@@ -564,13 +659,13 @@ bool AlpamayoPostVlmRuntime::handleRequest(LLMInferenceRuntime& runtime, LLMGene
     {
         check::check(unguided->fmSnapshot.has_value(), "Unguided FM snapshot is missing");
         ok = mFmRuntime->runNavCfg(*guided.fmSnapshot, *unguided->fmSnapshot, *fmConstants, egoHistoryXyz, egoHistoryXyzShape,
-            egoHistoryRot, egoHistoryRotShape, fmConfig, fmResult);
+            egoHistoryRot, egoHistoryRotShape, fmConfig, fmResult, stream);
         responseJson["fm_mode"] = "nav_cfg";
     }
     else
     {
         ok = mFmRuntime->runNoNav(*guided.fmSnapshot, *fmConstants, egoHistoryXyz, egoHistoryXyzShape, egoHistoryRot,
-            egoHistoryRotShape, fmConfig, fmResult);
+            egoHistoryRotShape, fmConfig, fmResult, stream);
         responseJson["fm_mode"] = "single_branch";
     }
     check::check(ok, "Native FM runtime execution failed");

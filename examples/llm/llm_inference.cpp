@@ -387,7 +387,8 @@ enum LLMInferenceOptionId : int
     DEFAULT_NAV_GUIDANCE_WEIGHT = 923,
     DUMP_NAV_DUAL_CACHE = 924,
     NAV_CACHE_OUTPUT_DIR = 925,
-    PERSISTENT_SERVER = 926
+    PERSISTENT_SERVER = 926,
+    ALPAMAYO_FM_USE_PREFILL_KV = 927
 };
 
 // Struct to hold Eagle-specific arguments for speculative decoding
@@ -428,6 +429,7 @@ struct LLMInferenceArgs
     std::string fmEngine{""};
     bool alpamayoPostVlmRuntime{false};
     bool alpamayoNavCfg{false};
+    bool alpamayoFmUsePrefillKv{false};
     float defaultNavGuidanceWeight{3.0F};
     bool dumpNavDualCache{false};
     std::string navCacheOutputDir{"./output/nav_dual_cache"};
@@ -448,7 +450,7 @@ void printUsage(char const* programName)
                  "[--dumpOutput] [--dumpKVCache] [--kvCacheOutputDir=<path>] "
                  "[--dumpPrefillInputs] [--prefillInputOutputDir=<path>] [--batchSize=<number>] "
                  "[--maxGenerateLength=<number>] [--fmEngine=<path>] [--alpamayoPostVlmRuntime] "
-                 "[--alpamayoNavCfg] [--defaultNavGuidanceWeight=<number>] [--dumpNavDualCache] "
+                 "[--alpamayoFmUsePrefillKv] [--alpamayoNavCfg] [--defaultNavGuidanceWeight=<number>] [--dumpNavDualCache] "
                  "[--navCacheOutputDir=<path>] [--persistentServer] [--eagle] "
                  "[--eagleDraftTopK=<number>] [--eagleDraftStep=<number>] "
                  "[--eagleVerifyTreeSize=<number>]"
@@ -476,6 +478,8 @@ void printUsage(char const* programName)
     std::cerr << "  --fmEngine                Path to FM TRT one-step engine (for Alpamayo post-VLM runtime)"
               << std::endl;
     std::cerr << "  --alpamayoPostVlmRuntime  Enable Alpamayo post-VLM orchestration path" << std::endl;
+    std::cerr << "  --alpamayoFmUsePrefillKv  Feed backbone prefill KV directly to FM and skip CoT decode"
+              << std::endl;
     std::cerr << "  --alpamayoNavCfg          Enable nav-aware guided/unguided dual-cache path" << std::endl;
     std::cerr << "  --defaultNavGuidanceWeight  Default nav CFG guidance weight (default: 3.0)" << std::endl;
     std::cerr << "  --dumpNavDualCache        Dump guided/unguided KV-cache artifacts" << std::endl;
@@ -511,6 +515,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"prefillInputOutputDir", required_argument, 0, LLMInferenceOptionId::PREFILL_INPUT_OUTPUT_DIR},
         {"fmEngine", required_argument, 0, LLMInferenceOptionId::FM_ENGINE},
         {"alpamayoPostVlmRuntime", no_argument, 0, LLMInferenceOptionId::ALPAMAYO_POST_VLM_RUNTIME},
+        {"alpamayoFmUsePrefillKv", no_argument, 0, LLMInferenceOptionId::ALPAMAYO_FM_USE_PREFILL_KV},
         {"alpamayoNavCfg", no_argument, 0, LLMInferenceOptionId::ALPAMAYO_NAV_CFG},
         {"defaultNavGuidanceWeight", required_argument, 0, LLMInferenceOptionId::DEFAULT_NAV_GUIDANCE_WEIGHT},
         {"dumpNavDualCache", no_argument, 0, LLMInferenceOptionId::DUMP_NAV_DUAL_CACHE},
@@ -559,6 +564,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         case LLMInferenceOptionId::PREFILL_INPUT_OUTPUT_DIR: args.prefillInputOutputDir = optarg; break;
         case LLMInferenceOptionId::FM_ENGINE: args.fmEngine = optarg; break;
         case LLMInferenceOptionId::ALPAMAYO_POST_VLM_RUNTIME: args.alpamayoPostVlmRuntime = true; break;
+        case LLMInferenceOptionId::ALPAMAYO_FM_USE_PREFILL_KV: args.alpamayoFmUsePrefillKv = true; break;
         case LLMInferenceOptionId::ALPAMAYO_NAV_CFG: args.alpamayoNavCfg = true; break;
         case LLMInferenceOptionId::DEFAULT_NAV_GUIDANCE_WEIGHT:
             try
@@ -702,6 +708,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         if (!args.fmEngine.empty())
         {
             LOG_INFO("args.fmEngine: %s", args.fmEngine.c_str());
+        }
+        if (args.alpamayoFmUsePrefillKv)
+        {
+            LOG_INFO("args.alpamayoFmUsePrefillKv: enabled");
         }
         if (args.alpamayoNavCfg)
         {
@@ -1335,6 +1345,7 @@ int main(int argc, char* argv[])
             options.navCacheOutputDir = args.navCacheOutputDir;
             options.fmEngine = args.fmEngine;
             options.defaultNavGuidanceWeight = args.defaultNavGuidanceWeight;
+            options.usePrefillKvForFm = args.alpamayoFmUsePrefillKv;
             alpamayoPostVlmRuntime = std::make_unique<rt::AlpamayoPostVlmRuntime>(std::move(options));
         }
     }
@@ -1703,4 +1714,3 @@ int main(int argc, char* argv[])
 
     return EXIT_SUCCESS;
 }
-

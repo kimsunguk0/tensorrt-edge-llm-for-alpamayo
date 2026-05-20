@@ -4,11 +4,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from fm_model_defaults import first_existing_fm_engine
 
 
 def build_env(plugin_lib: Path) -> dict[str, str]:
@@ -51,11 +58,36 @@ def main() -> None:
     parser.add_argument("--plugin-lib", type=Path, default=Path("/root/TensorRT-Edge-LLM-v060/build/libNvInfer_edgellm_plugin.so"))
     parser.add_argument("--engine-dir", type=Path, default=Path("/alpamayo_vlm_engines/alpa1.5"))
     parser.add_argument("--multimodal-engine-dir", type=Path, default=Path("/alpamayo_vlm_engines/alpa1.5_visual_fp8_rebuild"))
-    parser.add_argument("--fm-engine", type=Path, default=Path("/root/test/output/alpamayo15_fm_one_step_mxfp8/alpamayo15_fm_one_step_mxfp8_thor.plan"))
+    parser.add_argument(
+        "--fm-engine",
+        type=Path,
+        default=first_existing_fm_engine(),
+    )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--timeout-per-request", type=float, default=600.0)
     parser.add_argument("--limit", type=int, default=-1)
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--alpamayo-nav-cfg",
+        action="store_true",
+        help="Pass --alpamayoNavCfg through to llm_inference so nav-guided dual-cache FM is enabled.",
+    )
+    parser.add_argument(
+        "--alpamayo-fm-use-prefill-kv",
+        action="store_true",
+        help="Pass --alpamayoFmUsePrefillKv through to llm_inference.",
+    )
+    parser.add_argument(
+        "--dump-nav-dual-cache",
+        action="store_true",
+        help="Pass --dumpNavDualCache through to llm_inference to export guided/unguided KV snapshot artifacts.",
+    )
+    parser.add_argument(
+        "--nav-cache-output-dir",
+        type=Path,
+        default=Path("./output/nav_dual_cache"),
+        help="Directory for --dumpNavDualCache artifacts.",
+    )
     args = parser.parse_args()
 
     args.output_root.mkdir(parents=True, exist_ok=True)
@@ -78,6 +110,12 @@ def main() -> None:
         "--warmup",
         str(args.warmup),
     ]
+    if args.alpamayo_fm_use_prefill_kv:
+        cmd.append("--alpamayoFmUsePrefillKv")
+    if args.alpamayo_nav_cfg:
+        cmd.append("--alpamayoNavCfg")
+    if args.dump_nav_dual_cache:
+        cmd.extend(["--dumpNavDualCache", "--navCacheOutputDir", str(args.nav_cache_output_dir)])
 
     print("[runner] starting persistent llm_inference")
     print("[runner] " + " ".join(cmd), flush=True)
@@ -116,6 +154,14 @@ def main() -> None:
             status = read_status(proc, timeout_s=args.timeout_per_request)
             if status.get("status") != "ok":
                 raise RuntimeError(f"Request failed for {request_path.name}: {status}")
+
+            if args.dump_nav_dual_cache:
+                src_nav_dir = args.nav_cache_output_dir / "request_0"
+                if src_nav_dir.exists():
+                    dst_nav_dir = args.nav_cache_output_dir / request_path.stem
+                    if dst_nav_dir.exists():
+                        shutil.rmtree(dst_nav_dir)
+                    shutil.copytree(src_nav_dir, dst_nav_dir)
 
             completed += 1
             dt = time.time() - t0
