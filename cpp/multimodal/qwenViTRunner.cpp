@@ -19,13 +19,17 @@
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/mathUtils.h"
+#include "common/mmapReader.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
 #include "profiling/timer.h"
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <numeric>
@@ -43,6 +47,19 @@ namespace rt
 
 namespace
 {
+constexpr char const* kFlexInputName = "final_visual";
+constexpr char const* kFlexOutputName = "scene_embeds";
+constexpr std::array<char const*, 3> kFlexDeepstackInputNames = {"ds_level0", "ds_level1", "ds_level2"};
+constexpr std::array<char const*, 3> kFlexDeepstackOutputNames
+    = {"deepstack_scene_0", "deepstack_scene_1", "deepstack_scene_2"};
+constexpr char const* kFlexCameraIdsName = "camera_ids";
+constexpr char const* kFlexRelativeTimesName = "relative_times";
+constexpr std::array<int64_t, 4> kFlexAlpamayoCameraIds = {0, 1, 2, 6};
+constexpr std::array<float, 4> kFlexAlpamayoRelativeTimes = {-0.3F, -0.2F, -0.1F, 0.0F};
+constexpr int64_t kFlexAlpamayoFramesPerCamera = 4;
+constexpr int64_t kFlexAlpamayoImageCount
+    = static_cast<int64_t>(kFlexAlpamayoCameraIds.size()) * kFlexAlpamayoFramesPerCamera;
+
 bool isDebugQwenTextPreprocessEnabled()
 {
     char const* env = std::getenv("EDGELLM_DEBUG_QWEN_TEXTPRE");
@@ -109,6 +126,36 @@ bool writeBinaryFile(std::filesystem::path const& path, void const* data, size_t
     ofs.write(static_cast<char const*>(data), static_cast<std::streamsize>(size));
     return ofs.good();
 }
+
+bool hasIOTensor(nvinfer1::ICudaEngine const& engine, char const* name)
+{
+    for (int32_t idx = 0; idx < engine.getNbIOTensors(); ++idx)
+    {
+        char const* tensorName = engine.getIOTensorName(idx);
+        if (tensorName != nullptr && std::strcmp(tensorName, name) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasAllIOTensors(nvinfer1::ICudaEngine const& engine, std::array<char const*, 3> const& names)
+{
+    return std::all_of(names.begin(), names.end(), [&engine](char const* name) { return hasIOTensor(engine, name); });
+}
+
+bool checkTensorDataType(nvinfer1::ICudaEngine const& engine, char const* name, nvinfer1::DataType expected)
+{
+    nvinfer1::DataType const actual = engine.getTensorDataType(name);
+    if (actual != expected)
+    {
+        LOG_ERROR("QwenViTRunner: FLEX tensor %s has dtype %s, expected %s.", name, getDataTypeString(actual).c_str(),
+            getDataTypeString(expected).c_str());
+        return false;
+    }
+    return true;
+}
 } // namespace
 
 QwenViTRunner::QwenViTRunner(
@@ -127,6 +174,168 @@ QwenViTRunner::QwenViTRunner(
         LOG_ERROR("QwenViTRunner::QwenViTRunner(): Failed to allocate buffer");
         throw std::runtime_error("QwenViTRunner::QwenViTRunner(): Failed to allocate buffer");
     }
+    if (!tryLoadFlexEngine(engineDir, stream))
+    {
+        LOG_ERROR("QwenViTRunner::QwenViTRunner(): Failed to load optional FLEX engine");
+        throw std::runtime_error("QwenViTRunner::QwenViTRunner(): Failed to load optional FLEX engine");
+    }
+}
+
+bool QwenViTRunner::tryLoadFlexEngine(std::string const& engineDir, cudaStream_t stream)
+{
+    namespace fs = std::filesystem;
+
+    fs::path const flexEnginePath = fs::path(engineDir).parent_path() / "flex" / "flex.engine";
+    std::error_code ec;
+    if (!fs::exists(flexEnginePath, ec))
+    {
+        return true;
+    }
+
+    try
+    {
+        mFlexRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
+        auto mmapReader = std::make_unique<file_io::MmapReader>(flexEnginePath);
+        mFlexEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
+            mFlexRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+        if (!mFlexEngine)
+        {
+            LOG_ERROR("QwenViTRunner::tryLoadFlexEngine(): Failed to deserialize FLEX engine: %s",
+                flexEnginePath.c_str());
+            return false;
+        }
+
+        mFlexContext = std::unique_ptr<nvinfer1::IExecutionContext>(mFlexEngine->createExecutionContext());
+        if (!mFlexContext)
+        {
+            LOG_ERROR("QwenViTRunner::tryLoadFlexEngine(): Failed to create FLEX execution context.");
+            return false;
+        }
+        if (!mFlexContext->setOptimizationProfileAsync(0, stream))
+        {
+            LOG_ERROR("QwenViTRunner::tryLoadFlexEngine(): Failed to set FLEX optimization profile.");
+            return false;
+        }
+
+        mFlexHasDeepstackInputs = hasAllIOTensors(*mFlexEngine, kFlexDeepstackInputNames);
+        mFlexHasDeepstackOutputs = hasAllIOTensors(*mFlexEngine, kFlexDeepstackOutputNames);
+        mFlexHasMetadataInputs
+            = hasIOTensor(*mFlexEngine, kFlexCameraIdsName) && hasIOTensor(*mFlexEngine, kFlexRelativeTimesName);
+
+        if (mFlexHasDeepstackInputs != mFlexHasDeepstackOutputs)
+        {
+            LOG_ERROR(
+                "QwenViTRunner::tryLoadFlexEngine(): FLEX engine must have both deepstack inputs and deepstack outputs.");
+            return false;
+        }
+        if (mFlexHasDeepstackInputs && static_cast<int64_t>(mDeepstackFeatures.size()) < 3)
+        {
+            LOG_ERROR(
+                "QwenViTRunner::tryLoadFlexEngine(): FLEX engine requires 3 ViT deepstack features, but visual engine exposes %zu.",
+                mDeepstackFeatures.size());
+            return false;
+        }
+
+        for (char const* name : kFlexDeepstackInputNames)
+        {
+            if (hasIOTensor(*mFlexEngine, name)
+                && !checkTensorDataType(*mFlexEngine, name, nvinfer1::DataType::kHALF))
+            {
+                return false;
+            }
+        }
+        for (char const* name : kFlexDeepstackOutputNames)
+        {
+            if (hasIOTensor(*mFlexEngine, name)
+                && !checkTensorDataType(*mFlexEngine, name, nvinfer1::DataType::kHALF))
+            {
+                return false;
+            }
+        }
+        if (mFlexHasMetadataInputs)
+        {
+            if (!checkTensorDataType(*mFlexEngine, kFlexCameraIdsName, nvinfer1::DataType::kINT64)
+                || !checkTensorDataType(*mFlexEngine, kFlexRelativeTimesName, nvinfer1::DataType::kHALF))
+            {
+                return false;
+            }
+        }
+        if (hasIOTensor(*mFlexEngine, kFlexInputName)
+            && !checkTensorDataType(*mFlexEngine, kFlexInputName, nvinfer1::DataType::kHALF))
+        {
+            return false;
+        }
+        if (!checkTensorDataType(*mFlexEngine, kFlexOutputName, nvinfer1::DataType::kHALF))
+        {
+            return false;
+        }
+
+        nvinfer1::Dims const flexOutputShape = mFlexEngine->getTensorShape(kFlexOutputName);
+        if (flexOutputShape.nbDims == 3 && flexOutputShape.d[1] > 0)
+        {
+            mFlexMaxSceneTokens = flexOutputShape.d[1];
+        }
+        if (flexOutputShape.nbDims == 3 && flexOutputShape.d[2] > 0
+            && flexOutputShape.d[2] != mConfig.outHiddenSize)
+        {
+            LOG_ERROR("QwenViTRunner::tryLoadFlexEngine(): FLEX hidden size %d does not match ViT/LLM hidden size %d.",
+                flexOutputShape.d[2], mConfig.outHiddenSize);
+            return false;
+        }
+
+        mFlexOutputEmbedding = rt::Tensor({mFlexMaxSceneTokens, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kHALF, "QwenViTRunner::mFlexOutputEmbedding");
+        if (!mFlexContext->setTensorAddress(kFlexOutputName, mFlexOutputEmbedding.rawPointer()))
+        {
+            LOG_ERROR("QwenViTRunner::tryLoadFlexEngine(): Failed to bind FLEX output tensor.");
+            return false;
+        }
+
+        if (mFlexHasDeepstackOutputs)
+        {
+            mFlexDeepstackFeatures.clear();
+            mFlexDeepstackFeatures.reserve(kFlexDeepstackOutputNames.size());
+            for (size_t idx = 0; idx < kFlexDeepstackOutputNames.size(); ++idx)
+            {
+                mFlexDeepstackFeatures.emplace_back(rt::Tensor({mFlexMaxSceneTokens, mConfig.outHiddenSize},
+                    rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
+                    "QwenViTRunner::mFlexDeepstackFeatures" + std::to_string(idx)));
+                if (!mFlexContext->setTensorAddress(
+                        kFlexDeepstackOutputNames[idx], mFlexDeepstackFeatures.back().rawPointer()))
+                {
+                    LOG_ERROR("QwenViTRunner::tryLoadFlexEngine(): Failed to bind FLEX output tensor %s.",
+                        kFlexDeepstackOutputNames[idx]);
+                    return false;
+                }
+            }
+        }
+
+        if (mFlexHasMetadataInputs)
+        {
+            mFlexCameraIdsHost = rt::Tensor({1, mFlexExpectedVisualTokens}, rt::DeviceType::kCPU,
+                nvinfer1::DataType::kINT64, "QwenViTRunner::mFlexCameraIdsHost");
+            mFlexCameraIdsDevice = rt::Tensor({1, mFlexExpectedVisualTokens}, rt::DeviceType::kGPU,
+                nvinfer1::DataType::kINT64, "QwenViTRunner::mFlexCameraIdsDevice");
+            mFlexRelativeTimesHost = rt::Tensor({1, mFlexExpectedVisualTokens, 1}, rt::DeviceType::kCPU,
+                nvinfer1::DataType::kHALF, "QwenViTRunner::mFlexRelativeTimesHost");
+            mFlexRelativeTimesDevice = rt::Tensor({1, mFlexExpectedVisualTokens, 1}, rt::DeviceType::kGPU,
+                nvinfer1::DataType::kHALF, "QwenViTRunner::mFlexRelativeTimesDevice");
+        }
+
+        mFlexEnabled = true;
+        LOG_INFO(
+            "QwenViTRunner: enabled FLEX scene encoder from %s, scene_tokens=%lld, tokens_per_image=%lld, expected_vit_tokens=%lld, deepstack_io=%d, metadata_inputs=%d",
+            flexEnginePath.c_str(), static_cast<long long>(mFlexMaxSceneTokens),
+            static_cast<long long>(mFlexSceneTokensPerImage), static_cast<long long>(mFlexExpectedVisualTokens),
+            mFlexHasDeepstackOutputs ? 1 : 0, mFlexHasMetadataInputs ? 1 : 0);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("QwenViTRunner::tryLoadFlexEngine(): %s", e.what());
+        return false;
+    }
+
+    return true;
 }
 
 bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
@@ -728,6 +937,71 @@ void QwenViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> const&
     }
 }
 
+void QwenViTRunner::getFlexMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds) noexcept
+{
+    int64_t* mropePositionIdsPtr = mMropePositionIdsHost.dataPointer<int64_t>();
+    int64_t const maxPositionEmbeddings = mMropePositionIdsHost.getShape()[2];
+    int64_t batchOffset = 0;
+
+    for (auto const& inputIds : batchInputIds)
+    {
+        auto start = inputIds.begin();
+        auto end = inputIds.end();
+        auto it = inputIds.begin();
+        int64_t startIdx = 0;
+        int64_t remainingStartPos = 0;
+
+        while ((it = std::find(start, end, mConfig.visionStartTokenId)) != end)
+        {
+            int64_t const textLen = it + 1 - start;
+            for (int64_t axis = 0; axis < 3; ++axis)
+            {
+                for (int64_t j = 0; j < textLen; ++j)
+                {
+                    mropePositionIdsPtr[batchOffset + axis * maxPositionEmbeddings + remainingStartPos + j]
+                        = j + startIdx;
+                }
+            }
+
+            int64_t visualLen = mFlexSceneTokensPerImage;
+            int64_t const tokensAfterVisionStart = end - (it + 1);
+            if (tokensAfterVisionStart < visualLen)
+            {
+                visualLen = std::max<int64_t>(tokensAfterVisionStart, 0);
+                LOG_WARNING(
+                    "QwenViTRunner::getFlexMRopePositionIds(): truncated FLEX visual span to %lld tokens.",
+                    static_cast<long long>(visualLen));
+            }
+
+            for (int64_t k = 0; k < visualLen; ++k)
+            {
+                int64_t const idx = remainingStartPos + textLen + k;
+                int64_t const pos = textLen + startIdx + k;
+                for (int64_t axis = 0; axis < 3; ++axis)
+                {
+                    mropePositionIdsPtr[batchOffset + axis * maxPositionEmbeddings + idx] = pos;
+                }
+            }
+
+            start = it + 1 + visualLen;
+            startIdx += textLen + visualLen;
+            remainingStartPos = start - inputIds.begin();
+        }
+
+        int64_t const textLen = maxPositionEmbeddings - remainingStartPos;
+        for (int64_t axis = 0; axis < 3; ++axis)
+        {
+            for (int64_t j = 0; j < textLen; ++j)
+            {
+                mropePositionIdsPtr[batchOffset + axis * maxPositionEmbeddings + remainingStartPos + j]
+                    = j + startIdx;
+            }
+        }
+
+        batchOffset += 3 * maxPositionEmbeddings;
+    }
+}
+
 void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const& batchInputIds,
     std::vector<std::vector<int64_t>> const& imageGridTHWs, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
@@ -750,7 +1024,14 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
     check::check(mMropePositionIdsHost.reshape({activeBatchSize, 3, maxPositionEmbeddings}), "Tensor reshape failed");
     check::check(mMropePositionIdsDevice.reshape({activeBatchSize, 3, maxPositionEmbeddings}), "Tensor reshape failed");
     check::check(mRopeDeltasHost.reshape({activeBatchSize, 1}), "Tensor reshape failed");
-    getMRopePositionIds(batchInputIds, imageGridTHWs);
+    if (mFlexEnabled)
+    {
+        getFlexMRopePositionIds(batchInputIds);
+    }
+    else
+    {
+        getMRopePositionIds(batchInputIds, imageGridTHWs);
+    }
 
     // Match Hugging Face rope_deltas semantics: max(active_position_ids) + 1 - input_length.
     int64_t const* mropePositionIdsPtr = mMropePositionIdsHost.dataPointer<int64_t>();
@@ -775,6 +1056,10 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
             }
         }
         ropeDeltasPtr[batchIdx] = maxActivePositionId + 1 - inputLength;
+        if (mFlexEnabled && batchIdx < static_cast<int64_t>(mFlexRopeDeltaCorrections.size()))
+        {
+            ropeDeltasPtr[batchIdx] += mFlexRopeDeltaCorrections[batchIdx];
+        }
     }
 
     CUDA_CHECK(cudaMemcpyAsync(mMropePositionIdsDevice.rawPointer(), mMropePositionIdsHost.rawPointer(),
@@ -944,6 +1229,10 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             if (ids[j] == mConfig.imageTokenId || ids[j] == mConfig.videoTokenId)
             {
                 int64_t numImageTokens = imageTokenLengths.at(imageIndex);
+                if (mFlexEnabled && !isQwen3Omni)
+                {
+                    numImageTokens = mFlexSceneTokensPerImage;
+                }
 
                 if (isQwen3Omni)
                 {
@@ -1037,6 +1326,28 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     try
     {
         imagePreprocess(request, imageGridTHWs, imageTokenLengths, numImages, true, stream);
+        mFlexRopeDeltaCorrections.clear();
+        if (mFlexEnabled)
+        {
+            size_t imageOffset = 0;
+            for (size_t batchIdx = 0; batchIdx < numImages.size(); ++batchIdx)
+            {
+                int64_t originalImageTokens = 0;
+                for (int64_t localIdx = 0; localIdx < numImages[batchIdx]; ++localIdx)
+                {
+                    originalImageTokens += imageTokenLengths.at(imageOffset + static_cast<size_t>(localIdx));
+                }
+                imageOffset += static_cast<size_t>(numImages[batchIdx]);
+
+                int64_t const compressedImageTokens = numImages[batchIdx] * mFlexSceneTokensPerImage;
+                if (compressedImageTokens > mFlexMaxSceneTokens)
+                {
+                    throw std::runtime_error("FLEX compressed image tokens " + std::to_string(compressedImageTokens)
+                        + " exceed FLEX scene token capacity " + std::to_string(mFlexMaxSceneTokens));
+                }
+                mFlexRopeDeltaCorrections.emplace_back(originalImageTokens - compressedImageTokens);
+            }
+        }
         textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
         generateMropeParams(batchedInputIds, imageGridTHWs, ropeRotaryCosSinDevice, stream);
     }
@@ -1067,6 +1378,7 @@ bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, toke
     std::vector<std::vector<int32_t>> batchedInputIds;
     batchedInputIds.emplace_back(std::move(ids));
     std::vector<std::vector<int64_t>> imageGridTHWs;
+    mFlexRopeDeltaCorrections.assign(batchedInputIds.size(), 0);
 
     try
     {
@@ -1078,6 +1390,69 @@ bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, toke
         return false;
     }
 
+    return true;
+}
+
+bool QwenViTRunner::populateFlexMetadata(int64_t totalImageTokens, cudaStream_t stream) noexcept
+{
+    if (!mFlexHasMetadataInputs)
+    {
+        return true;
+    }
+    if (totalImageTokens <= 0 || totalImageTokens % kFlexAlpamayoImageCount != 0)
+    {
+        LOG_ERROR(
+            "QwenViTRunner::populateFlexMetadata(): expected token count divisible by %lld Alpamayo images, got %lld.",
+            static_cast<long long>(kFlexAlpamayoImageCount), static_cast<long long>(totalImageTokens));
+        return false;
+    }
+
+    rt::Coords const cameraIdsShape{1, totalImageTokens};
+    rt::Coords const relativeTimesShape{1, totalImageTokens, 1};
+    if (!mFlexCameraIdsHost.reshape(cameraIdsShape) || !mFlexCameraIdsDevice.reshape(cameraIdsShape)
+        || !mFlexRelativeTimesHost.reshape(relativeTimesShape) || !mFlexRelativeTimesDevice.reshape(relativeTimesShape))
+    {
+        LOG_ERROR("QwenViTRunner::populateFlexMetadata(): failed to reshape FLEX metadata tensors.");
+        return false;
+    }
+
+    int64_t* cameraIds = mFlexCameraIdsHost.dataPointer<int64_t>();
+    half* relativeTimes = mFlexRelativeTimesHost.dataPointer<half>();
+    int64_t const tokensPerImage = totalImageTokens / kFlexAlpamayoImageCount;
+    for (size_t cameraIdx = 0; cameraIdx < kFlexAlpamayoCameraIds.size(); ++cameraIdx)
+    {
+        for (int64_t frameIdx = 0; frameIdx < kFlexAlpamayoFramesPerCamera; ++frameIdx)
+        {
+            int64_t const imageIdx = static_cast<int64_t>(cameraIdx) * kFlexAlpamayoFramesPerCamera + frameIdx;
+            int64_t const tokenOffset = imageIdx * tokensPerImage;
+            half const relativeTime = __float2half(kFlexAlpamayoRelativeTimes[frameIdx]);
+            for (int64_t tokenIdx = 0; tokenIdx < tokensPerImage; ++tokenIdx)
+            {
+                int64_t const idx = tokenOffset + tokenIdx;
+                cameraIds[idx] = kFlexAlpamayoCameraIds[cameraIdx];
+                relativeTimes[idx] = relativeTime;
+            }
+        }
+    }
+
+    size_t const cameraIdsBytes = static_cast<size_t>(totalImageTokens) * sizeof(int64_t);
+    size_t const relativeTimesBytes = static_cast<size_t>(totalImageTokens) * sizeof(half);
+    cudaError_t status = cudaMemcpyAsync(
+        mFlexCameraIdsDevice.rawPointer(), mFlexCameraIdsHost.rawPointer(), cameraIdsBytes, cudaMemcpyHostToDevice,
+        stream);
+    if (status != cudaSuccess)
+    {
+        LOG_ERROR("QwenViTRunner::populateFlexMetadata(): failed to copy camera_ids: %s", cudaGetErrorString(status));
+        return false;
+    }
+    status = cudaMemcpyAsync(mFlexRelativeTimesDevice.rawPointer(), mFlexRelativeTimesHost.rawPointer(),
+        relativeTimesBytes, cudaMemcpyHostToDevice, stream);
+    if (status != cudaSuccess)
+    {
+        LOG_ERROR(
+            "QwenViTRunner::populateFlexMetadata(): failed to copy relative_times: %s", cudaGetErrorString(status));
+        return false;
+    }
     return true;
 }
 
@@ -1133,6 +1508,113 @@ bool QwenViTRunner::infer(cudaStream_t stream) noexcept
         }
     }
 
+    if (mFlexEnabled)
+    {
+        int64_t const totalImageTokens = mOutputEmbedding.getShape()[0];
+        if (totalImageTokens != mFlexExpectedVisualTokens)
+        {
+            LOG_ERROR(
+                "QwenViTRunner::infer(): FLEX K512 engine currently expects %lld ViT tokens, got %lld. Check image count/resolution.",
+                static_cast<long long>(mFlexExpectedVisualTokens), static_cast<long long>(totalImageTokens));
+            return false;
+        }
+
+        TIME_STAGE(metrics::StageNames::kFLEX_ENCODER, stream);
+
+        rt::Coords const flexInputShape{1, totalImageTokens, mConfig.outHiddenSize};
+        rt::Coords const flexCameraIdsShape{1, totalImageTokens};
+        rt::Coords const flexRelativeTimesShape{1, totalImageTokens, 1};
+        if (!populateFlexMetadata(totalImageTokens, stream))
+        {
+            return false;
+        }
+
+        bool setFlexIOStatus{true};
+        setFlexIOStatus &= mFlexContext->setInputShape(kFlexInputName, flexInputShape.getTRTDims());
+        setFlexIOStatus &= mFlexContext->setTensorAddress(kFlexInputName, mOutputEmbedding.rawPointer());
+        if (mFlexHasDeepstackInputs)
+        {
+            for (size_t idx = 0; idx < kFlexDeepstackInputNames.size(); ++idx)
+            {
+                setFlexIOStatus &= mFlexContext->setInputShape(kFlexDeepstackInputNames[idx], flexInputShape.getTRTDims());
+                setFlexIOStatus
+                    &= mFlexContext->setTensorAddress(kFlexDeepstackInputNames[idx], mDeepstackFeatures[idx].rawPointer());
+            }
+        }
+        if (mFlexHasMetadataInputs)
+        {
+            setFlexIOStatus &= mFlexContext->setInputShape(kFlexCameraIdsName, flexCameraIdsShape.getTRTDims());
+            setFlexIOStatus &= mFlexContext->setTensorAddress(kFlexCameraIdsName, mFlexCameraIdsDevice.rawPointer());
+            setFlexIOStatus
+                &= mFlexContext->setInputShape(kFlexRelativeTimesName, flexRelativeTimesShape.getTRTDims());
+            setFlexIOStatus
+                &= mFlexContext->setTensorAddress(kFlexRelativeTimesName, mFlexRelativeTimesDevice.rawPointer());
+        }
+        setFlexIOStatus &= mFlexContext->setTensorAddress(kFlexOutputName, mFlexOutputEmbedding.rawPointer());
+        if (mFlexHasDeepstackOutputs)
+        {
+            for (size_t idx = 0; idx < kFlexDeepstackOutputNames.size(); ++idx)
+            {
+                setFlexIOStatus &= mFlexContext->setTensorAddress(
+                    kFlexDeepstackOutputNames[idx], mFlexDeepstackFeatures[idx].rawPointer());
+            }
+        }
+        if (!setFlexIOStatus)
+        {
+            LOG_ERROR("QwenViTRunner::infer(): Failed to bind FLEX engine tensors.");
+            return false;
+        }
+
+        nvinfer1::Dims const flexOutputShape = mFlexContext->getTensorShape(kFlexOutputName);
+        if (flexOutputShape.nbDims == 3 && flexOutputShape.d[1] > 0)
+        {
+            if (flexOutputShape.d[1] > mFlexMaxSceneTokens || flexOutputShape.d[2] != mConfig.outHiddenSize)
+            {
+                LOG_ERROR("QwenViTRunner::infer(): Invalid FLEX output shape [%d, %d, %d].", flexOutputShape.d[0],
+                    flexOutputShape.d[1], flexOutputShape.d[2]);
+                return false;
+            }
+            check::check(mFlexOutputEmbedding.reshape({flexOutputShape.d[1], flexOutputShape.d[2]}),
+                "Tensor reshape failed");
+        }
+        else
+        {
+            check::check(mFlexOutputEmbedding.reshape({mFlexMaxSceneTokens, mConfig.outHiddenSize}),
+                "Tensor reshape failed");
+        }
+
+        if (mFlexHasDeepstackOutputs)
+        {
+            int64_t const sceneTokens = mFlexOutputEmbedding.getShape()[0];
+            for (size_t idx = 0; idx < kFlexDeepstackOutputNames.size(); ++idx)
+            {
+                nvinfer1::Dims const flexDeepstackShape = mFlexContext->getTensorShape(kFlexDeepstackOutputNames[idx]);
+                int64_t outputTokens = sceneTokens;
+                int64_t outputHiddenSize = mConfig.outHiddenSize;
+                if (flexDeepstackShape.nbDims == 3 && flexDeepstackShape.d[1] > 0)
+                {
+                    outputTokens = flexDeepstackShape.d[1];
+                    outputHiddenSize = flexDeepstackShape.d[2];
+                }
+                if (outputTokens > mFlexMaxSceneTokens || outputHiddenSize != mConfig.outHiddenSize)
+                {
+                    LOG_ERROR("QwenViTRunner::infer(): Invalid FLEX deepstack output shape [%d, %d, %d].",
+                        flexDeepstackShape.d[0], flexDeepstackShape.d[1], flexDeepstackShape.d[2]);
+                    return false;
+                }
+                check::check(mFlexDeepstackFeatures[idx].reshape({outputTokens, outputHiddenSize}),
+                    "Tensor reshape failed");
+            }
+        }
+
+        bool enqueueStatus = mFlexContext->enqueueV3(stream);
+        if (!enqueueStatus)
+        {
+            LOG_ERROR("QwenViTRunner::infer(): Failed to enqueue FLEX engine.");
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -1141,6 +1623,16 @@ rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()
     if (mModelType != multimodal::ModelType::QWEN3_VL && mModelType != multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         return {};
+    }
+    if (mFlexEnabled)
+    {
+        std::vector<std::reference_wrapper<rt::Tensor const>> refs;
+        refs.reserve(mFlexDeepstackFeatures.size());
+        for (auto const& tensor : mFlexDeepstackFeatures)
+        {
+            refs.emplace_back(std::cref(tensor));
+        }
+        return refs;
     }
 
     // Build vector of references to individual tensors
@@ -1151,6 +1643,11 @@ rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()
         refs.emplace_back(std::cref(tensor));
     }
     return refs;
+}
+
+rt::Tensor& QwenViTRunner::getOutputEmbedding()
+{
+    return mFlexEnabled ? mFlexOutputEmbedding : mOutputEmbedding;
 }
 
 rt::OptionalInputTensor QwenViTRunner::getPositionIds()

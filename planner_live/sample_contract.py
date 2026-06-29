@@ -19,8 +19,14 @@ REQUIRED_SAMPLE_KEYS = (
 
 PLANNER_CAMERA_IDS = (0, 1, 2, 6)
 PLANNER_CAMERA_ORDER = ("left", "front", "right", "front_tele")
+LIVE_4CAM_CAMERA_IDS = (1, 6, 0, 2)
+LIVE_4CAM_CAMERA_ORDER = ("front", "front_tele", "left", "right")
 FRONT_TELE_CAMERA_IDS = (1, 6)
 FRONT_TELE_CAMERA_ORDER = ("front", "front_tele")
+FRONT_LEFT_CAMERA_IDS = (1, 0)
+FRONT_LEFT_CAMERA_ORDER = ("front", "left")
+LEFT_FRONT_CAMERA_IDS = (0, 1)
+LEFT_FRONT_CAMERA_ORDER = ("left", "front")
 SINGLE_CAMERA_CONFIGS = {
     (0,): ("left",),
     (1,): ("front",),
@@ -36,12 +42,18 @@ LEGACY_CAMERA_ORDER = (
 
 SUPPORTED_CAMERA_CONFIGS = {
     PLANNER_CAMERA_IDS: PLANNER_CAMERA_ORDER,
+    LIVE_4CAM_CAMERA_IDS: LIVE_4CAM_CAMERA_ORDER,
     FRONT_TELE_CAMERA_IDS: FRONT_TELE_CAMERA_ORDER,
+    FRONT_LEFT_CAMERA_IDS: FRONT_LEFT_CAMERA_ORDER,
+    LEFT_FRONT_CAMERA_IDS: LEFT_FRONT_CAMERA_ORDER,
     **SINGLE_CAMERA_CONFIGS,
 }
 
 LEGACY_CAMERA_ORDER_ALIASES = {
     LEGACY_CAMERA_ORDER: PLANNER_CAMERA_ORDER,
+    ("front_camera", "front_telephoto_camera", "front_left_camera", "front_right_camera"): LIVE_4CAM_CAMERA_ORDER,
+    ("front_camera", "front_left_camera"): FRONT_LEFT_CAMERA_ORDER,
+    ("front_left_camera", "front_camera"): LEFT_FRONT_CAMERA_ORDER,
     ("front_left_camera",): ("left",),
     ("front_camera",): ("front",),
     ("front_right_camera",): ("right",),

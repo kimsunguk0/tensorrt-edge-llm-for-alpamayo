@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import os
@@ -32,6 +33,8 @@ CAMERA_DISPLAY_NAMES = {
     6: "Front telephoto camera",
 }
 
+ALPAMAYO_CANONICAL_CAMERA_ORDER = (0, 1, 2, 6)
+
 DEFAULT_ACTION_SPACE_CONSTANTS = {
     "accel_mean": 0.029052734375,
     "accel_std": 0.6796875,
@@ -41,6 +44,14 @@ DEFAULT_ACTION_SPACE_CONSTANTS = {
     "v_lambda": 0.000001,
     "v_ridge": 0.0001,
 }
+
+
+def ordered_camera_positions(sample: dict[str, Any]) -> list[tuple[int, int]]:
+    camera_indices = [int(x) for x in np.asarray(sample["camera_indices"]).tolist()]
+    by_id = {cam_id: cam_pos for cam_pos, cam_id in enumerate(camera_indices)}
+    if set(camera_indices) == set(ALPAMAYO_CANONICAL_CAMERA_ORDER):
+        return [(by_id[cam_id], cam_id) for cam_id in ALPAMAYO_CANONICAL_CAMERA_ORDER]
+    return list(enumerate(camera_indices))
 
 
 def parse_args() -> argparse.Namespace:
@@ -221,7 +232,39 @@ def fetch_latest_sample(server_url: str, sample_endpoint: str, timeout: float) -
     return sample, metadata
 
 
-def write_sample_files(sample: dict[str, Any], image_dir: Path, ego_dir: Path) -> tuple[list[Path], Path, Path]:
+def _image_extension(image_format: str) -> str:
+    normalized = str(image_format).lower()
+    if normalized == "png":
+        return ".png"
+    if normalized == "ppm":
+        return ".ppm"
+    raise ValueError(f"unsupported image format: {image_format!r}")
+
+
+def _write_rgb_image(image_hwc: np.ndarray, image_path: Path, image_format: str) -> None:
+    normalized = str(image_format).lower()
+    if normalized == "png":
+        Image.fromarray(image_hwc).save(image_path, compress_level=0)
+        return
+    if normalized == "ppm":
+        contiguous = np.ascontiguousarray(image_hwc, dtype=np.uint8)
+        height, width, channels = contiguous.shape
+        if channels != 3:
+            raise ValueError(f"PPM writer expects RGB image with 3 channels, got shape={contiguous.shape}")
+        with image_path.open("wb") as handle:
+            handle.write(f"P6\n{width} {height}\n255\n".encode("ascii"))
+            handle.write(contiguous.tobytes())
+        return
+    raise ValueError(f"unsupported image format: {image_format!r}")
+
+
+def write_sample_files(
+    sample: dict[str, Any],
+    image_dir: Path,
+    ego_dir: Path,
+    *,
+    image_format: str = "png",
+) -> tuple[list[Path], Path, Path]:
     ensure_dir(image_dir)
     ensure_dir(ego_dir)
 
@@ -232,11 +275,12 @@ def write_sample_files(sample: dict[str, Any], image_dir: Path, ego_dir: Path) -
         raise RuntimeError(f"camera_indices length mismatch: num_cams={num_cams}, indices={camera_indices}")
 
     image_paths: list[Path] = []
-    for cam_pos, cam_id in enumerate(camera_indices):
+    image_suffix = _image_extension(image_format)
+    for cam_pos, cam_id in ordered_camera_positions(sample):
         for step_idx in range(num_steps):
             image_hwc = np.transpose(image_frames[cam_pos, step_idx], (1, 2, 0))
-            image_path = image_dir / f"cam{cam_id}_f{step_idx}.png"
-            Image.fromarray(image_hwc).save(image_path, compress_level=0)
+            image_path = image_dir / f"cam{cam_id}_f{step_idx}{image_suffix}"
+            _write_rgb_image(image_hwc, image_path, image_format)
             image_paths.append(image_path)
 
     xyz_path = ego_dir / "ego_history_xyz.npy"
@@ -262,13 +306,15 @@ def build_user_content(
     camera_indices: list[int],
     num_frames_per_camera: int,
     nav_text: str | None,
+    image_format: str = "png",
 ) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = []
+    image_suffix = _image_extension(image_format)
     for cam_id in camera_indices:
         cam_name = CAMERA_DISPLAY_NAMES.get(cam_id, f"Camera {cam_id}")
         content.append({"type": "text", "text": f"{cam_name}: "})
         for frame_idx in range(num_frames_per_camera):
-            image_path = image_dir / f"cam{cam_id}_f{frame_idx}.png"
+            image_path = image_dir / f"cam{cam_id}_f{frame_idx}{image_suffix}"
             if not image_path.exists():
                 raise FileNotFoundError(f"Missing frame file: {image_path}")
             content.append({"type": "text", "text": f"frame {frame_idx} "})
@@ -284,12 +330,50 @@ def build_user_content(
     return content
 
 
+def build_inline_user_content(
+    sample: dict[str, Any],
+    nav_text: str | None,
+) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = []
+    image_frames = np.asarray(sample["image_frames"])
+    num_frames_per_camera = int(image_frames.shape[1])
+    for cam_pos, cam_id in ordered_camera_positions(sample):
+        cam_name = CAMERA_DISPLAY_NAMES.get(cam_id, f"Camera {cam_id}")
+        content.append({"type": "text", "text": f"{cam_name}: "})
+        for frame_idx in range(num_frames_per_camera):
+            image_hwc = np.ascontiguousarray(np.transpose(image_frames[cam_pos, frame_idx], (1, 2, 0)), dtype=np.uint8)
+            height, width, channels = image_hwc.shape
+            if channels != 3:
+                raise ValueError(f"inline image expects RGB shape [H,W,3], got {image_hwc.shape}")
+            content.append({"type": "text", "text": f"frame {frame_idx} "})
+            content.append(
+                {
+                    "type": "image",
+                    "image": f"inline://cam{cam_id}_f{frame_idx}.rgb",
+                    "image_rgb_u8": {
+                        "shape": [int(height), int(width), int(channels)],
+                        "encoding": "base64",
+                        "data_b64": base64.b64encode(image_hwc.tobytes()).decode("ascii"),
+                    },
+                }
+            )
+
+    hist_placeholder = "<|traj_history_start|>" + ("<|traj_history|>" * 48) + "<|traj_history_end|>"
+    route_section = f"<|route_start|>{nav_text}<|route_end|>" if nav_text else ""
+    prompt_text = (
+        "output the chain-of-thought reasoning of the driving process, "
+        "then output the future trajectory."
+    )
+    content.append({"type": "text", "text": f"{hist_placeholder}{route_section}{prompt_text}"})
+    return content
+
+
 def build_runtime_request(
     *,
     sample: dict[str, Any],
-    xyz_path: Path,
-    rot_path: Path,
-    image_dir: Path,
+    xyz_path: Path | None,
+    rot_path: Path | None,
+    image_dir: Path | None,
     output_request: Path,
     action_space_constants: dict[str, float],
     nav_text: str | None,
@@ -301,15 +385,69 @@ def build_runtime_request(
     temperature: float,
     top_p: float,
     top_k: int,
+    image_format: str = "png",
+    inline_inputs: bool = False,
+    json_indent: int | None = 2,
 ) -> dict[str, Any]:
-    camera_indices = [int(x) for x in np.asarray(sample["camera_indices"]).tolist()]
+    camera_indices = [cam_id for _, cam_id in ordered_camera_positions(sample)]
     num_frames_per_camera = int(sample["image_frames"].shape[1])
-    user_content = build_user_content(
-        image_dir=image_dir,
-        camera_indices=camera_indices,
-        num_frames_per_camera=num_frames_per_camera,
-        nav_text=nav_text,
-    )
+    if inline_inputs:
+        user_content = build_inline_user_content(sample, nav_text=nav_text)
+    else:
+        if xyz_path is None or rot_path is None or image_dir is None:
+            raise ValueError("file-based runtime request requires xyz_path, rot_path, and image_dir")
+        user_content = build_user_content(
+            image_dir=image_dir,
+            camera_indices=camera_indices,
+            num_frames_per_camera=num_frames_per_camera,
+            nav_text=nav_text,
+            image_format=image_format,
+        )
+
+    request_item: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "You are a driving assistant that generates safe and accurate actions.",
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": user_content,
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "<|cot_start|>"}],
+            },
+        ],
+        "traj_token_offset": traj_token_offset,
+        "action_space_constants": action_space_constants,
+        "diffusion_seed": int(diffusion_seed),
+        "diffusion_num_steps": int(diffusion_num_steps),
+    }
+    if inline_inputs:
+        ego_xyz = np.asarray(sample["ego_history_xyz"], dtype=np.float32)
+        ego_rot = np.asarray(sample["ego_history_rot"], dtype=np.float32)
+        request_item["ego_history_xyz"] = {
+            "shape": [int(x) for x in ego_xyz.shape],
+            "dtype": "float32",
+            "data": ego_xyz.reshape(-1).astype(float).tolist(),
+        }
+        request_item["ego_history_rot"] = {
+            "shape": [int(x) for x in ego_rot.shape],
+            "dtype": "float32",
+            "data": ego_rot.reshape(-1).astype(float).tolist(),
+        }
+    else:
+        request_item["ego_history_xyz_npy"] = str(xyz_path)
+        request_item["ego_history_rot_npy"] = str(rot_path)
+    if nav_text:
+        request_item["nav_text"] = nav_text
+        request_item["nav_guidance_weight"] = float(nav_guidance_weight)
 
     request = {
         "batch_size": 1,
@@ -321,42 +459,14 @@ def build_runtime_request(
         "add_generation_prompt": False,
         "continue_final_message": True,
         "enable_thinking": False,
-        "requests": [
-            {
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "You are a driving assistant that generates safe and accurate actions.",
-                            }
-                        ],
-                    },
-                    {
-                        "role": "user",
-                        "content": user_content,
-                    },
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "<|cot_start|>"}],
-                    },
-                ],
-                "ego_history_xyz_npy": str(xyz_path),
-                "ego_history_rot_npy": str(rot_path),
-                "traj_token_offset": traj_token_offset,
-                "action_space_constants": action_space_constants,
-                "diffusion_seed": int(diffusion_seed),
-                "diffusion_num_steps": int(diffusion_num_steps),
-            }
-        ],
+        "requests": [request_item],
     }
-    if nav_text:
-        request["requests"][0]["nav_text"] = nav_text
-        request["requests"][0]["nav_guidance_weight"] = float(nav_guidance_weight)
 
     ensure_dir(output_request.parent)
-    output_request.write_text(json.dumps(request, indent=2, ensure_ascii=False))
+    if json_indent is None:
+        output_request.write_text(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
+    else:
+        output_request.write_text(json.dumps(request, indent=int(json_indent), ensure_ascii=False))
     return request
 
 
@@ -448,6 +558,10 @@ class PersistentLLMInferenceClient:
         self.start()
         assert self.process is not None and self.process.stdin is not None
         command = {"input_file": str(request_path), "output_file": str(output_file)}
+        if bool(getattr(self.args, "compact_output_json", False)):
+            command["compact_output_json"] = True
+        if bool(getattr(self.args, "minimal_output_json", False)):
+            command["minimal_output_json"] = True
         self.process.stdin.write(json.dumps(command) + "\n")
         self.process.stdin.flush()
         status = self._read_status(timeout_sec=300.0)

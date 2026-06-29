@@ -5,9 +5,15 @@ import unittest
 import numpy as np
 
 from planner_live.sample_contract import (
+    FRONT_LEFT_CAMERA_IDS,
+    FRONT_LEFT_CAMERA_ORDER,
     FRONT_TELE_CAMERA_IDS,
     FRONT_TELE_CAMERA_ORDER,
+    LEFT_FRONT_CAMERA_IDS,
+    LEFT_FRONT_CAMERA_ORDER,
     LEGACY_CAMERA_ORDER,
+    LIVE_4CAM_CAMERA_IDS,
+    LIVE_4CAM_CAMERA_ORDER,
     PLANNER_CAMERA_IDS,
     PLANNER_CAMERA_ORDER,
     SINGLE_CAMERA_CONFIGS,
@@ -46,11 +52,29 @@ class SampleValidationTests(unittest.TestCase):
         normalized = validate_live_sample(make_valid_sample(camera_order=LEGACY_CAMERA_ORDER))
         self.assertEqual(normalized["camera_order"], list(PLANNER_CAMERA_ORDER))
 
+    def test_accepts_live_4cam_contract(self) -> None:
+        normalized = validate_live_sample(
+            make_valid_sample(camera_indices=LIVE_4CAM_CAMERA_IDS, camera_order=LIVE_4CAM_CAMERA_ORDER)
+        )
+        self.assertEqual(normalized["camera_order"], list(LIVE_4CAM_CAMERA_ORDER))
+
     def test_accepts_front_and_front_tele_contract(self) -> None:
         normalized = validate_live_sample(
             make_valid_sample(camera_indices=FRONT_TELE_CAMERA_IDS, camera_order=FRONT_TELE_CAMERA_ORDER)
         )
         self.assertEqual(normalized["camera_order"], list(FRONT_TELE_CAMERA_ORDER))
+
+    def test_accepts_front_and_left_contract(self) -> None:
+        normalized = validate_live_sample(
+            make_valid_sample(camera_indices=FRONT_LEFT_CAMERA_IDS, camera_order=FRONT_LEFT_CAMERA_ORDER)
+        )
+        self.assertEqual(normalized["camera_order"], list(FRONT_LEFT_CAMERA_ORDER))
+
+    def test_accepts_left_and_front_contract(self) -> None:
+        normalized = validate_live_sample(
+            make_valid_sample(camera_indices=LEFT_FRONT_CAMERA_IDS, camera_order=LEFT_FRONT_CAMERA_ORDER)
+        )
+        self.assertEqual(normalized["camera_order"], list(LEFT_FRONT_CAMERA_ORDER))
 
     def test_accepts_single_camera_contracts(self) -> None:
         for camera_indices, camera_order in SINGLE_CAMERA_CONFIGS.items():

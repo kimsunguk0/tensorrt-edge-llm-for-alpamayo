@@ -124,5 +124,6 @@ TEST(WOQInt4GemmTest, accuracyGemm)
     // k=512 (instead of k=1024): FP16 tensor-core accumulation vs FP32 reference error scales
     // with k; halving k keeps the accumulated rounding error within rtol=1e-1.
     TestInt4GroupwiseGemmAccuracy(64, 512, 512, 128);
+    TestInt4GroupwiseGemmAccuracy(128, 1024, 512, 128);
     TestInt4GroupwiseGemmAccuracy(64, 640, 512, 128);
 }

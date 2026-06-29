@@ -430,6 +430,7 @@ int main(int argc, char** argv)
     int32_t hiddenSize = 0;
     int32_t vocabSize = 0;
     int32_t eagleHiddenDim = 0;
+    int32_t numDeepstackFeatures = 0;
 
     if (args.mode == BenchMode::kPREFILL && args.inputLen <= 0)
     {
@@ -476,6 +477,7 @@ int main(int argc, char** argv)
         hiddenSize = engineConfig.hiddenSize;
         vocabSize = engineConfig.vocabSize;
         eagleHiddenDim = engineConfig.outputHiddenDim;
+        numDeepstackFeatures = engineConfig.numDeepstackFeatures;
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PROPOSAL || args.mode == BenchMode::kEAGLE_DRAFT_PREFILL)
     {
@@ -573,6 +575,8 @@ int main(int argc, char** argv)
     rt::Tensor prefillInputs;
     rt::Tensor contextLengths;
     rt::Tensor prefillLogits;
+    std::vector<rt::Tensor> prefillDeepstackTensors;
+    rt::OptionalInputTensors prefillDeepstackEmbeds;
 
     rt::Tensor decodeInputs;
     rt::Tensor decodeLogits;
@@ -611,7 +615,20 @@ int main(int argc, char** argv)
         std::memcpy(contextLengths.rawPointer(), lengthsHost.data(), lengthsHost.size() * sizeof(int32_t));
 
         prefillLogits = rt::Tensor(
-            rt::Coords{args.batchSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "prefill_logits");
+            rt::Coords{args.batchSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "prefill_logits");
+
+        prefillDeepstackTensors.reserve(numDeepstackFeatures);
+        for (int32_t i = 0; i < numDeepstackFeatures; ++i)
+        {
+            prefillDeepstackTensors.emplace_back(rt::Coords{args.batchSize, args.inputLen, hiddenSize},
+                rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
+                std::string("prefill_deepstack_embed_") + std::to_string(i));
+        }
+        for (auto& tensor : prefillDeepstackTensors)
+        {
+            fillRandomHalf(tensor, 0.0f, 0.0f, args.seed);
+            prefillDeepstackEmbeds.push_back(std::cref(tensor));
+        }
     }
     else if (args.mode == BenchMode::kDECODE)
     {
@@ -621,7 +638,7 @@ int main(int argc, char** argv)
         fillRandomHalf(decodeInputs, -1.0f, 1.0f, args.seed);
 
         decodeLogits = rt::Tensor(
-            rt::Coords{args.batchSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "decode_logits");
+            rt::Coords{args.batchSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "decode_logits");
     }
     else if (args.mode == BenchMode::kEAGLE_VERIFY)
     {
@@ -713,7 +730,8 @@ int main(int argc, char** argv)
         if (args.mode == BenchMode::kPREFILL)
         {
             runner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengths, stream);
-            runner->executePrefillStep(prefillInputs, contextLengths, {}, prefillLogits, std::nullopt, stream);
+            runner->executePrefillStep(
+                prefillInputs, contextLengths, prefillDeepstackEmbeds, prefillLogits, std::nullopt, stream);
         }
         else if (args.mode == BenchMode::kDECODE)
         {
@@ -756,7 +774,8 @@ int main(int argc, char** argv)
         if (args.mode == BenchMode::kPREFILL)
         {
             runner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengths, stream);
-            runner->executePrefillStep(prefillInputs, contextLengths, {}, prefillLogits, std::nullopt, stream);
+            runner->executePrefillStep(
+                prefillInputs, contextLengths, prefillDeepstackEmbeds, prefillLogits, std::nullopt, stream);
         }
         else if (args.mode == BenchMode::kDECODE)
         {

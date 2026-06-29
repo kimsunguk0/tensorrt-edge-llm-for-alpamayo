@@ -16,11 +16,17 @@
  */
 
 #include "int4GroupwiseGemmPlugin.h"
+#include "common/cudaUtils.h"
+#include "common/stringUtils.h"
+#include "common/tensor.h"
 #include "kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h"
+#include "kernels/moe/moe_marlin/moeMarlin.h"
 #include "plugins/utils/pluginUtils.h"
 
 #include <cassert>
+#include <algorithm>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include <mutex>
 #include <optional>
 
@@ -36,6 +42,29 @@ namespace
 {
 constexpr char const* kINT4_GEMM_PLUGIN_VERSION{"1"};
 constexpr char const* kINT4_GEMM_PLUGIN_NAME{"Int4GroupwiseGemmPlugin"};
+constexpr int32_t kDENSE_MARLIN_BLOCK_SIZE{64};
+
+int32_t divUpInt32(int32_t x, int32_t y)
+{
+    return (x + y - 1) / y;
+}
+
+int64_t getProfileDim(nvinfer1::DynamicPluginTensorDesc const& desc, int32_t dim) noexcept
+{
+    if (desc.max.nbDims > dim && desc.max.d[dim] > 0)
+    {
+        return desc.max.d[dim];
+    }
+    if (desc.opt.nbDims > dim && desc.opt.d[dim] > 0)
+    {
+        return desc.opt.d[dim];
+    }
+    if (desc.desc.dims.nbDims > dim && desc.desc.dims.d[dim] > 0)
+    {
+        return desc.desc.dims.d[dim];
+    }
+    return 1;
+}
 
 } // namespace
 
@@ -45,11 +74,13 @@ std::vector<PluginField> Int4GroupwiseGemmPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(Int4GroupwiseGemmPluginCreator);
 
-Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize)
+Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(
+    std::string const& name, int32_t N, int32_t K, int32_t groupSize, bool useMarlinPrefill)
     : mLayerName(name)
     , mGemmN(N)
     , mGemmK(K)
     , mGroupSize(groupSize)
+    , mUseMarlinPrefill(useMarlinPrefill ? 1 : 0)
 {
 }
 
@@ -70,6 +101,10 @@ Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, Plugin
         else if (fieldName == "group_size")
         {
             mGroupSize = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
+        else if (fieldName == "use_marlin")
+        {
+            mUseMarlinPrefill = *static_cast<int32_t const*>(fc->fields[i].data);
         }
     }
 }
@@ -100,7 +135,8 @@ IPluginV3* Int4GroupwiseGemmPlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new Int4GroupwiseGemmPlugin(mLayerName, mGemmN, mGemmK, mGroupSize);
+        auto* plugin
+            = new Int4GroupwiseGemmPlugin(mLayerName, mGemmN, mGemmK, mGroupSize, mUseMarlinPrefill != 0);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -156,7 +192,7 @@ int32_t Int4GroupwiseGemmPlugin::getOutputShapes(DimsExprs const* inputs, [[mayb
 {
     try
     {
-        assert(nbInputs == 3);
+        assert(nbInputs == 3 || nbInputs == 5);
         assert(nbOutputs == 1);
         outputs[0].nbDims = 3;
         outputs[0].d[0] = inputs[0].d[0];
@@ -175,7 +211,7 @@ bool Int4GroupwiseGemmPlugin::supportsFormatCombination(int32_t pos, DynamicPlug
 {
     try
     {
-        assert(nbInputs == 3 && nbOutputs == 1);
+        assert((nbInputs == 3 || nbInputs == 5) && nbOutputs == 1);
         assert(pos < (nbInputs + nbOutputs));
         auto const& tensorDesc = inOut[pos].desc;
         bool status{true};
@@ -210,6 +246,32 @@ bool Int4GroupwiseGemmPlugin::supportsFormatCombination(int32_t pos, DynamicPlug
         }
         case 3:
         {
+            if (nbInputs == 5)
+            {
+                status &= tensorDesc.type == DataType::kINT8;
+                status &= tensorDesc.format == PluginFormat::kLINEAR;
+                status &= tensorDesc.dims.nbDims == 2;
+                status &= tensorDesc.dims.d[0] == mGemmK / 16;
+                status &= tensorDesc.dims.d[1] == 8 * mGemmN;
+                break;
+            }
+            status &= tensorDesc.type == DataType::kHALF;
+            status &= tensorDesc.format == PluginFormat::kLINEAR;
+            status &= tensorDesc.dims.nbDims == 3;
+            status &= tensorDesc.dims.d[2] == mGemmN;
+            break;
+        }
+        case 4:
+        {
+            status &= tensorDesc.type == DataType::kHALF;
+            status &= tensorDesc.format == PluginFormat::kLINEAR;
+            status &= tensorDesc.dims.nbDims == 2;
+            status &= tensorDesc.dims.d[0] == mGemmK / mGroupSize;
+            status &= tensorDesc.dims.d[1] == mGemmN;
+            break;
+        }
+        case 5:
+        {
             status &= tensorDesc.type == DataType::kHALF;
             status &= tensorDesc.format == PluginFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 3;
@@ -232,14 +294,39 @@ int32_t Int4GroupwiseGemmPlugin::configurePlugin(DynamicPluginTensorDesc const* 
     return 0;
 }
 
-size_t Int4GroupwiseGemmPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* inputs */, int32_t /* nbInputs */,
+size_t Int4GroupwiseGemmPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
     DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
 {
-    return 0;
+    try
+    {
+        if (mUseMarlinPrefill == 0 || nbInputs != 5)
+        {
+            return 0;
+        }
+
+        int64_t const maxM = getProfileDim(inputs[0], 0) * getProfileDim(inputs[0], 1);
+        int64_t const paddedM = static_cast<int64_t>(divUpInt32(static_cast<int32_t>(maxM), kDENSE_MARLIN_BLOCK_SIZE))
+            * kDENSE_MARLIN_BLOCK_SIZE;
+
+        int32_t dev = 0;
+        int32_t sms = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+        int64_t const marlinWorkspaceSize
+            = trt_edgellm::kernel::getMoeMarlinWorkspaceSize(paddedM, mGemmN, kDENSE_MARLIN_BLOCK_SIZE, sms);
+
+        size_t size = 0;
+        size = accumulateWorkspaceSize(size, rt::Coords{marlinWorkspaceSize}, DataType::kINT32);
+        return size;
+    }
+    catch (std::exception const&)
+    {
+        return 0;
+    }
 }
 
 int32_t Int4GroupwiseGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* /* outputDesc */,
-    void const* const* inputs, void* const* outputs, void* /* workspace */, cudaStream_t stream) noexcept
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     try
     {
@@ -255,6 +342,33 @@ int32_t Int4GroupwiseGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
         {
             trt_edgellm::kernel::gemv_forward_cuda_new(
                 gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
+        }
+        else if (mUseMarlinPrefill != 0)
+        {
+            int32_t const paddedM = divUpInt32(M, kDENSE_MARLIN_BLOCK_SIZE) * kDENSE_MARLIN_BLOCK_SIZE;
+
+            int32_t dev = 0;
+            int32_t sms = 0;
+            CUDA_CHECK(cudaGetDevice(&dev));
+            CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+            int64_t const marlinWorkspaceSize
+                = trt_edgellm::kernel::getMoeMarlinWorkspaceSize(paddedM, mGemmN, kDENSE_MARLIN_BLOCK_SIZE, sms);
+
+            std::byte* alignedWorkspacePtr = static_cast<std::byte*>(workspace);
+            int32_t* marlinWorkspacePtr = static_cast<int32_t*>(
+                assignTensorFromWorkspace(alignedWorkspacePtr, {marlinWorkspaceSize}, DataType::kINT32).rawPointer());
+
+            rt::Tensor inputTensor(gemmInPtr, rt::Coords{M, mGemmK}, rt::DeviceType::kGPU, DataType::kHALF);
+            rt::Tensor outputTensor(gemmOutDevicePtr, rt::Coords{M, mGemmN}, rt::DeviceType::kGPU, DataType::kHALF);
+            rt::Tensor marlinWeightsTensor(const_cast<void*>(inputs[3]), rt::Coords{1, mGemmK / 16, 2 * mGemmN},
+                rt::DeviceType::kGPU, DataType::kINT32);
+            rt::Tensor marlinScalesTensor(const_cast<void*>(inputs[4]),
+                rt::Coords{1, mGemmK / mGroupSize, mGemmN}, rt::DeviceType::kGPU, DataType::kHALF);
+            rt::Tensor marlinWorkspaceTensor(
+                marlinWorkspacePtr, rt::Coords{marlinWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT32);
+
+            trt_edgellm::kernel::denseAwqW4A16MarlinGemm(inputTensor, outputTensor, marlinWeightsTensor,
+                marlinScalesTensor, marlinWorkspaceTensor, kDENSE_MARLIN_BLOCK_SIZE, stream);
         }
         else
         {
@@ -286,6 +400,7 @@ PluginFieldCollection const* Int4GroupwiseGemmPlugin::getFieldsToSerialize() noe
     mDataToSerialize.emplace_back("gemm_n", &mGemmN, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("gemm_k", &mGemmK, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("group_size", &mGroupSize, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("use_marlin", &mUseMarlinPrefill, PluginFieldType::kINT32, 1);
 
     mFCToSerialize.nbFields = mDataToSerialize.size();
     mFCToSerialize.fields = mDataToSerialize.data();
@@ -301,6 +416,7 @@ Int4GroupwiseGemmPluginCreator::Int4GroupwiseGemmPluginCreator()
     mPluginAttributes.emplace_back(PluginField("gemm_n", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("gemm_k", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("group_size", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("use_marlin", nullptr, PluginFieldType::kINT32, 1));
 
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();

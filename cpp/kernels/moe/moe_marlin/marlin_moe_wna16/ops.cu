@@ -444,6 +444,8 @@ void marlin_mm(void const* A, void const* B, void* C, void* C_tmp, void* b_bias,
     int32_t const* num_tokens_past_padded_ptr = (int32_t const*) num_tokens_past_padded;
     float const* topk_weights_ptr = (float const*) topk_weights;
     int* locks = (int*) workspace;
+    bool const dense_identity
+        = sorted_token_ids_ptr == nullptr && expert_ids_ptr == nullptr && num_tokens_past_padded_ptr == nullptr;
 
     if (has_act_order)
     {
@@ -538,6 +540,25 @@ void marlin_mm(void const* A, void const* B, void* C, void* C_tmp, void* b_bias,
 
     auto kernel = get_marlin_kernel(a_type, b_type, c_type, s_type, thread_m_blocks, thread_n_blocks, thread_k_blocks,
         m_block_size_8, has_act_order, has_zp, group_blocks, num_threads, is_zp_float, stages);
+
+    if (dense_identity && a_type == trt_edgellm::marlin_dtypes::kFloat16
+        && b_type == trt_edgellm::marlin_dtypes::kU4 && c_type == trt_edgellm::marlin_dtypes::kFloat16
+        && s_type == trt_edgellm::marlin_dtypes::kFloat16 && !m_block_size_8 && !has_act_order && !has_zp
+        && group_blocks == 8 && stages == 4 && thread_m_blocks == 4 && thread_k_blocks == 4)
+    {
+        if (num_threads == 256 && thread_n_blocks == 16)
+        {
+            kernel = Marlin<trt_edgellm::marlin_dtypes::kFloat16.id(), trt_edgellm::marlin_dtypes::kU4.id(),
+                trt_edgellm::marlin_dtypes::kFloat16.id(), trt_edgellm::marlin_dtypes::kFloat16.id(), 256, 4, 16, 4,
+                false, 4, 8, false, true>;
+        }
+        else if (num_threads == 128 && thread_n_blocks == 8)
+        {
+            kernel = Marlin<trt_edgellm::marlin_dtypes::kFloat16.id(), trt_edgellm::marlin_dtypes::kU4.id(),
+                trt_edgellm::marlin_dtypes::kFloat16.id(), trt_edgellm::marlin_dtypes::kFloat16.id(), 128, 4, 8, 4,
+                false, 4, 8, false, true>;
+        }
+    }
 
     MARLIN_CHECK_FMT(kernel != MarlinDefault, "Unsupported shapes: MNK = [%d, %d, %d]", prob_m, prob_n, prob_k);
 

@@ -27,6 +27,7 @@ The module contains:
 """
 
 import math
+import os
 from typing import Optional, Tuple
 
 import numpy as np
@@ -62,6 +63,18 @@ int4_gemm_plugin_schema = OpSchema(
             description="Scale tensor (float16)",
             type_str="tensor(float16)",
         ),
+        OpSchema.FormalParameter(
+            name="marlin_qweight",
+            description="Optional Marlin-packed quantized weight tensor (int8)",
+            type_str="tensor(int8)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
+            name="marlin_scales",
+            description="Optional Marlin-permuted scale tensor (float16)",
+            type_str="tensor(float16)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
     ],
     outputs=[
         OpSchema.FormalParameter(
@@ -95,6 +108,12 @@ int4_gemm_plugin_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description="Group size for groupwise quantization",
             required=True,
+        ),
+        OpSchema.Attribute(
+            name="use_marlin",
+            type=OpSchema.AttrType.INT,
+            description="Use Marlin packed weights for prefill GEMM when set to 1",
+            required=False,
         ),
     ],
 )
@@ -270,6 +289,80 @@ def pack_intweights(unpacked_qweight: np.ndarray) -> np.ndarray:
     qweight = Packed_Kernel.reshape(N // interleave, K).astype(np.int16)
 
     return qweight
+
+
+_MARLIN_PACK_IDX = np.array([0, 2, 4, 6, 1, 3, 5, 7], dtype=np.int32)
+_MARLIN_OUT_IDX = np.array(
+    [(i % 32) * 4 + (i // 32) for i in range(128)], dtype=np.int32)
+_MARLIN_ROW_PATTERN = np.array(
+    [[0, 1, 8, 9, 0, 1, 8, 9], [2, 3, 10, 11, 2, 3, 10, 11],
+     [4, 5, 12, 13, 4, 5, 12, 13], [6, 7, 14, 15, 6, 7, 14, 15]],
+    dtype=np.int32)
+_MARLIN_ROW_IDX = np.tile(_MARLIN_ROW_PATTERN, (32, 1))
+_MARLIN_COL_IDX = np.array(
+    [[(thread // 32) * 16 + (thread % 32) // 4 + (lane // 4) * 8
+      for lane in range(8)] for thread in range(128)],
+    dtype=np.int32)
+
+
+def _marlin_permute_scales(s: np.ndarray, size_k: int, size_n: int,
+                           group_size: int) -> np.ndarray:
+    scale_perm = []
+    for i in range(8):
+        scale_perm.extend([i + 8 * j for j in range(8)])
+    scale_perm_single = []
+    for i in range(4):
+        scale_perm_single.extend(
+            [2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
+
+    if group_size < size_k and group_size != -1:
+        s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
+    else:
+        s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+    return s.reshape((-1, size_n)).copy()
+
+
+def pack_int4_awq_marlin_dense(
+        weights_q: np.ndarray, scales: np.ndarray,
+        group_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Pack dense AWQ weights/scales for the Marlin W4A16 kernel.
+
+    Args:
+        weights_q: INT4 weights [N, K] as int16/uint values in [0, 15].
+        scales: Scale tensor [K/group_size, N] as float16.
+    Returns:
+        marlin_qweight: INT8 view of Marlin INT32 weights [K/16, 8*N].
+        marlin_scales: Permuted scales [K/group_size, N].
+    """
+    N, K = weights_q.shape
+    assert K % 16 == 0, f"K={K} must be divisible by 16"
+    assert N % 64 == 0, f"N={N} must be divisible by 64"
+    assert K % group_size == 0, f"K={K} must be divisible by group_size={group_size}"
+    assert scales.shape == (K // group_size, N)
+
+    w_np = weights_q.transpose(1, 0).copy().astype(np.uint32)  # [K, N]
+    k_tiles, n_tiles = K // 16, N // 64
+    tiles = w_np.reshape(k_tiles, 16, n_tiles, 64).transpose(0, 2, 1, 3)
+    gathered = tiles[:, :, _MARLIN_ROW_IDX,
+                     _MARLIN_COL_IDX][:, :, :,
+                                      _MARLIN_PACK_IDX].astype(np.uint32)
+
+    packed_out = (gathered[:, :, :, 0] | (gathered[:, :, :, 1] << 4)
+                  | (gathered[:, :, :, 2] << 8)
+                  | (gathered[:, :, :, 3] << 12)
+                  | (gathered[:, :, :, 4] << 16)
+                  | (gathered[:, :, :, 5] << 20)
+                  | (gathered[:, :, :, 6] << 24)
+                  | (gathered[:, :, :, 7] << 28))
+
+    out = np.zeros((k_tiles, n_tiles * 128), dtype=np.uint32)
+    for n_tile_id in range(n_tiles):
+        out[:, n_tile_id * 128 + _MARLIN_OUT_IDX] = packed_out[:,
+                                                               n_tile_id, :]
+
+    marlin_qweight = out.view(np.int8).reshape(k_tiles, 8 * N).copy()
+    marlin_scales = _marlin_permute_scales(scales.copy(), K, N, group_size)
+    return marlin_qweight, marlin_scales
 
 
 def gather_rows_by_gidx_order(
@@ -662,11 +755,26 @@ def int4_dq_gemm_to_plugin(graph: gs.Graph) -> gs.Graph:
                                      packed_weights)
         plugin_scales = gs.Constant(f"{matmul_node.name}/scales", scales_data)
 
+        use_marlin = (
+            os.environ.get("TRT_EDGELLM_INT4_GEMM_USE_MARLIN_PREFILL") == "1"
+            and gemm_k % 16 == 0 and gemm_n % 64 == 0
+            and gemm_k % group_size == 0)
+        plugin_inputs = [plugin_input, plugin_weights, plugin_scales]
+        if use_marlin:
+            marlin_weights, marlin_scales = pack_int4_awq_marlin_dense(
+                unpacked_qweight, scales_data, group_size)
+            plugin_marlin_weights = gs.Constant(
+                f"{matmul_node.name}/marlin_qweight", marlin_weights)
+            plugin_marlin_scales = gs.Constant(
+                f"{matmul_node.name}/marlin_scales", marlin_scales)
+            plugin_inputs.extend([plugin_marlin_weights, plugin_marlin_scales])
+
         # Plugin attributes for Int4GroupwiseGemmPlugin
         gemm_attrs = {
             "gemm_n": gemm_n,
             "gemm_k": gemm_k,
             "group_size": group_size,
+            "use_marlin": int(use_marlin),
         }
 
         # Remove the old nodes and their connections
@@ -682,7 +790,7 @@ def int4_dq_gemm_to_plugin(graph: gs.Graph) -> gs.Graph:
         # Create the Int4GroupwiseGemmPlugin node
         graph.layer(name=f"{matmul_node.name}Plugin",
                     op="Int4GroupwiseGemmPlugin",
-                    inputs=[plugin_input, plugin_weights, plugin_scales],
+                    inputs=plugin_inputs,
                     outputs=[matmul_output],
                     attrs=gemm_attrs)
     # Update Cast nodes around Add/Concat to fp16

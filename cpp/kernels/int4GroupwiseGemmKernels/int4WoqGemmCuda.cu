@@ -39,12 +39,31 @@
  */
 
 #include "dequantize.cuh"
+#include <cstdlib>
 #include <cuda_pipeline_primitives.h>
 
 namespace trt_edgellm
 {
 namespace kernel
 {
+
+namespace
+{
+
+int getAlpamayoDenseW4A16TileMode() noexcept
+{
+    static int const modeValue = []() {
+        char const* mode = std::getenv("TRT_EDGELLM_INT4_DENSE_TILE");
+        if (mode == nullptr || mode[0] == '\0')
+        {
+            return 0;
+        }
+        return std::atoi(mode);
+    }();
+    return modeValue;
+}
+
+} // namespace
 
 #if (__CUDACC_VER_MAJOR__ >= 11) && (__CUDACC_VER_MINOR__ >= 4)
 #define L2_CACHEHINT(size) ".L2::" #size "B"
@@ -476,21 +495,10 @@ __global__ void gemm_w4a16_T2(half const* __restrict__ A, half const* __restrict
     }
 }
 
-void gemm_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
-    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream) noexcept
+template <int CTA_M, int CTA_N, int CTA_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, int G>
+void launch_gemm_w4a16_T2(half const* in_feats, half const* kernel, half const* scaling_factors, half* out_feats, int m,
+    int n, int k, cudaStream_t stream) noexcept
 {
-    // The GEMM kernel will load packed int4 weights as fp16 data tensor.
-    half const* kernel = reinterpret_cast<half const*>(weights_device);
-
-    constexpr int G = 128;
-    constexpr int CTA_M = 64;
-    constexpr int CTA_N = 128;
-    constexpr int CTA_K = 64;
-    constexpr int WARP_M = 64;
-    constexpr int WARP_N = 32;
-    constexpr int WARP_K = 64;
-    constexpr int STAGES = 4;
-
     constexpr int NUM_WARPS = (CTA_M / WARP_M) * (CTA_N / WARP_N);
     constexpr int kSmemByteSize
         = (CTA_M * (CTA_K + SMEM_PAD_A) + CTA_N * (CTA_K + SMEM_PAD_B) / kInterleave + CTA_N) * STAGES * sizeof(half);
@@ -503,6 +511,52 @@ void gemm_forward_cuda_new(half const* in_feats, int8_t const* weights_device, h
     cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);
     kernel_func<<<num_blocks, threads_per_block, kSmemByteSize, stream>>>(
         in_feats, kernel, scaling_factors, out_feats, m, n, k);
+}
+
+void gemm_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
+    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream) noexcept
+{
+    // The GEMM kernel will load packed int4 weights as fp16 data tensor.
+    half const* kernel = reinterpret_cast<half const*>(weights_device);
+
+    constexpr int G = 128;
+    if (group_size == G && m >= 128)
+    {
+        int const tile_mode = getAlpamayoDenseW4A16TileMode();
+        if (tile_mode == 1 && n >= 1024 && n % 512 == 0)
+        {
+            launch_gemm_w4a16_T2<64, 512, 64, 64, 64, 64, 3, G>(
+                in_feats, kernel, scaling_factors, out_feats, m, n, k, stream);
+            return;
+        }
+        if (tile_mode == 2 && n == 12288)
+        {
+            launch_gemm_w4a16_T2<64, 384, 64, 64, 64, 64, 4, G>(
+                in_feats, kernel, scaling_factors, out_feats, m, n, k, stream);
+            return;
+        }
+        if (tile_mode == 3 && n >= 1024 && n % 256 == 0)
+        {
+            launch_gemm_w4a16_T2<128, 256, 64, 64, 64, 64, 3, G>(
+                in_feats, kernel, scaling_factors, out_feats, m, n, k, stream);
+            return;
+        }
+        if (tile_mode == 4 && n >= 1024 && n % 128 == 0)
+        {
+            launch_gemm_w4a16_T2<128, 128, 64, 64, 64, 64, 4, G>(
+                in_feats, kernel, scaling_factors, out_feats, m, n, k, stream);
+            return;
+        }
+        if (n >= 1024 && n % 256 == 0)
+        {
+            launch_gemm_w4a16_T2<64, 256, 64, 64, 64, 64, 4, G>(
+                in_feats, kernel, scaling_factors, out_feats, m, n, k, stream);
+            return;
+        }
+    }
+
+    launch_gemm_w4a16_T2<64, 128, 64, 64, 32, 64, 4, G>(
+        in_feats, kernel, scaling_factors, out_feats, m, n, k, stream);
 }
 
 } // namespace kernel

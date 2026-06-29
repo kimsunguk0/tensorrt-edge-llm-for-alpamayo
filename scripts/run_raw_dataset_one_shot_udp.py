@@ -110,6 +110,7 @@ def build_single_request(
     width: int,
     height: int,
     nav_text: str | None,
+    nav_guidance_weight: float,
     traj_token_offset: int,
     diffusion_seed: int,
     diffusion_num_steps: int,
@@ -244,7 +245,7 @@ def build_single_request(
     }
     if nav_text:
         request["requests"][0]["nav_text"] = nav_text
-        request["requests"][0]["nav_guidance_weight"] = 3.0
+        request["requests"][0]["nav_guidance_weight"] = float(nav_guidance_weight)
 
     request_path = request_root / f"request_{stem}.json"
     request_path.write_text(json.dumps(request, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -674,6 +675,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=576)
     parser.add_argument("--height", type=int, default=320)
     parser.add_argument("--nav-text", type=str, default=None)
+    parser.add_argument("--nav-guidance-weight", type=float, default=3.0)
     parser.add_argument("--alpamayo-nav-cfg", action="store_true")
     parser.add_argument("--alpamayo-fm-use-prefill-kv", action="store_true")
     parser.add_argument("--traj-token-offset", type=int, default=3000)
@@ -741,6 +743,7 @@ def main() -> None:
         width=args.width,
         height=args.height,
         nav_text=args.nav_text,
+        nav_guidance_weight=args.nav_guidance_weight,
         traj_token_offset=args.traj_token_offset,
         diffusion_seed=args.diffusion_seed,
         diffusion_num_steps=args.diffusion_num_steps,

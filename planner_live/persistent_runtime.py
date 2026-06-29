@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,6 +22,8 @@ class PlannerRuntimeConfig:
     fm_engine: Path
     staging_root: Path
     output_root: Path
+    runtime_input_mode: str = "files"
+    staging_image_format: str = "png"
     action_space_constants_json: Path | None = None
     nav_text: str | None = None
     nav_guidance_weight: float = 3.0
@@ -36,6 +39,7 @@ class PlannerRuntimeConfig:
     enable_dashboard: bool = False
     alpamayo_fm_use_prefill_kv: bool = False
     quiet_llm_logs: bool = False
+    live_low_latency: bool = False
 
     @property
     def image_dir(self) -> Path:
@@ -222,6 +226,8 @@ class PlannerRuntimeService:
             nav_text=self.config.nav_text,
             alpamayo_fm_use_prefill_kv=self.config.alpamayo_fm_use_prefill_kv,
             quiet_llm_logs=self.config.quiet_llm_logs,
+            compact_output_json=self.config.live_low_latency,
+            minimal_output_json=self.config.live_low_latency,
             dump_profile=False,
         )
 
@@ -271,22 +277,48 @@ class PlannerRuntimeService:
                 self._restart_client()
 
     def process_sample(self, sample: dict[str, Any], metadata: SampleMetadata) -> PlannerResult:
+        process_start_perf = time.perf_counter()
+        process_start_unix = time.time()
+        timing: dict[str, Any] = dict(sample.get("planner_live_timing") or {})
+        timing["process_start_unix"] = process_start_unix
+        timing["sample_age_at_process_start_ms"] = max((process_start_unix - metadata.t0_us / 1_000_000.0) * 1000.0, 0.0)
+        timing["receiver_to_process_start_ms"] = max((process_start_unix - metadata.received_at_unix) * 1000.0, 0.0)
+
         self._ensure_dirs()
         if self.config.keep_last_only:
+            step_start = time.perf_counter()
             self.helpers["remove_tree_contents"](self.config.image_dir)
             self.helpers["remove_tree_contents"](self.config.ego_dir)
             self.helpers["remove_tree_contents"](self.config.request_dir)
+            timing["staging_cleanup_ms"] = (time.perf_counter() - step_start) * 1000.0
+        else:
+            timing["staging_cleanup_ms"] = 0.0
 
         run_name = f"seq{metadata.sequence:06d}_t0_{metadata.t0_us}"
 
-        _, xyz_path, rot_path = self.helpers["write_sample_files"](sample, self.config.image_dir, self.config.ego_dir)
+        inline_inputs = self.config.runtime_input_mode == "inline_json"
+        if inline_inputs:
+            xyz_path = None
+            rot_path = None
+            timing["write_sample_files_ms"] = 0.0
+        else:
+            step_start = time.perf_counter()
+            _, xyz_path, rot_path = self.helpers["write_sample_files"](
+                sample,
+                self.config.image_dir,
+                self.config.ego_dir,
+                image_format=self.config.staging_image_format,
+            )
+            timing["write_sample_files_ms"] = (time.perf_counter() - step_start) * 1000.0
+
         request_path = self.config.request_dir / f"request_{run_name}.json"
         latest_request_path = self.config.request_dir / "latest_request.json"
+        step_start = time.perf_counter()
         self.helpers["build_runtime_request"](
             sample=sample,
             xyz_path=xyz_path,
             rot_path=rot_path,
-            image_dir=self.config.image_dir,
+            image_dir=None if inline_inputs else self.config.image_dir,
             output_request=request_path,
             action_space_constants=self._action_space_constants,
             nav_text=self.config.nav_text,
@@ -298,28 +330,57 @@ class PlannerRuntimeService:
             temperature=self.config.temperature,
             top_p=self.config.top_p,
             top_k=self.config.top_k,
+            image_format=self.config.staging_image_format,
+            inline_inputs=inline_inputs,
+            json_indent=None if self.config.live_low_latency else 2,
         )
-        latest_request_path.write_text(request_path.read_text())
+        timing["build_runtime_request_ms"] = (time.perf_counter() - step_start) * 1000.0
+
+        if self.config.live_low_latency:
+            timing["write_latest_request_ms"] = 0.0
+            timing["write_latest_request_skipped"] = True
+        else:
+            step_start = time.perf_counter()
+            latest_request_path.write_text(request_path.read_text())
+            timing["write_latest_request_ms"] = (time.perf_counter() - step_start) * 1000.0
 
         output_file = self.config.runs_dir / f"output_{run_name}.json"
+        step_start = time.perf_counter()
         self._run_persistent_request(request_path=request_path, output_file=output_file)
+        timing["runtime_request_wall_ms"] = (time.perf_counter() - step_start) * 1000.0
 
-        latest_output_path = self.config.runs_dir / "latest_output.json"
-        latest_output_path.write_text(output_file.read_text())
+        if self.config.live_low_latency:
+            timing["write_latest_output_ms"] = 0.0
+            timing["write_latest_output_skipped"] = True
+        else:
+            latest_output_path = self.config.runs_dir / "latest_output.json"
+            step_start = time.perf_counter()
+            latest_output_path.write_text(output_file.read_text())
+            timing["write_latest_output_ms"] = (time.perf_counter() - step_start) * 1000.0
 
         metadata_dict = {
             "sequence": metadata.sequence,
             "t0_us": metadata.t0_us,
             "clip_id": metadata.clip_id,
         }
-        traj_json, traj_xyz_npy, traj_rot_npy = self.helpers["extract_trajectory_artifacts"](
-            output_file=output_file,
-            trajectory_dir=self.config.trajectories_dir,
-            run_name=run_name,
-            metadata=metadata_dict,
-            sample=sample,
-        )
+        if self.config.live_low_latency:
+            traj_json = None
+            traj_xyz_npy = None
+            traj_rot_npy = None
+            timing["extract_trajectory_artifacts_ms"] = 0.0
+            timing["extract_trajectory_artifacts_skipped"] = True
+        else:
+            step_start = time.perf_counter()
+            traj_json, traj_xyz_npy, traj_rot_npy = self.helpers["extract_trajectory_artifacts"](
+                output_file=output_file,
+                trajectory_dir=self.config.trajectories_dir,
+                run_name=run_name,
+                metadata=metadata_dict,
+                sample=sample,
+            )
+            timing["extract_trajectory_artifacts_ms"] = (time.perf_counter() - step_start) * 1000.0
 
+        step_start = time.perf_counter()
         result = parse_planner_result(
             output_file=output_file,
             metadata=metadata,
@@ -328,13 +389,51 @@ class PlannerRuntimeService:
             trajectory_rot_npy_path=traj_rot_npy,
             dashboard_png_path=None,
         )
+        timing["parse_planner_result_ms"] = (time.perf_counter() - step_start) * 1000.0
+        timing["result_completed_age_ms"] = max((result.completed_at_unix - metadata.t0_us / 1_000_000.0) * 1000.0, 0.0)
+        reported_post_vlm_ms = result.post_vlm_timing.get("total_post_vlm_ms")
+        if reported_post_vlm_ms is not None:
+            timing["model_reported_post_vlm_ms"] = float(reported_post_vlm_ms)
+            timing["runtime_wall_minus_reported_post_vlm_ms"] = float(timing["runtime_request_wall_ms"]) - float(reported_post_vlm_ms)
+        fm_wall_ms = result.fm_timing.get("wall_ms")
+        if fm_wall_ms is not None:
+            timing["model_reported_fm_wall_ms"] = float(fm_wall_ms)
 
         result_path = self.config.results_dir / f"result_{run_name}.json"
         latest_result_path = self.config.results_dir / "latest_result.json"
-        payload = json.dumps(result.to_dict(), indent=2)
-        result_path.write_text(payload)
-        latest_result_path.write_text(payload)
+        timing["process_total_before_result_write_ms"] = (time.perf_counter() - process_start_perf) * 1000.0
+        result.live_timing = dict(timing)
+
+        if self.config.live_low_latency:
+            step_start = time.perf_counter()
+            payload = json.dumps(result.to_dict(), separators=(",", ":"))
+            timing["serialize_result_json_ms"] = (time.perf_counter() - step_start) * 1000.0
+
+            step_start = time.perf_counter()
+            latest_result_path.write_text(payload)
+            timing["write_result_json_ms"] = (time.perf_counter() - step_start) * 1000.0
+            timing["result_json_latest_only"] = True
+            timing["process_total_ms"] = (time.perf_counter() - process_start_perf) * 1000.0
+            result.live_timing = dict(timing)
+            result_path = latest_result_path
+        else:
+            step_start = time.perf_counter()
+            payload = json.dumps(result.to_dict(), indent=2)
+            timing["serialize_result_json_ms"] = (time.perf_counter() - step_start) * 1000.0
+
+            step_start = time.perf_counter()
+            result_path.write_text(payload)
+            latest_result_path.write_text(payload)
+            timing["write_result_json_ms"] = (time.perf_counter() - step_start) * 1000.0
+            timing["process_total_ms"] = (time.perf_counter() - process_start_perf) * 1000.0
+            result.live_timing = dict(timing)
+
+            # Rewrite once so the on-disk latest_result contains the final timing fields too.
+            payload = json.dumps(result.to_dict(), indent=2)
+            result_path.write_text(payload)
+            latest_result_path.write_text(payload)
         if self._dashboard_writer is not None:
+            step_start = time.perf_counter()
             self._dashboard_writer.submit(
                 DashboardJob(
                     sample=sample,
@@ -345,4 +444,5 @@ class PlannerRuntimeService:
                     latest_result_path=latest_result_path,
                 )
             )
+            result.live_timing["dashboard_submit_ms"] = (time.perf_counter() - step_start) * 1000.0
         return result

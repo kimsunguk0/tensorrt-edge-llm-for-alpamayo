@@ -84,6 +84,10 @@ struct LLMGenerationRequest
         // Optional Alpamayo-specific metadata carried alongside the request. Generic runtimes may ignore these.
         std::string egoHistoryXYZNpy{};               //!< Path to ego history xyz .npy (if provided)
         std::string egoHistoryRotNpy{};               //!< Path to ego history rot .npy (if provided)
+        std::vector<float> egoHistoryXYZ{};           //!< Inline ego history xyz, if provided
+        std::vector<int64_t> egoHistoryXYZShape{};     //!< Inline ego history xyz shape
+        std::vector<float> egoHistoryRot{};           //!< Inline ego history rotation, if provided
+        std::vector<int64_t> egoHistoryRotShape{};     //!< Inline ego history rotation shape
         bool predictYaw{false};                       //!< Whether trajectory history includes yaw conditioning
         int32_t trajTokenOffset{3000};                //!< Offset used when injecting fused trajectory history tokens
         std::optional<std::string> navText{};         //!< Optional route/navigation instruction text

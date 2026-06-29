@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
+import math
 import threading
 import time
 from pathlib import Path
@@ -12,6 +13,7 @@ from fm_model_defaults import preferred_fm_engine_candidates
 
 from .gnss_serial import GnssSerialConfig, GnssSerialReader
 from .health_server import HealthServer
+from .live_path_manager import LivePathManager, LivePathManagerConfig
 from .persistent_runtime import PlannerRuntimeConfig, PlannerRuntimeService
 from .result_bridge import UdpBridgeConfig, UdpResultBridge
 from .result_parser import PlannerResult
@@ -27,6 +29,16 @@ def _first_existing_path(candidates: list[Path]) -> Path:
         if candidate.exists():
             return candidate
     return candidates[0]
+
+
+def _parse_float_csv(value: str) -> tuple[float, ...]:
+    marks: list[float] = []
+    for token in str(value).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        marks.append(float(token))
+    return tuple(marks)
 
 
 class LatestOnlyBuffer(Generic[T]):
@@ -84,6 +96,7 @@ class PlannerServiceConfig:
     gnss_required: bool = False
     gnss_history_len: int = 16
     gnss_dt_s: float = 0.1
+    path_manager: LivePathManagerConfig | None = None
     manual_trigger_only: bool = False
 
 
@@ -172,6 +185,11 @@ class PlannerLiveService:
         self.runtime = PlannerRuntimeService(config.runtime)
         self.state = PlannerServiceState()
         self.result_bridge = UdpResultBridge(config.udp_bridge) if config.udp_bridge is not None else None
+        self.path_manager = (
+            LivePathManager(config.path_manager, udp_bridge=self.result_bridge)
+            if config.path_manager is not None and self.result_bridge is not None
+            else None
+        )
         self.gnss_reader = GnssSerialReader(config.gnss_serial) if config.gnss_serial is not None else None
         self.pending = LatestOnlyBuffer[SampleEnvelope]()
         self.stop_event = threading.Event()
@@ -193,7 +211,9 @@ class PlannerLiveService:
         self.state._update(lambda s: setattr(s, "service_running", True))
         if self.gnss_reader is not None:
             self.gnss_reader.start()
-        if self.result_bridge is not None and not self.config.manual_trigger_only:
+        if self.path_manager is not None:
+            self.path_manager.start()
+        if self.result_bridge is not None and self.path_manager is None and not self.config.manual_trigger_only:
             self.result_bridge.start()
         self.health_server.start()
         if not self.config.manual_trigger_only:
@@ -209,6 +229,8 @@ class PlannerLiveService:
             self.receiver_thread.join(timeout=5.0)
         if self.worker_thread.is_alive():
             self.worker_thread.join(timeout=5.0)
+        if self.path_manager is not None:
+            self.path_manager.stop()
         if self.result_bridge is not None:
             self.result_bridge.stop()
         if self.gnss_reader is not None:
@@ -287,22 +309,38 @@ class PlannerLiveService:
     def _fetch_and_validate_sample(self, *, allow_duplicate: bool) -> SampleEnvelope | None:
         from jetson_live_infer_alpamayo15 import fetch_latest_sample
 
+        fetch_start_perf = time.perf_counter()
+        fetch_start_unix = time.time()
         sample, metadata_obj = fetch_latest_sample(
             self.config.server_url,
             self.config.sample_endpoint,
             self.config.timeout,
         )
+        fetch_done_perf = time.perf_counter()
+        fetch_done_unix = time.time()
         if sample is None:
             return None
 
+        t0_us = int(metadata_obj["t0_us"])
+        planner_live_timing = dict(sample.get("planner_live_timing") or {})
+        planner_live_timing.update(
+            {
+                "fetch_start_unix": fetch_start_unix,
+                "fetch_done_unix": fetch_done_unix,
+                "fetch_latest_sample_ms": (fetch_done_perf - fetch_start_perf) * 1000.0,
+                "sample_age_at_fetch_done_ms": max((fetch_done_unix - t0_us / 1_000_000.0) * 1000.0, 0.0),
+            }
+        )
+        sample["planner_live_timing"] = planner_live_timing
+
         metadata = SampleMetadata(
             sequence=int(metadata_obj["sequence"]),
-            t0_us=int(metadata_obj["t0_us"]),
+            t0_us=t0_us,
             clip_id=str(metadata_obj["clip_id"]),
-            received_at_unix=time.time(),
+            received_at_unix=fetch_done_unix,
             source_headers={
                 "X-Sample-Sequence": str(metadata_obj["sequence"]),
-                "X-T0-US": str(metadata_obj["t0_us"]),
+                "X-T0-US": str(t0_us),
                 "X-Clip-ID": str(metadata_obj["clip_id"]),
             },
         )
@@ -313,7 +351,11 @@ class PlannerLiveService:
                     return None
                 self._last_seen_sequence = metadata.sequence
 
+        step_start = time.perf_counter()
         sample = self._apply_gnss_history(sample, metadata)
+        planner_live_timing = dict(sample.get("planner_live_timing") or planner_live_timing)
+        planner_live_timing["apply_gnss_history_ms"] = (time.perf_counter() - step_start) * 1000.0
+        sample["planner_live_timing"] = planner_live_timing
 
         self.state._update(
             lambda s: (
@@ -325,7 +367,12 @@ class PlannerLiveService:
         )
 
         try:
+            step_start = time.perf_counter()
             validated_sample = validate_live_sample(sample)
+            planner_live_timing = dict(validated_sample.get("planner_live_timing") or planner_live_timing)
+            planner_live_timing["validate_live_sample_ms"] = (time.perf_counter() - step_start) * 1000.0
+            planner_live_timing["fetch_to_validated_ms"] = (time.perf_counter() - fetch_start_perf) * 1000.0
+            validated_sample["planner_live_timing"] = planner_live_timing
         except ValidationError as exc:
             self.state._update(
                 lambda s: (
@@ -432,7 +479,9 @@ class PlannerLiveService:
             result = self._run_inference(envelope)
 
             udp_info: dict[str, Any] | None = None
-            if self.result_bridge is not None and self.result_bridge.config.enabled:
+            if self.path_manager is not None:
+                udp_info = self.path_manager.publish_result(result)
+            elif self.result_bridge is not None and self.result_bridge.config.enabled:
                 udp_info = self.result_bridge.send_result_once(result)
 
             self._record_success(result, publish_bridge=False)
@@ -465,7 +514,9 @@ class PlannerLiveService:
             self.state._update(lambda s: setattr(s, "manual_run_busy", False))
 
     def _record_success(self, result: PlannerResult, *, publish_bridge: bool = True) -> None:
-        if publish_bridge and self.result_bridge is not None:
+        if publish_bridge and self.path_manager is not None:
+            self.path_manager.publish_result(result)
+        elif publish_bridge and self.result_bridge is not None:
             self.result_bridge.publish_result(result)
         self.state._update(
             lambda s: (
@@ -485,6 +536,8 @@ class PlannerLiveService:
         snapshot.update(self.runtime.dashboard_snapshot())
         if self.result_bridge is not None:
             snapshot.update(self.result_bridge.snapshot())
+        if self.path_manager is not None:
+            snapshot.update(self.path_manager.snapshot())
         if self.gnss_reader is not None:
             snapshot["gnss"] = self.gnss_reader.snapshot()
         else:
@@ -559,6 +612,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--output-root", type=Path, default=default_output_root)
+    parser.add_argument(
+        "--staging-root",
+        type=Path,
+        default=None,
+        help="Directory for transient live images/ego/request files. Use /dev/shm/... to avoid disk IO.",
+    )
+    parser.add_argument(
+        "--staging-image-format",
+        choices=["png", "ppm"],
+        default="png",
+        help="Image file format for transient model inputs. ppm avoids PNG encoding cost but uses more RAM.",
+    )
+    parser.add_argument(
+        "--runtime-input-mode",
+        choices=["files", "inline_json"],
+        default="files",
+        help=(
+            "files writes image/ego staging files and passes paths to llm_inference. "
+            "inline_json embeds raw RGB images and ego arrays directly in the request JSON."
+        ),
+    )
     parser.add_argument("--action-space-constants-json", type=Path, default=None)
     parser.add_argument("--nav-text", default=None)
     parser.add_argument("--nav-guidance-weight", type=float, default=3.0)
@@ -576,6 +650,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Feed backbone prefill KV directly to FM and skip CoT decode before FM.",
     )
     parser.add_argument("--enable-dashboard", action="store_true")
+    parser.add_argument(
+        "--live-low-latency",
+        action="store_true",
+        help=(
+            "Reduce live-control overhead: compact request/output JSON, ask C++ for minimal output, "
+            "skip latest request/output copies, skip trajectory artifacts, and write only compact latest_result."
+        ),
+    )
     parser.add_argument(
         "--quiet-llm-logs",
         action=argparse.BooleanOptionalAction,
@@ -603,12 +685,151 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--udp-control-points", type=int, default=16)
     parser.add_argument("--udp-full-plan", action="store_true")
     parser.add_argument(
+        "--udp-latency-compensate-full-plan",
+        action="store_true",
+        help=(
+            "When --udp-full-plan is enabled, shift the outgoing path to the current TX time "
+            "using tx_time_us - source_t0_us, then re-origin it at the age-compensated pose."
+        ),
+    )
+    parser.add_argument(
+        "--udp-previous-path-blend-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "For direct --udp-send-mode on_result + --udp-full-plan, blend each new full path with the "
+            "previous full path shifted to the current TX time. 0 disables it; 0.3 is a conservative start."
+        ),
+    )
+    parser.add_argument(
+        "--udp-previous-path-blend-max-age-s",
+        type=float,
+        default=3.0,
+        help="Do not blend with a previous full path older than this many seconds.",
+    )
+    parser.add_argument(
+        "--udp-save-path-log",
+        action="store_true",
+        help=(
+            "Append every sent UDP path to udp_sent_paths.jsonl and update latest_udp_path.json "
+            "for post-drive debugging."
+        ),
+    )
+    parser.add_argument(
+        "--udp-path-log-dir",
+        type=Path,
+        default=None,
+        help="Directory for --udp-save-path-log. Defaults to --output-root/udp_path_log.",
+    )
+    parser.add_argument(
+        "--udp-origin-offset-x-m",
+        type=float,
+        default=0.0,
+        help="Shift outgoing local path into the control origin frame: x_send = x - offset_x.",
+    )
+    parser.add_argument(
+        "--udp-origin-offset-y-m",
+        type=float,
+        default=0.0,
+        help="Shift outgoing local path into the control origin frame: y_send = y + offset_y.",
+    )
+    parser.add_argument(
+        "--udp-origin-yaw-offset-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "Rotate outgoing local path into the control origin frame. Positive means the control frame "
+            "is yawed left relative to ego, so outgoing yaw is yaw - offset."
+        ),
+    )
+    parser.add_argument("--enable-udp-opencv-ui", action="store_true")
+    parser.add_argument("--udp-opencv-ui-width", type=int, default=900)
+    parser.add_argument("--udp-opencv-ui-height", type=int, default=700)
+    parser.add_argument("--udp-opencv-ui-window-name", default="Alpamayo UDP path")
+    parser.add_argument(
+        "--udp-opencv-ui-display",
+        default=None,
+        help="X display for OpenCV UDP path window, e.g. ':42'. Defaults to current DISPLAY.",
+    )
+    parser.add_argument("--udp-opencv-ui-retry-interval-s", type=float, default=5.0)
+    parser.add_argument(
         "--udp-action-log-interval-s",
         type=float,
         default=3.0,
-        help="Throttle interval for UDP accel/curvature preview logs. Use negative value to disable.",
+        help="Throttle interval for UDP preview logs. Use negative value to disable.",
+    )
+    parser.add_argument(
+        "--udp-action-log-mode",
+        choices=["distance_marks", "x_marks", "points"],
+        default="distance_marks",
+        help=(
+            "distance_marks logs nearest actual x/y path points around selected cumulative path lengths; "
+            "points logs the first N path points. x_marks is accepted as a legacy alias."
+        ),
     )
     parser.add_argument("--udp-action-log-points", type=int, default=16)
+    parser.add_argument(
+        "--udp-action-log-distance-marks-m",
+        "--udp-action-log-x-marks-m",
+        dest="udp_action_log_distance_marks_m",
+        default="1,3,5,7,9,11",
+        help="Comma-separated cumulative path lengths, in meters, for --udp-action-log-mode distance_marks.",
+    )
+    parser.add_argument(
+        "--udp-action-log-distance-mark-tolerance-m",
+        "--udp-action-log-x-mark-tolerance-m",
+        dest="udp_action_log_distance_mark_tolerance_m",
+        type=float,
+        default=0.35,
+        help="Nearest actual path point must be within this arclength distance from each mark, otherwise NULL is logged.",
+    )
+    parser.add_argument(
+        "--enable-path-manager",
+        action="store_true",
+        help=(
+            "Route Alpamayo results through a GNSS-projection path manager that republishes "
+            "the latest path at --path-manager-rate-hz instead of direct one-shot UDP."
+        ),
+    )
+    parser.add_argument("--path-manager-rate-hz", type=float, default=10.0)
+    parser.add_argument(
+        "--path-manager-health-url",
+        default=None,
+        help="Health endpoint containing gnss_utm and ins_yaw_rad. Defaults to --server-url/healthz.",
+    )
+    parser.add_argument("--path-manager-pose-timeout-s", type=float, default=0.2)
+    parser.add_argument("--path-manager-max-plan-age-s", type=float, default=3.0)
+    parser.add_argument("--path-manager-min-plan-arc-m", type=float, default=2.0)
+    parser.add_argument("--path-manager-min-remaining-distance-m", type=float, default=2.0)
+    parser.add_argument("--path-manager-max-projection-distance-m", type=float, default=5.0)
+    parser.add_argument("--path-manager-output-points", type=int, default=65)
+    parser.add_argument(
+        "--path-manager-plan-blend-s",
+        type=float,
+        default=0.0,
+        help="Seconds to blend from the previous path into each newly accepted path. 0 keeps legacy behavior.",
+    )
+    parser.add_argument(
+        "--path-manager-stabilize-local-frame",
+        action="store_true",
+        help=(
+            "Filter yaw, track projection arclength monotonically, and optionally resample the outgoing "
+            "path on a fixed arclength grid to reduce same-plan 10Hz target jitter."
+        ),
+    )
+    parser.add_argument("--path-manager-yaw-filter-tau-s", type=float, default=0.35)
+    parser.add_argument("--path-manager-yaw-max-rate-rad-s", type=float, default=1.5)
+    parser.add_argument("--path-manager-projection-arc-filter-tau-s", type=float, default=0.35)
+    parser.add_argument(
+        "--path-manager-fixed-arc-step-m",
+        type=float,
+        default=None,
+        help=(
+            "Fixed arclength spacing for path-manager output points. Defaults to 0.25m when "
+            "--path-manager-stabilize-local-frame is enabled; otherwise disabled."
+        ),
+    )
+    parser.add_argument("--path-manager-log-interval-s", type=float, default=1.0)
     parser.add_argument("--enable-gnss-serial", action="store_true")
     parser.add_argument("--gnss-device", default="/dev/ttyUSB0")
     parser.add_argument("--gnss-baud", type=int, default=115200)
@@ -629,6 +850,44 @@ def build_service_config(args: argparse.Namespace) -> PlannerServiceConfig:
         if float(args.udp_period_s) <= 0.0:
             raise ValueError("--udp-period-s must be > 0")
         udp_rate_hz = 1.0 / float(args.udp_period_s)
+    if float(args.udp_previous_path_blend_max_age_s) <= 0.0:
+        raise ValueError("--udp-previous-path-blend-max-age-s must be > 0")
+    if bool(args.enable_path_manager) and not bool(args.enable_udp_bridge):
+        raise ValueError("--enable-path-manager requires --enable-udp-bridge")
+    udp_path_log_dir = None
+    if bool(args.udp_save_path_log):
+        udp_path_log_dir = args.udp_path_log_dir if args.udp_path_log_dir is not None else args.output_root / "udp_path_log"
+    path_manager_health_url = (
+        str(args.path_manager_health_url)
+        if args.path_manager_health_url is not None
+        else str(args.server_url).rstrip("/") + "/healthz"
+    )
+    path_manager_config = (
+        LivePathManagerConfig(
+            enabled=True,
+            rate_hz=float(args.path_manager_rate_hz),
+            health_url=path_manager_health_url,
+            pose_timeout_s=float(args.path_manager_pose_timeout_s),
+            max_plan_age_s=float(args.path_manager_max_plan_age_s),
+            min_plan_arc_m=float(args.path_manager_min_plan_arc_m),
+            min_remaining_distance_m=float(args.path_manager_min_remaining_distance_m),
+            max_projection_distance_m=float(args.path_manager_max_projection_distance_m),
+            output_points=int(args.path_manager_output_points),
+            plan_blend_s=float(args.path_manager_plan_blend_s),
+            stabilize_local_frame=bool(args.path_manager_stabilize_local_frame),
+            yaw_filter_tau_s=float(args.path_manager_yaw_filter_tau_s),
+            yaw_max_rate_rad_s=float(args.path_manager_yaw_max_rate_rad_s),
+            projection_arc_filter_tau_s=float(args.path_manager_projection_arc_filter_tau_s),
+            fixed_arc_step_m=float(
+                0.25
+                if args.path_manager_fixed_arc_step_m is None and bool(args.path_manager_stabilize_local_frame)
+                else (0.0 if args.path_manager_fixed_arc_step_m is None else args.path_manager_fixed_arc_step_m)
+            ),
+            log_interval_s=float(args.path_manager_log_interval_s),
+        )
+        if bool(args.enable_path_manager)
+        else None
+    )
 
     runtime_config = PlannerRuntimeConfig(
         llm_inference_bin=args.llm_inference_bin,
@@ -636,8 +895,10 @@ def build_service_config(args: argparse.Namespace) -> PlannerServiceConfig:
         engine_dir=args.engine_dir,
         multimodal_engine_dir=args.multimodal_engine_dir,
         fm_engine=args.fm_engine,
-        staging_root=args.output_root / "staging",
+        staging_root=args.staging_root if args.staging_root is not None else args.output_root / "staging",
         output_root=args.output_root,
+        runtime_input_mode=str(args.runtime_input_mode),
+        staging_image_format=str(args.staging_image_format),
         action_space_constants_json=args.action_space_constants_json,
         nav_text=args.nav_text,
         nav_guidance_weight=args.nav_guidance_weight,
@@ -652,6 +913,7 @@ def build_service_config(args: argparse.Namespace) -> PlannerServiceConfig:
         alpamayo_fm_use_prefill_kv=bool(args.alpamayo_fm_use_prefill_kv),
         enable_dashboard=args.enable_dashboard,
         quiet_llm_logs=bool(args.quiet_llm_logs),
+        live_low_latency=bool(args.live_low_latency),
     )
     return PlannerServiceConfig(
         server_url=args.server_url,
@@ -671,8 +933,24 @@ def build_service_config(args: argparse.Namespace) -> PlannerServiceConfig:
             control_dt_s=args.udp_control_dt,
             control_points=args.udp_control_points,
             full_plan=bool(args.udp_full_plan),
+            latency_compensate_full_plan=bool(args.udp_latency_compensate_full_plan),
+            previous_path_blend_ratio=float(args.udp_previous_path_blend_ratio),
+            previous_path_blend_max_age_s=float(args.udp_previous_path_blend_max_age_s),
+            path_log_dir=udp_path_log_dir,
+            origin_offset_x_m=float(args.udp_origin_offset_x_m),
+            origin_offset_y_m=float(args.udp_origin_offset_y_m),
+            origin_yaw_offset_rad=math.radians(float(args.udp_origin_yaw_offset_deg)),
             action_log_interval_s=float(args.udp_action_log_interval_s),
+            action_log_mode=str(args.udp_action_log_mode),
             action_log_points=int(args.udp_action_log_points),
+            action_log_distance_marks_m=_parse_float_csv(args.udp_action_log_distance_marks_m),
+            action_log_distance_mark_tolerance_m=float(args.udp_action_log_distance_mark_tolerance_m),
+            opencv_ui_enabled=bool(args.enable_udp_opencv_ui),
+            opencv_ui_width=int(args.udp_opencv_ui_width),
+            opencv_ui_height=int(args.udp_opencv_ui_height),
+            opencv_ui_window_name=str(args.udp_opencv_ui_window_name),
+            opencv_ui_display=args.udp_opencv_ui_display,
+            opencv_ui_retry_interval_s=float(args.udp_opencv_ui_retry_interval_s),
         ),
         gnss_serial=GnssSerialConfig(device=str(args.gnss_device), baud=int(args.gnss_baud))
         if bool(args.enable_gnss_serial)
@@ -680,6 +958,7 @@ def build_service_config(args: argparse.Namespace) -> PlannerServiceConfig:
         gnss_required=bool(args.gnss_required),
         gnss_history_len=int(args.gnss_history_len),
         gnss_dt_s=float(args.gnss_dt_s),
+        path_manager=path_manager_config,
         manual_trigger_only=bool(args.manual_trigger_only),
     )
 

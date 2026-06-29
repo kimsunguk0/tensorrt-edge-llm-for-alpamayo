@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import math
 import os
@@ -122,6 +124,13 @@ def parse_args() -> argparse.Namespace:
         help="Use raw selected heading even while stationary.",
     )
     parser.add_argument("--enable-opencv-ui", action="store_true")
+    parser.add_argument(
+        "--opencv-ui-display",
+        "--udp-opencv-ui-display",
+        dest="opencv_ui_display",
+        default=None,
+        help="X display for OpenCV window, e.g. ':42'. Defaults to current DISPLAY or REMOTE_CONTAINERS_DISPLAY_SOCK.",
+    )
     parser.add_argument("--ui-width", type=int, default=1280)
     parser.add_argument("--ui-height", type=int, default=720)
     parser.add_argument("--ui-history-points", type=int, default=120)
@@ -157,6 +166,39 @@ def parse_chunks(value: str) -> list[int]:
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def build_alpamayo_compatible_raw_action(
+    future_points: list[dict[str, Any]],
+    *,
+    dt_s: float,
+    source: str,
+) -> dict[str, Any]:
+    # Control-team compatibility: the historical "accel_mps2" field currently
+    # carries velocity in m/s for the UDP text JSON path interface.
+    velocities = [float(point.get("v_mps", 0.0)) for point in future_points]
+    curvatures = [float(point.get("curvature", 0.0)) for point in future_points]
+    return {
+        "num_points": int(len(future_points)),
+        "normalized_x_final": [],
+        "accel_mps2": velocities,
+        "accel_mps2_units": "m/s",
+        "raw_accel_mps2": [],
+        "curvature": curvatures,
+        "action_space_constants": {"dt_value": float(dt_s)},
+        "source": source,
+    }
+
+
+def pred_xyz_from_packet_points(future_points: list[dict[str, Any]]) -> list[list[float]]:
+    return [
+        [
+            float(point.get("x_m", 0.0)),
+            float(point.get("y_m", 0.0)),
+            0.0,
+        ]
+        for point in future_points
+    ]
 
 
 def geodetic_to_ecef(lat_deg: np.ndarray, lon_deg: np.ndarray, alt_m: np.ndarray) -> np.ndarray:
@@ -384,10 +426,11 @@ def build_local_packet(
     row = gnss.iloc[row_index]
     future_points = packet["points"][1:]
     global_indices = np.flatnonzero(point_mask)
+    initial_speed_mps = float(packet["points"][0].get("v_mps", 0.0)) if packet["points"] else None
     payload: dict[str, Any] = {
-        "label": "gnss_local_path",
-        "payload_format": "gnss_local_path_json",
-        "path_type": "gnss_local_path",
+        "label": "ac_decoded_path",
+        "path_type": "ac_decoded_path",
+        "gnss_path_type": "gnss_local_path",
         "udp_mode": "text_json_gnss_local_path_replay",
         "chunk_id": int(chunk_id),
         "sample_id": int(row_index),
@@ -407,10 +450,25 @@ def build_local_packet(
         "coordinate_note": "ego-local: +x forward, +y left, yaw/curvature positive left",
         "packet_header": packet["header"],
         "packet_points": packet["points"],
-        "pred_xyz": local_xyz_packet[1:].astype(float).tolist(),
+        "pred_xyz": pred_xyz_from_packet_points(future_points),
         "pred_yaw_rad": [float(point["yaw_rad"]) for point in future_points],
         "pred_v_mps": [float(point["v_mps"]) for point in future_points],
         "pred_curvature": [float(point["curvature"]) for point in future_points],
+        "raw_action": build_alpamayo_compatible_raw_action(
+            future_points,
+            dt_s=float(plan_dt_s),
+            source="gnss_local_path",
+        ),
+        "final_output": "gnss_local_path",
+        "timing": {},
+        "inference_time_s": 0.0,
+        "initial_speed_mps": initial_speed_mps,
+        "initial_speed_kph": float(initial_speed_mps * 3.6) if initial_speed_mps is not None else None,
+        "initial_speed_source": "packet_points[0].v_mps",
+        "sensor_speed_mps": initial_speed_mps,
+        "sensor_speed_kph": float(initial_speed_mps * 3.6) if initial_speed_mps is not None else None,
+        "sensor_speed_source": "gnss_path_packet",
+        "sensor_speed_t0_utc_ns": t0_ns,
         "source_gnss": {
             "timestamp_utc_ns": t0_ns,
             "lat": float(row["lat"]),
@@ -485,6 +543,59 @@ def _pick_int(mapping: dict[str, Any], keys: tuple[str, ...]) -> int | None:
     return None
 
 
+def _numeric_vector(value: Any) -> list[float] | None:
+    if not isinstance(value, (list, tuple)):
+        return None
+    out: list[float] = []
+    for item in value:
+        if isinstance(item, (list, tuple)):
+            nested = _numeric_vector(item)
+            if nested is None:
+                return None
+            out.extend(nested)
+        else:
+            parsed = _coerce_float(item)
+            if parsed is None:
+                return None
+            out.append(float(parsed))
+    return out
+
+
+def _apply_utm_fields(fix: dict[str, Any], utm: list[float] | None, zone: Any = None, northp: Any = None) -> None:
+    if utm is not None and len(utm) >= 2:
+        fix["gnss_utm"] = [float(item) for item in utm[:3]]
+    zone_text = str(zone).strip() if zone is not None else ""
+    if zone_text:
+        zone_match = re.search(r"(\d+)", zone_text)
+        if zone_match:
+            fix["gnss_utm_zone"] = int(zone_match.group(1))
+        if "N" in zone_text.upper():
+            fix["gnss_utm_northp"] = True
+        elif "S" in zone_text.upper():
+            fix["gnss_utm_northp"] = False
+    if northp is not None:
+        if isinstance(northp, str):
+            fix["gnss_utm_northp"] = northp.strip().lower() in {"1", "true", "t", "yes", "y", "north", "n"}
+        else:
+            fix["gnss_utm_northp"] = bool(northp)
+
+
+def _apply_covariance_fields(fix: dict[str, Any], values: list[float] | None, *, is_diag: bool = False) -> None:
+    if values is None:
+        return
+    if is_diag and len(values) >= 2:
+        diag = [float(values[0]), float(values[1]), float(values[2] if len(values) > 2 else 0.0)]
+        cov9 = [diag[0], 0.0, 0.0, 0.0, diag[1], 0.0, 0.0, 0.0, diag[2]]
+        fix["gnss_covariance_enu_m2"] = cov9
+        fix["position_covariance"] = cov9
+        return
+    if len(values) in (4, 6, 9):
+        cov_values = [float(item) for item in values]
+        fix["position_covariance"] = cov_values
+        if len(values) == 9:
+            fix["gnss_covariance_enu_m2"] = cov_values
+
+
 def _extract_gnss_from_dict(mapping: dict[str, Any]) -> dict[str, Any] | None:
     lat = _pick_float(mapping, ("lat", "latitude"))
     lon = _pick_float(mapping, ("lon", "lng", "longitude"))
@@ -503,6 +614,11 @@ def _extract_gnss_from_dict(mapping: dict[str, Any]) -> dict[str, Any] | None:
     yaw_rad = _pick_float(mapping, ("yaw_rad", "heading_rad", "heading_enu_rad"))
     if yaw_rad is not None:
         fix["yaw_rad"] = yaw_rad
+    yaw_deg = _pick_float(mapping, ("yaw_deg", "heading_deg", "heading_enu_deg"))
+    if yaw_deg is not None:
+        fix["yaw_deg"] = yaw_deg
+        if "yaw_rad" not in fix:
+            fix["yaw_rad"] = math.radians(float(yaw_deg))
     for out_key, keys in (
         ("fix_type", ("fix_type", "quality", "fix_quality")),
         ("num_sats", ("num_sats", "satellites", "sat_count")),
@@ -529,13 +645,26 @@ def _extract_gnss_from_dict(mapping: dict[str, Any]) -> dict[str, Any] | None:
             vector = [_coerce_float(item) for item in value]
             fix["velocity_mps"] = [float(item) for item in vector if item is not None]
             break
-    for key in ("covariance", "position_covariance", "pos_covariance", "position_cov", "cov"):
-        value = mapping.get(key)
-        if isinstance(value, (list, tuple)) and len(value) in (4, 6, 9):
-            cov_values = [_coerce_float(item) for item in value]
-            if all(item is not None for item in cov_values):
-                fix["position_covariance"] = [float(item) for item in cov_values if item is not None]
-                break
+    for key in ("utm", "gnss_utm", "utm_enu", "utm_xyz"):
+        vector = _numeric_vector(mapping.get(key))
+        if vector is not None:
+            _apply_utm_fields(
+                fix,
+                vector,
+                mapping.get("utm_zone", mapping.get("gnss_utm_zone")),
+                mapping.get("utm_northp", mapping.get("gnss_utm_northp")),
+            )
+            break
+    for key in ("cov_diag_m2", "covariance_diag_m2", "gnss_cov_diag_m2", "position_covariance_diag_m2"):
+        vector = _numeric_vector(mapping.get(key))
+        if vector is not None:
+            _apply_covariance_fields(fix, vector, is_diag=True)
+            break
+    for key in ("covariance", "position_covariance", "pos_covariance", "position_cov", "cov", "gnss_covariance_enu_m2"):
+        vector = _numeric_vector(mapping.get(key))
+        if vector is not None:
+            _apply_covariance_fields(fix, vector)
+            break
     for out_key, keys in (
         ("hacc_m", ("hacc_m", "horizontal_accuracy_m", "accuracy_m", "eph")),
         ("vacc_m", ("vacc_m", "vertical_accuracy_m", "epv")),
@@ -571,6 +700,11 @@ def _parse_text_gnss(text: str) -> dict[str, Any] | None:
     yaw_rad = field(("yaw_rad", "heading_rad", "heading_enu_rad"))
     if yaw_rad is not None:
         fix["yaw_rad"] = float(yaw_rad)
+    yaw_deg = field(("yaw_deg", "heading_deg", "heading_enu_deg"))
+    if yaw_deg is not None:
+        fix["yaw_deg"] = float(yaw_deg)
+        if "yaw_rad" not in fix:
+            fix["yaw_rad"] = math.radians(float(yaw_deg))
     for out_key, names, parser in (
         ("fix_type", ("fix_type", "quality", "fix_quality"), _coerce_int),
         ("num_sats", ("num_sats", "satellites", "sat_count"), _coerce_int),
@@ -591,12 +725,24 @@ def _parse_text_gnss(text: str) -> dict[str, Any] | None:
     if vel_match:
         velocity = [_coerce_float(item.strip()) for item in vel_match.group(1).split(",")]
         fix["velocity_mps"] = [float(item) for item in velocity if item is not None]
-    cov_match = re.search(r"(?:position_covariance|pos_covariance|position_cov|covariance|cov)\s*[:=]\s*\[([^\]]+)\]", text)
+    utm = _parse_vector_field(text, ("utm", "gnss_utm", "utm_enu", "utm_xyz"))
+    zone_match = re.search(r"(?:^|[\s,{])(?:utm_zone|gnss_utm_zone)\s*[:=]\s*([0-9]+[NSns]?)", text)
+    northp_match = re.search(r"(?:^|[\s,{])(?:utm_northp|gnss_utm_northp)\s*[:=]\s*([A-Za-z0-9_.+-]+)", text)
+    if utm is not None or zone_match or northp_match:
+        _apply_utm_fields(
+            fix,
+            utm,
+            zone_match.group(1) if zone_match else None,
+            northp_match.group(1) if northp_match else None,
+        )
+    cov_diag = _parse_vector_field(text, ("cov_diag_m2", "covariance_diag_m2", "gnss_cov_diag_m2", "position_covariance_diag_m2"))
+    if cov_diag is not None:
+        _apply_covariance_fields(fix, cov_diag, is_diag=True)
+    cov_match = re.search(r"(?:position_covariance|pos_covariance|position_cov|covariance|gnss_covariance_enu_m2|cov)\s*[:=]\s*\[([^\]]+)\]", text)
     if cov_match:
         covariance = [_coerce_float(item.strip()) for item in cov_match.group(1).split(",")]
         covariance = [float(item) for item in covariance if item is not None]
-        if len(covariance) in (4, 6, 9):
-            fix["position_covariance"] = covariance
+        _apply_covariance_fields(fix, covariance)
     for out_key, names in (
         ("hacc_m", ("hacc_m", "horizontal_accuracy_m", "accuracy_m", "eph")),
         ("vacc_m", ("vacc_m", "vertical_accuracy_m", "epv")),
@@ -844,6 +990,7 @@ def actual_gnss_log_row(
     for key in (
         "timestamp_utc_ns",
         "yaw_rad",
+        "yaw_deg",
         "ins_euler_deg",
         "ins_yaw_deg",
         "ins_yaw_rad",
@@ -855,6 +1002,10 @@ def actual_gnss_log_row(
         "fix_age_ms",
         "velocity_mps",
         "position_covariance",
+        "gnss_covariance_enu_m2",
+        "gnss_utm",
+        "gnss_utm_zone",
+        "gnss_utm_northp",
         "hacc_m",
         "vacc_m",
     ):
@@ -1080,6 +1231,69 @@ def covariance_summary(cov_xy: np.ndarray | None) -> dict[str, Any] | None:
     }
 
 
+def _display_from_x_socket(path: str | None) -> str | None:
+    if not path:
+        return None
+    name = os.path.basename(path)
+    if not name.startswith("X"):
+        return None
+    number = name[1:]
+    return f":{number}" if number.isdigit() else None
+
+
+def _x_display_preflight_error(display: str | None) -> str | None:
+    if not display:
+        return "DISPLAY is not set"
+    lib_name = ctypes.util.find_library("X11")
+    if not lib_name:
+        return "libX11 is unavailable"
+    try:
+        x11 = ctypes.cdll.LoadLibrary(lib_name)
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        ptr = x11.XOpenDisplay(display.encode("utf-8"))
+        if not ptr:
+            return f"cannot connect to X display {display!r}"
+        x11.XCloseDisplay(ptr)
+    except Exception as exc:
+        return f"X display preflight failed for {display!r}: {exc}"
+    return None
+
+
+def _available_x_socket_displays() -> list[str]:
+    root = "/tmp/.X11-unix"
+    if not os.path.isdir(root):
+        return []
+    displays: list[str] = []
+    for name in os.listdir(root):
+        display = _display_from_x_socket(name)
+        if display is not None:
+            displays.append(display)
+    return sorted(set(displays), key=lambda item: int(item[1:]) if item[1:].isdigit() else -1, reverse=True)
+
+
+def _resolve_opencv_display(explicit_display: str | None) -> str:
+    candidates: list[str | None] = [
+        explicit_display,
+        os.environ.get("DISPLAY"),
+        _display_from_x_socket(os.environ.get("REMOTE_CONTAINERS_DISPLAY_SOCK")),
+    ]
+    candidates.extend(_available_x_socket_displays())
+    seen: set[str] = set()
+    errors: list[str] = []
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        error = _x_display_preflight_error(candidate)
+        if error is None:
+            return candidate
+        errors.append(error)
+    detail = "; ".join(errors[-5:]) if errors else "no DISPLAY or X socket candidates found"
+    raise RuntimeError(f"no usable X display for OpenCV UI: {detail}")
+
+
 class LiveFollowOpenCvUi:
     def __init__(
         self,
@@ -1089,7 +1303,10 @@ class LiveFollowOpenCvUi:
         height: int,
         window_name: str,
         history_points: int,
+        display: str | None,
     ) -> None:
+        resolved_display = _resolve_opencv_display(display)
+        os.environ["DISPLAY"] = resolved_display
         os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
         import cv2  # type: ignore
 
@@ -1112,6 +1329,11 @@ class LiveFollowOpenCvUi:
         try:
             self.cv2.namedWindow(self.window_name, self.cv2.WINDOW_NORMAL)
             self.cv2.resizeWindow(self.window_name, self.width, self.height)
+            print(
+                f"[gnss opencv ui] opened window={self.window_name!r} "
+                f"display={resolved_display!r} size={self.width}x{self.height}",
+                flush=True,
+            )
         except cv2.error as exc:
             raise RuntimeError(
                 "OpenCV HighGUI window creation failed. The container likely lacks a GUI-enabled OpenCV "
@@ -1316,6 +1538,25 @@ class LiveFollowOpenCvUi:
         cv2.arrowedLine(img, tuple(origin_px), (origin_px[0], y0 + 24), axis_color, 2, tipLength=0.04)
         cv2.putText(img, "+x forward", (origin_px[0] + 8, y0 + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45, axis_color, 1)
         cv2.putText(img, "+y left", (x0 + 24, origin_px[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, axis_color, 1)
+        for y_m in np.arange(-8.0, 8.0 + 0.5, 0.5):
+            if abs(float(y_m)) <= 1e-6:
+                continue
+            x_px = int(round(origin_px[0] - y_m * scale))
+            if x0 + 20 <= x_px <= x1 - 20:
+                is_meter = abs(float(y_m) - round(float(y_m))) < 1e-6
+                color = (68, 68, 68) if is_meter else (44, 44, 44)
+                cv2.line(img, (x_px, y0 + 20), (x_px, y1 - 20), color, 1, cv2.LINE_AA)
+                if is_meter:
+                    cv2.putText(
+                        img,
+                        f"{y_m:+.0f}m",
+                        (x_px - 22, origin_px[1] + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42,
+                        (205, 205, 205),
+                        1,
+                        cv2.LINE_AA,
+                    )
         if len(local_route_xy) >= 2:
             px = local_to_px(local_route_xy)
             cv2.polylines(img, [px.reshape((-1, 1, 2))], False, (0, 0, 255), 2, cv2.LINE_AA)
@@ -1419,10 +1660,11 @@ def build_live_follow_packet(
 
     nearest_row = gnss.iloc[nearest_idx]
     future_points = packet["points"][1:]
+    initial_speed_mps = float(packet["points"][0].get("v_mps", 0.0)) if packet["points"] else None
     payload: dict[str, Any] = {
-        "label": "gnss_live_follow_path",
-        "payload_format": "gnss_local_path_json",
-        "path_type": "gnss_live_follow_path",
+        "label": "ac_decoded_path",
+        "path_type": "ac_decoded_path",
+        "gnss_path_type": "gnss_live_follow_path",
         "udp_mode": "text_json_gnss_live_follow",
         "chunk_id": int(nearest_row["chunk_id"]),
         "sample_id": int(nearest_idx),
@@ -1442,10 +1684,27 @@ def build_live_follow_packet(
         "coordinate_note": "ego-local from live GNSS: +x forward, +y left, yaw/curvature positive left",
         "packet_header": packet["header"],
         "packet_points": packet["points"],
-        "pred_xyz": local_xyz_packet[1:].astype(float).tolist(),
+        "pred_xyz": pred_xyz_from_packet_points(future_points),
         "pred_yaw_rad": [float(point["yaw_rad"]) for point in future_points],
         "pred_v_mps": [float(point["v_mps"]) for point in future_points],
         "pred_curvature": [float(point["curvature"]) for point in future_points],
+        "raw_action": build_alpamayo_compatible_raw_action(
+            future_points,
+            dt_s=float(plan_dt_s),
+            source="gnss_live_follow_path",
+        ),
+        "final_output": "gnss_live_follow_path",
+        "timing": {},
+        "inference_time_s": 0.0,
+        "initial_speed_mps": initial_speed_mps,
+        "initial_speed_kph": float(initial_speed_mps * 3.6) if initial_speed_mps is not None else None,
+        "initial_speed_source": "packet_points[0].v_mps",
+        "sensor_speed_mps": live_fix_speed_mps(live_fix),
+        "sensor_speed_kph": None
+        if live_fix_speed_mps(live_fix) is None
+        else float(live_fix_speed_mps(live_fix) * 3.6),
+        "sensor_speed_source": "live_gnss",
+        "sensor_speed_t0_utc_ns": source_t0_ns,
         "source_gnss": {
             "timestamp_utc_ns": source_t0_ns,
             "lat": float(live_fix["lat"]),
@@ -1703,6 +1962,7 @@ def send_live_follow(
     ui_height: int,
     ui_window_name: str,
     ui_history_points: int,
+    ui_display: str | None,
     target_log_path: Path,
     actual_log_path: Path,
 ) -> dict[str, Any]:
@@ -1730,6 +1990,7 @@ def send_live_follow(
             height=int(ui_height),
             window_name=str(ui_window_name),
             history_points=int(ui_history_points),
+            display=ui_display,
         )
     target_log_path.parent.mkdir(parents=True, exist_ok=True)
     actual_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2056,6 +2317,7 @@ def main() -> None:
                 ui_height=int(args.ui_height),
                 ui_window_name=str(args.ui_window_name),
                 ui_history_points=int(args.ui_history_points),
+                ui_display=args.opencv_ui_display,
                 target_log_path=target_tx_log_path,
                 actual_log_path=actual_gnss_log_path,
             )

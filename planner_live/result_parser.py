@@ -36,6 +36,7 @@ class PlannerResult:
     output_json_path: str
     x_final: list[list[float]] = field(default_factory=list)
     action_space_constants: dict[str, Any] = field(default_factory=dict)
+    live_timing: dict[str, Any] = field(default_factory=dict)
     trajectory_json_path: str | None = None
     trajectory_xyz_npy_path: str | None = None
     trajectory_rot_npy_path: str | None = None
@@ -57,6 +58,7 @@ class PlannerResult:
             "action_space_constants": self.action_space_constants,
             "post_vlm_timing": self.post_vlm_timing,
             "fm_timing": self.fm_timing,
+            "live_timing": self.live_timing,
             "output_json_path": self.output_json_path,
             "trajectory_json_path": self.trajectory_json_path,
             "trajectory_xyz_npy_path": self.trajectory_xyz_npy_path,

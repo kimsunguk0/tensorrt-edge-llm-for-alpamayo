@@ -31,6 +31,8 @@
 #include "runtime/alpamayoPostVlmRuntime.h"
 #include "tokenizer/tokenizer.h"
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -114,6 +116,117 @@ std::vector<traj::DeltaTrajectoryTokenizer::Mat3> loadSingleTrajectoryRot(common
             {array.data[base + 6], array.data[base + 7], array.data[base + 8]}}};
     }
     return rot;
+}
+
+int decodeBase64Value(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+    {
+        return c - 'A';
+    }
+    if (c >= 'a' && c <= 'z')
+    {
+        return c - 'a' + 26;
+    }
+    if (c >= '0' && c <= '9')
+    {
+        return c - '0' + 52;
+    }
+    if (c == '+')
+    {
+        return 62;
+    }
+    if (c == '/')
+    {
+        return 63;
+    }
+    return -1;
+}
+
+std::vector<uint8_t> decodeBase64(std::string const& encoded)
+{
+    std::vector<uint8_t> decoded;
+    decoded.reserve((encoded.size() * 3) / 4);
+    int value = 0;
+    int bits = -8;
+    for (unsigned char rawChar : encoded)
+    {
+        char const c = static_cast<char>(rawChar);
+        if (std::isspace(rawChar))
+        {
+            continue;
+        }
+        if (c == '=')
+        {
+            break;
+        }
+        int const digit = decodeBase64Value(c);
+        check::check(digit >= 0, "Invalid base64 character in inline image data");
+        value = (value << 6) | digit;
+        bits += 6;
+        if (bits >= 0)
+        {
+            decoded.push_back(static_cast<uint8_t>((value >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return decoded;
+}
+
+std::vector<int64_t> parseInt64Shape(Json const& tensorJson, std::string const& name)
+{
+    check::check(tensorJson.contains("shape") && tensorJson["shape"].is_array(), name + " must contain shape array");
+    auto shape = tensorJson["shape"].get<std::vector<int64_t>>();
+    check::check(!shape.empty(), name + " shape must not be empty");
+    int64_t elementCount = 1;
+    for (int64_t dim : shape)
+    {
+        check::check(dim > 0, name + " shape dimensions must be positive");
+        elementCount *= dim;
+    }
+    check::check(elementCount > 0, name + " shape element count must be positive");
+    return shape;
+}
+
+common::NpyArrayFloat32 parseInlineFloat32Tensor(Json const& tensorJson, std::string const& name)
+{
+    common::NpyArrayFloat32 tensor;
+    tensor.shape = parseInt64Shape(tensorJson, name);
+    check::check(tensorJson.contains("data") && tensorJson["data"].is_array(), name + " must contain data array");
+    tensor.data = tensorJson["data"].get<std::vector<float>>();
+    int64_t expectedSize = 1;
+    for (int64_t dim : tensor.shape)
+    {
+        expectedSize *= dim;
+    }
+    check::check(static_cast<int64_t>(tensor.data.size()) == expectedSize,
+        format::fmtstr("%s data size %zu does not match shape element count %lld", name.c_str(), tensor.data.size(),
+            static_cast<long long>(expectedSize)));
+    return tensor;
+}
+
+rt::imageUtils::ImageData loadInlineRgbImage(Json const& imageJson)
+{
+    check::check(imageJson.contains("shape") && imageJson["shape"].is_array(),
+        "inline image_rgb_u8 must contain shape=[height,width,channels]");
+    auto shape = imageJson["shape"].get<std::vector<int64_t>>();
+    check::check(shape.size() == 3, "inline image_rgb_u8 shape must be [height,width,channels]");
+    int64_t const height = shape[0];
+    int64_t const width = shape[1];
+    int64_t const channels = shape[2];
+    check::check(height > 0 && width > 0 && channels == 3, "inline image_rgb_u8 must be HxWx3 RGB uint8");
+    check::check(imageJson.contains("data_b64") && imageJson["data_b64"].is_string(),
+        "inline image_rgb_u8 must contain base64 data_b64");
+    std::vector<uint8_t> const bytes = decodeBase64(imageJson["data_b64"].get<std::string>());
+    int64_t const expectedBytes = height * width * channels;
+    check::check(static_cast<int64_t>(bytes.size()) == expectedBytes,
+        format::fmtstr("inline image_rgb_u8 byte size %zu does not match expected %lld", bytes.size(),
+            static_cast<long long>(expectedBytes)));
+
+    rt::Tensor imgTensor({height, width, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
+        "llm_inference::inline_rgb_image");
+    std::memcpy(imgTensor.dataPointer<uint8_t>(), bytes.data(), bytes.size());
+    return rt::imageUtils::ImageData(std::move(imgTensor));
 }
 
 bool replaceTrajectoryText(std::string& text, std::string const& replacement)
@@ -951,6 +1064,21 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                 {
                     egoHistoryRotNpy = requestItem["ego_history_rot_npy"].get<std::string>();
                 }
+                common::NpyArrayFloat32 inlineEgoHistoryXYZ;
+                bool hasInlineEgoHistoryXYZ = false;
+                if (requestItem.contains("ego_history_xyz") && !requestItem["ego_history_xyz"].is_null())
+                {
+                    inlineEgoHistoryXYZ = parseInlineFloat32Tensor(requestItem["ego_history_xyz"], "ego_history_xyz");
+                    hasInlineEgoHistoryXYZ = true;
+                }
+
+                common::NpyArrayFloat32 inlineEgoHistoryRot;
+                bool hasInlineEgoHistoryRot = false;
+                if (requestItem.contains("ego_history_rot") && !requestItem["ego_history_rot"].is_null())
+                {
+                    inlineEgoHistoryRot = parseInlineFloat32Tensor(requestItem["ego_history_rot"], "ego_history_rot");
+                    hasInlineEgoHistoryRot = true;
+                }
 
                 bool predictYaw = false;
                 if (requestItem.contains("predict_yaw") && !requestItem["predict_yaw"].is_null())
@@ -1005,19 +1133,21 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                     diffusionNumSteps = requestItem["diffusion_num_steps"].get<int32_t>();
                 }
 
-                bool const shouldInjectTrajectory = !egoHistoryXYZNpy.empty();
+                bool const shouldInjectTrajectory = hasInlineEgoHistoryXYZ || !egoHistoryXYZNpy.empty();
                 std::string trajectoryReplacement;
                 if (shouldInjectTrajectory)
                 {
-                    common::NpyArrayFloat32 const xyzArray = common::loadNpyFloat32(egoHistoryXYZNpy);
+                    common::NpyArrayFloat32 const xyzArray
+                        = hasInlineEgoHistoryXYZ ? inlineEgoHistoryXYZ : common::loadNpyFloat32(egoHistoryXYZNpy);
                     std::vector<traj::DeltaTrajectoryTokenizer::Vec3> const histXYZ = loadSingleTrajectoryXYZ(xyzArray);
 
                     std::vector<traj::DeltaTrajectoryTokenizer::Mat3> histRot;
                     if (predictYaw)
                     {
-                        check::check(!egoHistoryRotNpy.empty(),
+                        check::check(hasInlineEgoHistoryRot || !egoHistoryRotNpy.empty(),
                             "predict_yaw is enabled but no ego_history_rot_npy was provided.");
-                        common::NpyArrayFloat32 const rotArray = common::loadNpyFloat32(egoHistoryRotNpy);
+                        common::NpyArrayFloat32 const rotArray
+                            = hasInlineEgoHistoryRot ? inlineEgoHistoryRot : common::loadNpyFloat32(egoHistoryRotNpy);
                         histRot = loadSingleTrajectoryRot(rotArray);
                     }
 
@@ -1107,9 +1237,10 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                             }
                             else if (msgContent.type == "image")
                             {
-                                msgContent.content = contentItemJson["image"].get<std::string>();
-                                // TODO: Need to consider multi-turn conversation, and whether to load all images.
-                                auto image = rt::imageUtils::loadImageFromFile(msgContent.content);
+                                msgContent.content = contentItemJson.value("image", std::string{"inline_rgb_u8"});
+                                auto image = contentItemJson.contains("image_rgb_u8")
+                                    ? loadInlineRgbImage(contentItemJson["image_rgb_u8"])
+                                    : rt::imageUtils::loadImageFromFile(msgContent.content);
                                 if (image.buffer != nullptr)
                                 {
                                     imageBuffers.push_back(std::move(image));
@@ -1196,6 +1327,16 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                 request.audioBuffers = std::move(audioBuffers);
                 request.egoHistoryXYZNpy = std::move(egoHistoryXYZNpy);
                 request.egoHistoryRotNpy = std::move(egoHistoryRotNpy);
+                if (hasInlineEgoHistoryXYZ)
+                {
+                    request.egoHistoryXYZ = std::move(inlineEgoHistoryXYZ.data);
+                    request.egoHistoryXYZShape = std::move(inlineEgoHistoryXYZ.shape);
+                }
+                if (hasInlineEgoHistoryRot)
+                {
+                    request.egoHistoryRot = std::move(inlineEgoHistoryRot.data);
+                    request.egoHistoryRotShape = std::move(inlineEgoHistoryRot.shape);
+                }
                 request.predictYaw = predictYaw;
                 request.trajTokenOffset = trajTokenOffset;
                 request.navText = std::move(navText);
@@ -1227,6 +1368,8 @@ struct PersistentServerCommand
 {
     std::string inputFile;
     std::string outputFile;
+    bool compactOutputJson{false};
+    bool minimalOutputJson{false};
     bool shutdown{false};
 };
 
@@ -1242,6 +1385,8 @@ PersistentServerCommand parsePersistentServerCommand(std::string const& line)
 
     command.inputFile = payload.at("input_file").get<std::string>();
     command.outputFile = payload.at("output_file").get<std::string>();
+    command.compactOutputJson = payload.value("compact_output_json", false);
+    command.minimalOutputJson = payload.value("minimal_output_json", false);
     check::check(!command.inputFile.empty(), "Persistent server command requires a non-empty input_file.");
     check::check(!command.outputFile.empty(), "Persistent server command requires a non-empty output_file.");
     return command;
@@ -1388,7 +1533,7 @@ int main(int argc, char* argv[])
     auto processRequests = [&](std::string const& inputFileLabel, std::string const& outputFilePath,
                                std::string const& profileOutputFile,
                                std::vector<rt::LLMGenerationRequest> const& activeBatchedRequests,
-                               bool enableProfiling) -> int
+                               bool enableProfiling, bool compactOutputJson, bool minimalOutputJson) -> int
     {
         if (enableProfiling)
         {
@@ -1482,66 +1627,78 @@ int main(int argc, char* argv[])
                 nlohmann::json responseJson;
                 std::string outputText = requestStatus ? response.outputTexts[batchIdx] : errorMessage;
                 responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
-                if (requestStatus)
+                if (requestStatus && !minimalOutputJson)
                 {
                     responseJson["output_ids"] = response.outputIds[batchIdx];
                     responseJson["output_token_ids"] = response.outputIds[batchIdx];
                 }
                 responseJson["request_idx"] = requestIdx;
                 responseJson["batch_idx"] = batchIdx;
-                nlohmann::json messagesJson = nlohmann::json::array();
-                for (auto const& msg : request.requests[batchIdx].messages)
+                if (!minimalOutputJson)
                 {
-                    nlohmann::json msgJson;
-                    msgJson["role"] = msg.role;
-                    msgJson["content"] = nlohmann::json::array();
-                    for (auto const& content : msg.contents)
+                    nlohmann::json messagesJson = nlohmann::json::array();
+                    for (auto const& msg : request.requests[batchIdx].messages)
                     {
-                        nlohmann::json contentJson;
-                        contentJson["type"] = content.type;
-                        if (content.type == "text")
+                        nlohmann::json msgJson;
+                        msgJson["role"] = msg.role;
+                        msgJson["content"] = nlohmann::json::array();
+                        for (auto const& content : msg.contents)
                         {
-                            contentJson["text"] = content.content;
+                            nlohmann::json contentJson;
+                            contentJson["type"] = content.type;
+                            if (content.type == "text")
+                            {
+                                contentJson["text"] = content.content;
+                            }
+                            else if (content.type == "image")
+                            {
+                                contentJson["image"] = content.content;
+                            }
+                            else if (content.type == "video")
+                            {
+                                contentJson["video"] = content.content;
+                            }
+                            msgJson["content"].push_back(contentJson);
                         }
-                        else if (content.type == "image")
-                        {
-                            contentJson["image"] = content.content;
-                        }
-                        else if (content.type == "video")
-                        {
-                            contentJson["video"] = content.content;
-                        }
-                        msgJson["content"].push_back(contentJson);
+                        messagesJson.push_back(msgJson);
                     }
-                    messagesJson.push_back(msgJson);
+                    responseJson["messages"] = messagesJson;
                 }
-                responseJson["messages"] = messagesJson;
                 if (args.alpamayoPostVlmRuntime)
                 {
                     responseJson["alpamayo_post_vlm"] = alpamayoPostVlmJson;
-                    responseJson["formatted_system_prompt"]
-                        = alpamayoPostVlmJson.value("guided", nlohmann::json::object()).value("formatted_system_prompt", "");
-                    responseJson["formatted_complete_request"]
-                        = alpamayoPostVlmJson.value("guided", nlohmann::json::object()).value("formatted_complete_request", "");
-                    if (request.requests[batchIdx].navText.has_value())
+                    if (!minimalOutputJson)
                     {
-                        responseJson["nav_text"] = *request.requests[batchIdx].navText;
-                    }
-                    if (request.requests[batchIdx].navGuidanceWeight.has_value())
-                    {
-                        responseJson["nav_guidance_weight"] = *request.requests[batchIdx].navGuidanceWeight;
+                        responseJson["formatted_system_prompt"]
+                            = alpamayoPostVlmJson.value("guided", nlohmann::json::object()).value("formatted_system_prompt", "");
+                        responseJson["formatted_complete_request"]
+                            = alpamayoPostVlmJson.value("guided", nlohmann::json::object()).value("formatted_complete_request", "");
+                        if (request.requests[batchIdx].navText.has_value())
+                        {
+                            responseJson["nav_text"] = *request.requests[batchIdx].navText;
+                        }
+                        if (request.requests[batchIdx].navGuidanceWeight.has_value())
+                        {
+                            responseJson["nav_guidance_weight"] = *request.requests[batchIdx].navGuidanceWeight;
+                        }
                     }
                 }
                 else
                 {
-                    responseJson["formatted_system_prompt"] = request.formattedRequests[batchIdx].formattedSystemPrompt;
-                    responseJson["formatted_complete_request"] = request.formattedRequests[batchIdx].formattedCompleteRequest;
+                    if (!minimalOutputJson)
+                    {
+                        responseJson["formatted_system_prompt"] = request.formattedRequests[batchIdx].formattedSystemPrompt;
+                        responseJson["formatted_complete_request"] = request.formattedRequests[batchIdx].formattedCompleteRequest;
+                    }
                 }
                 outputData["responses"].push_back(responseJson);
             }
         }
 
-        outputData["token_metadata"] = {{"traj_future_start_token_id", 155681}, {"traj_future_end_token_id", 155683}};
+        if (!minimalOutputJson)
+        {
+            outputData["token_metadata"] = {{"traj_future_start_token_id", 155681}, {"traj_future_end_token_id", 155683}};
+        }
 
         LOG_INFO("Processing complete: %zu/%zu batched requests successful", activeBatchedRequests.size() - failedCount,
             activeBatchedRequests.size());
@@ -1635,7 +1792,7 @@ int main(int argc, char* argv[])
             std::ofstream outputFile(outputFilePath);
             if (outputFile.is_open())
             {
-                outputFile << outputData.dump(4);
+                outputFile << (compactOutputJson ? outputData.dump() : outputData.dump(4));
                 outputFile.close();
                 LOG_INFO("All responses exported to: %s", outputFilePath.c_str());
             }
@@ -1656,7 +1813,7 @@ int main(int argc, char* argv[])
 
     if (!args.persistentServer)
     {
-        return processRequests(args.inputFile, args.outputFile, args.profileOutputFile, batchedRequests, profilerEnabled);
+        return processRequests(args.inputFile, args.outputFile, args.profileOutputFile, batchedRequests, profilerEnabled, false, false);
     }
 
     LOG_INFO("Persistent server ready. Send newline-delimited JSON commands on stdin.");
@@ -1696,7 +1853,8 @@ int main(int argc, char* argv[])
                 throw std::runtime_error("Persistent server received an input file with no valid requests.");
             }
 
-            int const rc = processRequests(command.inputFile, command.outputFile, std::string{}, commandRequests, false);
+            int const rc = processRequests(command.inputFile, command.outputFile, std::string{}, commandRequests, false,
+                command.compactOutputJson, command.minimalOutputJson);
             std::cout << Json{{"status", rc == EXIT_SUCCESS ? "ok" : "error"},
                              {"output_file", command.outputFile},
                              {"exit_code", rc}}

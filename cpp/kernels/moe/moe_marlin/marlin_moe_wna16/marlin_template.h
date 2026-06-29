@@ -194,7 +194,8 @@ template <trt_edgellm::marlin_dtypes::ScalarTypeId const a_type_id, // A ScalarT
                                                                     // fetch pipeline
     int const group_blocks,                                         // number of consecutive 16x16 blocks
                                                                     // with a separate quantization scale
-    bool const is_zp_float                                          // is zero point of float16 type?
+    bool const is_zp_float,                                         // is zero point of float16 type?
+    bool const dense_identity                                       // skip MoE metadata and use identity row mapping
     >
 __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape mxk
     int4 const* __restrict__ B,                    // 4bit quantized weight matrix of shape kxn
@@ -254,8 +255,9 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
         return;
 #endif
 
-    int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
     constexpr int moe_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
+    int num_tokens_past_padded
+        = dense_identity ? div_ceil(prob_m, moe_block_size) * moe_block_size : num_tokens_past_padded_ptr[0];
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
     constexpr bool use_fp16_accum = a_type_id == trt_edgellm::marlin_dtypes::kFloat16.id();
@@ -391,6 +393,28 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
     int32_t block_num_valid_tokens = 0;
     int32_t locks_off = 0;
 
+    auto dense_row = [&](int row) { return static_cast<int64_t>(block_id) * moe_block_size + row; };
+    auto block_sorted_row = [&](int row) {
+        if constexpr (dense_identity)
+        {
+            return dense_row(row);
+        }
+        else
+        {
+            return static_cast<int64_t>(sh_block_sorted_ids[row]);
+        }
+    };
+    auto block_rd_row = [&](int row) {
+        if constexpr (dense_identity)
+        {
+            return dense_row(row);
+        }
+        else
+        {
+            return static_cast<int64_t>(sh_rd_block_sorted_ids[row]);
+        }
+    };
+
     // We can easily implement parallel problem execution by just remapping
     // indices and advancing global pointers
     if (part2_mn_tiles >= gridDim.x)
@@ -408,6 +432,17 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
     // read moe block data given block_id
     // block_sorted_ids / block_num_valid_tokens / block_topk_weights
     auto read_moe_block_data = [&](int block_id) {
+        if constexpr (dense_identity)
+        {
+            int remaining = prob_m - block_id * moe_block_size;
+            block_num_valid_tokens = remaining > moe_block_size ? moe_block_size : remaining;
+            if (block_num_valid_tokens < 0)
+            {
+                block_num_valid_tokens = 0;
+            }
+            return;
+        }
+
         block_num_valid_tokens = moe_block_size;
 
         cp_async4_pred(sh_block_sorted_ids_int4 + threadIdx.x,
@@ -490,6 +525,14 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 
         old_expert_id = expert_id;
         block_id = par_id;
+        if constexpr (dense_identity)
+        {
+            expert_id = 0;
+            B_expert_off = 0;
+            read_moe_block_data(block_id);
+            return;
+        }
+
         expert_id = expert_ids_ptr[block_id];
 
         if constexpr (b_type == trt_edgellm::marlin_dtypes::kFE2M1f && s_type == trt_edgellm::marlin_dtypes::kFE4M3fn)
@@ -564,7 +607,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                 int row = threads / threads_per_m * i + threadIdx.x / threads_per_m;
                 if (row < block_num_valid_tokens)
                 {
-                    int64_t sorted_row = sh_block_sorted_ids[row];
+                    int64_t sorted_row = block_sorted_row(row);
                     int col = slice_col * 16 * thread_n_blocks / 8 + threadIdx.x % threads_per_m;
                     C[sorted_row * prob_n / 8 + col] = {0, 0, 0, 0};
                 }
@@ -587,7 +630,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
         if (is_a_8bit && (first_init || slice_col == 0))
         {
             __syncthreads();
-            cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[sh_rd_block_sorted_ids[threadIdx.x]],
+            cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[block_rd_row(threadIdx.x)],
                 threadIdx.x < block_num_valid_tokens);
         }
     };
@@ -603,7 +646,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
             if (is_a_8bit)
             {
                 __syncthreads();
-                cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[sh_rd_block_sorted_ids[threadIdx.x]],
+                cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[block_rd_row(threadIdx.x)],
                     threadIdx.x < block_num_valid_tokens);
             }
         }
@@ -906,7 +949,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                 int row = a_gl_rd_delta_i / a_gl_stride * i + a_gl_rd_row;
                 int64_t sorted_row = 0;
                 if (!m_block_size_8 || row < 8)
-                    sorted_row = sh_rd_block_sorted_ids[row];
+                    sorted_row = block_rd_row(row);
                 int64_t true_idx = sorted_row * a_gl_stride + a_gl_rd_col + a_gl_rd_delta_o * a_off;
                 cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx], row < block_num_valid_tokens);
             }
@@ -1452,7 +1495,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                     c_idx = c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
                 if (c_idx / c_gl_stride < block_num_valid_tokens)
                 {
-                    int64_t sorted_row = sh_block_sorted_ids[c_idx / c_gl_stride];
+                    int64_t sorted_row = block_sorted_row(c_idx / c_gl_stride);
                     int64_t true_idx = sorted_row * c_gl_stride + c_idx % c_gl_stride;
                     if constexpr (is_a_8bit)
                     {
@@ -1518,7 +1561,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                     c_idx = c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
                 if (c_idx / c_gl_stride < block_num_valid_tokens)
                 {
-                    int64_t sorted_row = sh_block_sorted_ids[c_idx / c_gl_stride];
+                    int64_t sorted_row = block_sorted_row(c_idx / c_gl_stride);
                     int64_t true_idx = sorted_row * c_gl_stride + c_idx % c_gl_stride;
                     if constexpr (is_a_8bit)
                     {
@@ -1717,7 +1760,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
             int row = c_gl_wr / c_gl_stride;
             if (row < block_num_valid_tokens)
             {
-                int64_t sorted_row = sh_block_sorted_ids[row];
+                int64_t sorted_row = block_sorted_row(row);
                 int64_t true_idx = sorted_row * c_gl_stride + c_gl_wr % c_gl_stride;
                 c_scalar_t2 topk_weight_score;
                 if (mul_topk_weights)

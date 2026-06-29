@@ -44,7 +44,8 @@ public:
      * @param K Input dimension (rows in weight matrix)
      * @param groupSize Quantization group size
      */
-    Int4GroupwiseGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize);
+    Int4GroupwiseGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize,
+        bool useMarlinPrefill = false);
 
     /*!
      * @brief Construct from field collection
@@ -176,6 +177,7 @@ private:
     int32_t mGemmN{};
     int32_t mGemmK{};
     int32_t mGroupSize{};
+    int32_t mUseMarlinPrefill{0};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;

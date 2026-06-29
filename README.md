@@ -377,3 +377,183 @@ Shapes used by the live path:
 ## Upstream Documentation
 
 For the original TensorRT-Edge-LLM overview, installation guide, and supported-platform matrix, see [README_nvidia.md](README_nvidia.md) and the upstream NVIDIA documentation linked there.
+
+## 코드 사용법(0601)
+
+## Alpamayo path
+python3 -m planner_live.planner_live_service   
+  --server-url http://127.0.0.1:18080
+  --engine-dir /workspace/models/alpamayo_runtime/engines/alpa1.5   
+  --multimodal-engine-dir /workspace/models/alpamayo_runtime/engines/alpa15_visual_fp8_rebuild   
+  --fm-engine /workspace/models/alpamayo_runtime/fm/flowmatching_20260424_trt_fp8/engine_thor/teacher_structured_student_reflow_consistency_step4_mlp6144_one_step_fp8_s3328_thor.plan   --diffusion-num-steps 2   
+  --alpamayo-fm-use-prefill-kv   
+  --enable-udp-bridge   
+  --udp-host 10.179.113.253   
+  --udp-port 5005   
+  --udp-payload-mode text_json   
+  --udp-full-plan   
+  --udp-send-mode on_result   
+  --enable-udp-opencv-ui
+
+## reference path
+python3 scripts/replay_gnss_local_path_udp.py   --global-path-csv /workspace/alpamayo_vlm/output/live_global_path_run01/global_path_smoothed.csv   --output-root /workspace/alpamayo_vlm/output/live_global_path_follow_run01   --live-follow   --send   --send-hz 10.0   --udp-host 10.179.113.253   --udp-port 5005   --sensor-health-url http://127.0.0.1:18080/healthz   --max-forward-m 20.0   --live-heading-source auto   --enable-opencv-ui
+
+## seed 23
+python3 -m planner_live.planner_live_service \
+  --server-url http://127.0.0.1:18080 \
+  --engine-dir /workspace/models/alpamayo_runtime/engines/alpa1.5 \
+  --multimodal-engine-dir /workspace/models/alpamayo_runtime/engines/alpa1.5_visual_fp8_rebuild \
+  --fm-engine /workspace/models/alpamayo_runtime/fm/flowmatching_20260424_trt_fp8/engine_thor/teacher_structured_student_reflow_consistency_step4_mlp6144_one_step_fp8_s3328_thor.plan \
+  --diffusion-seed 23 \
+  --diffusion-num-steps 2 \
+  --alpamayo-fm-use-prefill-kv \
+  --runtime-input-mode files \
+  --staging-root /dev/shm/alpamayo_planner_live_staging \
+  --staging-image-format ppm \
+  --live-low-latency \
+  --enable-udp-bridge \
+  --udp-host 10.179.113.253 \
+  --udp-port 5005 \
+  --udp-payload-mode text_json \
+  --udp-full-plan \
+  --udp-send-mode on_result \
+  --enable-udp-opencv-ui
+
+## seed 23 - path 보정
+## 송신 시점 기준으로 tx_time_us - t0_us만큼 앞부분을 건너뛰고, 그 지점을 새 (0,0) 기준으로 다시 잡아서 보냄
+python3 -m planner_live.planner_live_service \
+  --server-url http://127.0.0.1:18080 \
+  --engine-dir /workspace/models/alpamayo_runtime/engines/alpa1.5 \
+  --multimodal-engine-dir /workspace/models/alpamayo_runtime/engines/alpa1.5_visual_fp8_rebuild \
+  --fm-engine /workspace/models/alpamayo_runtime/fm/flowmatching_20260424_trt_fp8/engine_thor/teacher_structured_student_reflow_consistency_step4_mlp6144_one_step_fp8_s3328_thor.plan \
+  --diffusion-seed 23 \
+  --diffusion-num-steps 2 \
+  --alpamayo-fm-use-prefill-kv \
+  --runtime-input-mode files \
+  --staging-root /dev/shm/alpamayo_planner_live_staging \
+  --staging-image-format ppm \
+  --live-low-latency \
+  --enable-udp-bridge \
+  --udp-host 172.17.27.253 \
+  --udp-port 5005 \
+  --udp-payload-mode text_json \
+  --udp-full-plan \
+  --udp-latency-compensate-full-plan \
+  --udp-send-mode on_result \
+  --enable-udp-opencv-ui
+
+
+  ## 경로 플래닝 단에서 잘라서 10hz로 보내는거
+  python3 -m planner_live.planner_live_service \
+    --server-url http://127.0.0.1:18080 \
+    --engine-dir /workspace/models/alpamayo_runtime/engines/alpa1.5 \
+    --multimodal-engine-dir /workspace/models/alpamayo_runtime/engines/alpa1.5_visual_fp8_rebuild \
+    --fm-engine /workspace/models/alpamayo_runtime/fm/flowmatching_20260424_trt_fp8/engine_thor/teacher_structured_student_reflow_consistency_step4_mlp6144_one_step_fp8_s3328_thor.plan \
+    --diffusion-seed 23 \
+    --diffusion-num-steps 2 \
+    --alpamayo-fm-use-prefill-kv \
+    --runtime-input-mode files \
+    --staging-root /dev/shm/alpamayo_planner_live_staging \
+    --staging-image-format ppm \
+    --live-low-latency \
+    --enable-udp-bridge \
+    --udp-host 172.17.27.253 \
+    --udp-port 5005 \
+    --udp-payload-mode text_json \
+    --udp-full-plan \
+    --udp-send-mode on_result \
+    --enable-path-manager \
+    --path-manager-rate-hz 10 \
+    --path-manager-health-url http://127.0.0.1:18080/healthz \
+    --path-manager-max-plan-age-s 3.0 \
+    --path-manager-min-plan-arc-m 2.0 \
+    --path-manager-min-remaining-distance-m 2.0 \
+    --path-manager-max-projection-distance-m 5.0 \
+    --path-manager-output-points 65 \
+    --enable-udp-opencv-ui
+
+  ## 경로 blend
+  python3 -m planner_live.planner_live_service \
+    --server-url http://127.0.0.1:18080 \
+    --engine-dir /workspace/models/alpamayo_runtime/engines/alpa1.5 \
+    --multimodal-engine-dir /workspace/models/alpamayo_runtime/engines/alpa1.5_visual_fp8_rebuild \
+    --fm-engine /workspace/models/alpamayo_runtime/fm/flowmatching_20260424_trt_fp8/engine_thor/teacher_structured_student_reflow_consistency_step4_mlp6144_one_step_fp8_s3328_thor.plan \
+    --diffusion-seed 23 \
+    --diffusion-num-steps 2 \
+    --alpamayo-fm-use-prefill-kv \
+    --runtime-input-mode files \
+    --staging-root /dev/shm/alpamayo_planner_live_staging \
+    --staging-image-format ppm \
+    --live-low-latency \
+    --enable-udp-bridge \
+    --udp-host 192.168.43.1 \
+    --udp-port 5005 \
+    --udp-payload-mode text_json \
+    --udp-full-plan \
+    --udp-send-mode on_result \
+    --enable-path-manager \
+    --path-manager-rate-hz 10 \
+    --path-manager-health-url http://127.0.0.1:18080/healthz \
+    --path-manager-max-plan-age-s 3.0 \
+    --path-manager-min-plan-arc-m 2.0 \
+    --path-manager-min-remaining-distance-m 2.0 \
+    --path-manager-max-projection-distance-m 5.0 \
+    --path-manager-output-points 65 \
+    --path-manager-plan-blend-s 0.5 \
+    --enable-udp-opencv-ui
+
+  ## FLEX
+  python3 -m planner_live.planner_live_service \
+  --server-url http://127.0.0.1:18080 \
+  --engine-dir /workspace/models/student_weights/engines/flex_k512_fp16/llm \
+  --multimodal-engine-dir /workspace/models/student_weights/engines/flex_k512_fp16 \
+  --fm-engine /workspace/models/student_weights/engines/flex_k512_fp16/ae28/ae28_single_step.plan \
+  --diffusion-seed 42 \
+  --diffusion-num-steps 4 \
+  --alpamayo-fm-use-prefill-kv \
+  --runtime-input-mode files \
+  --staging-root /dev/shm/alpamayo_planner_live_staging \
+  --staging-image-format ppm \
+  --live-low-latency \
+  --enable-udp-bridge \
+  --udp-host 172.17.27.253 \
+  --udp-port 5005 \
+  --udp-payload-mode text_json \
+  --udp-full-plan \
+  --udp-send-mode on_result \
+  --enable-udp-opencv-ui
+
+
+  ## 6/22 best
+python3 -m planner_live.planner_live_service \
+  --server-url http://127.0.0.1:18080 \
+  --engine-dir /workspace/models/alpamayo_runtime/engines/alpa1.5 \
+  --multimodal-engine-dir /workspace/models/alpamayo_runtime/engines/alpa1.5_visual_fp8_rebuild \
+  --fm-engine /workspace/models/alpamayo_runtime/fm/flowmatching_20260424_trt_fp8/engine_thor/teacher_structured_student_reflow_consistency_step4_mlp6144_one_step_fp8_s3328_thor.plan \
+  --diffusion-seed 23 \
+  --diffusion-num-steps 2 \
+  --alpamayo-fm-use-prefill-kv \
+  --runtime-input-mode files \
+  --staging-root /dev/shm/alpamayo_planner_live_staging \
+  --staging-image-format ppm \
+  --live-low-latency \
+  --enable-udp-bridge \
+  --udp-host 192.168.43.1 \
+  --udp-port 5005 \
+  --udp-payload-mode text_json \
+  --udp-full-plan \
+  --udp-latency-compensate-full-plan \
+  --udp-previous-path-blend-ratio 0.0 \
+  --udp-previous-path-blend-max-age-s 3.0 \
+  --udp-send-mode on_result \
+  --enable-udp-opencv-ui \
+  --udp-save-path-log \
+  --udp-path-log-dir /workspace/alpamayo_vlm/output/live_path_logs/seed23_direct_blend00_test1 
+
+  python3 scripts/record_live_gnss_global_path.py \
+    --output-root /workspace/alpamayo_vlm/output/live_gt_logs/seed23_direct_blend00_test1 \
+    --output-name gnss_gt \
+    --gnss-source healthz \
+    --sensor-health-url http://127.0.0.1:18080/healthz \
+    --record-hz 10 \
+    --no-review-ui

@@ -113,6 +113,10 @@ public:
     //! \return Optional input tensors vector containing deepstack features
     rt::OptionalInputTensors getDeepstackFeatures() override;
 
+    //! \brief Get output embeddings from ViT or FLEX scene encoder when present
+    //! \return Reference to output embedding tensor
+    rt::Tensor& getOutputEmbedding() override;
+
     //! \brief Get cached multimodal position IDs used to construct mRoPE
     //! \return Optional tensor reference with shape [batch_size, 3, max_position_embeddings]
     rt::OptionalInputTensor getPositionIds() override;
@@ -177,6 +181,10 @@ private:
     void getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,
         std::vector<std::vector<int64_t>> const& imageGridTHWs) noexcept;
 
+    //! \brief Get FLEX-compressed 1D multi-dimensional RoPE position indices
+    //! \param[in] batchInputIds Batch of input token IDs
+    void getFlexMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds) noexcept;
+
     //! \brief Generate multi-dimensional RoPE parameters
     //! \param[in] batchInputIds Batch of input token IDs
     //! \param[in] imageGridTHWs Image grid dimensions (Temporal, Height, Width)
@@ -200,6 +208,15 @@ private:
     //! \throws std::runtime_error if a CUDA error occurs
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int64_t>>& imageGridTHWs,
         std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
+
+    //! \brief Try to load optional FLEX scene encoder from a sibling flex/flex.engine
+    //! \param[in] engineDir Path to visual engine directory
+    //! \param[in] stream CUDA stream for profile activation
+    //! \return True if no FLEX engine exists or if it was loaded successfully
+    bool tryLoadFlexEngine(std::string const& engineDir, cudaStream_t stream);
+
+    //! \brief Populate FLEX camera/time metadata tensors for the active 4-camera x 4-frame Alpamayo request
+    bool populateFlexMetadata(int64_t totalImageTokens, cudaStream_t stream) noexcept;
 
     QwenViTConfig mConfig{};                       //!< Qwen-VL configuration
     rt::Tensor mVitInput{};                        //!< Vision encoder input tensor
@@ -228,6 +245,24 @@ private:
     std::vector<rt::Tensor> mDeepstackFeatures{}; //!< Deepstack features tensors
     std::filesystem::path mActiveDebugDumpDir{};  //!< Active debug dump dir for preprocess-stage artifacts
     int64_t mActiveDebugImageIndex{0};            //!< Current image index for preprocess-stage artifacts
+
+    bool mFlexEnabled{false};                                   //!< Whether optional FLEX scene encoder is active
+    int64_t mFlexSceneTokensPerImage{32};                       //!< FLEX scene-token budget per image
+    int64_t mFlexMaxSceneTokens{512};                           //!< FLEX K512 output token capacity
+    int64_t mFlexExpectedVisualTokens{2880};                    //!< Current FLEX export expects 16 * 180 ViT tokens
+    std::unique_ptr<nvinfer1::IRuntime> mFlexRuntime{};         //!< TensorRT runtime for FLEX engine
+    std::unique_ptr<nvinfer1::ICudaEngine> mFlexEngine{};       //!< FLEX scene encoder engine
+    std::unique_ptr<nvinfer1::IExecutionContext> mFlexContext{}; //!< FLEX execution context
+    rt::Tensor mFlexOutputEmbedding{};                          //!< FLEX scene embeddings [512, hidden]
+    std::vector<rt::Tensor> mFlexDeepstackFeatures{};            //!< FLEX scene deepstack features [512, hidden]
+    rt::Tensor mFlexCameraIdsHost{};                             //!< Host FLEX camera ids [1, 2880]
+    rt::Tensor mFlexCameraIdsDevice{};                           //!< Device FLEX camera ids [1, 2880]
+    rt::Tensor mFlexRelativeTimesHost{};                         //!< Host FLEX relative times [1, 2880, 1]
+    rt::Tensor mFlexRelativeTimesDevice{};                       //!< Device FLEX relative times [1, 2880, 1]
+    bool mFlexHasDeepstackInputs{false};                         //!< FLEX engine consumes ViT deepstack features
+    bool mFlexHasDeepstackOutputs{false};                        //!< FLEX engine emits scene deepstack features
+    bool mFlexHasMetadataInputs{false};                          //!< FLEX engine consumes camera/time metadata
+    std::vector<int64_t> mFlexRopeDeltaCorrections{};           //!< Per-batch original-vs-compressed token delta
 
     int32_t mLLMMaxBatchSize{0};      //!< Maximum batch size from LLM engine
     int32_t mLLMMaxSequenceLength{0}; //!< Maximum sequence length from LLM engine

@@ -36,6 +36,7 @@
 #include "marlin/scalar_type.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 
 #include "marlin_moe_wna16/ops.cu"
@@ -51,6 +52,51 @@ using namespace trt_edgellm::format;
 // Internal constants for FP32 reduction (always enabled for accuracy)
 constexpr bool kUseFp32Reduce = true;
 constexpr bool kUseAtomicAdd = false;
+
+namespace
+{
+
+__global__ void prepareDenseMarlinMetadataKernel(int32_t* sortedTokenIds, int32_t* expertIds,
+    int32_t* numTokensPostPadded, float* topkWeights, int32_t numTokens, int32_t paddedTokens, int32_t blockSize)
+{
+    int32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < paddedTokens)
+    {
+        sortedTokenIds[idx] = idx < numTokens ? idx : numTokens;
+        topkWeights[idx] = 1.0f;
+    }
+    if (idx < (paddedTokens + blockSize - 1) / blockSize)
+    {
+        expertIds[idx] = 0;
+    }
+    if (idx == 0)
+    {
+        numTokensPostPadded[0] = paddedTokens;
+    }
+}
+
+int getDenseMarlinConfigMode() noexcept
+{
+    static int const modeValue = []() {
+        char const* mode = std::getenv("TRT_EDGELLM_DENSE_MARLIN_CONFIG");
+        if (mode == nullptr || mode[0] == '\0')
+        {
+            return 0;
+        }
+        return std::atoi(mode);
+    }();
+    return modeValue;
+}
+
+} // namespace
+
+void prepareDenseMarlinMetadata(int32_t* sortedTokenIds, int32_t* expertIds, int32_t* numTokensPostPadded,
+    float* topkWeights, int32_t numTokens, int32_t paddedTokens, int32_t blockSize, cudaStream_t stream)
+{
+    int32_t const blocks = static_cast<int32_t>(divUp(paddedTokens, 256));
+    prepareDenseMarlinMetadataKernel<<<blocks, 256, 0, stream>>>(
+        sortedTokenIds, expertIds, numTokensPostPadded, topkWeights, numTokens, paddedTokens, blockSize);
+}
 
 void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tensor const& weights,
     rt::Tensor const& scales, rt::Tensor const& sortedTokenIds, rt::Tensor const& expertIds,
@@ -182,6 +228,124 @@ void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tens
     );
 }
 
+void denseAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tensor const& weights,
+    rt::Tensor const& scales, rt::Tensor& workspace, int64_t blockSize, cudaStream_t stream)
+{
+    // Validate input shapes
+    auto const inputShape = input.getShape();
+    auto const outputShape = output.getShape();
+    auto const weightsShape = weights.getShape();
+    auto const scalesShape = scales.getShape();
+
+    check::check(inputShape.getNumDims() == 2, "Input must be 2D tensor [numTokens, hiddenDim]");
+    check::check(outputShape.getNumDims() == 2, "Output must be 2D tensor [numTokens, outDim]");
+    check::check(weightsShape.getNumDims() == 3, "Weights must be 3D tensor [1, K/16, 2*N]");
+    check::check(scalesShape.getNumDims() == 3, "Scales must be 3D tensor [1, numGroups, outDim]");
+
+    int64_t numTokens = inputShape[0];
+    int64_t hiddenDim = inputShape[1];
+    int64_t outDim = outputShape[1];
+    int64_t numGroups = scalesShape[1];
+
+    check::check(outputShape[0] == numTokens, "Output token dimension must match input");
+    check::check(weightsShape[0] == 1, "Dense Marlin weights must use one synthetic expert");
+    check::check(weightsShape[1] == hiddenDim / 16, "Dense Marlin weight K dimension mismatch");
+    check::check(weightsShape[2] == 2 * outDim, "Dense Marlin weight N dimension mismatch");
+    check::check(scalesShape[0] == 1, "Dense Marlin scales must use one synthetic expert");
+    check::check(scalesShape[2] == outDim, "Dense Marlin scale N dimension mismatch");
+
+    // Validate data types
+    check::check(input.getDataType() == nvinfer1::DataType::kHALF, "Input must be FP16");
+    check::check(output.getDataType() == nvinfer1::DataType::kHALF, "Output must be FP16");
+    check::check(weights.getDataType() == nvinfer1::DataType::kINT32, "Weights must be INT32 (Marlin packed)");
+    check::check(scales.getDataType() == nvinfer1::DataType::kHALF, "Scales must be FP16");
+    check::check(workspace.getDataType() == nvinfer1::DataType::kINT32, "workspace must be INT32");
+
+    if (blockSize != 8)
+    {
+        check::check(blockSize % 16 == 0, fmtstr("blockSize %ld must be divisible by 16", blockSize));
+        check::check(blockSize >= 16 && blockSize <= 64, fmtstr("blockSize %ld must be in [16, 64]", blockSize));
+    }
+
+    int groupSize = (numGroups > 1) ? static_cast<int>(hiddenDim / numGroups) : -1;
+
+    int dev;
+    int sms;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+
+    trt_edgellm::marlin_dtypes::ScalarType aType = trt_edgellm::marlin_dtypes::kFloat16;
+    trt_edgellm::marlin_dtypes::ScalarType bType = trt_edgellm::marlin_dtypes::kU4;
+    trt_edgellm::marlin_dtypes::ScalarType cType = trt_edgellm::marlin_dtypes::kFloat16;
+    trt_edgellm::marlin_dtypes::ScalarType sType = trt_edgellm::marlin_dtypes::kFloat16;
+
+    int threadK = -1;
+    int threadN = -1;
+    int blocksPerSm = -1;
+    switch (getDenseMarlinConfigMode())
+    {
+    case 1:
+        threadK = 64;
+        threadN = 128;
+        blocksPerSm = 1;
+        break;
+    case 2:
+        threadK = 64;
+        threadN = 128;
+        blocksPerSm = 2;
+        break;
+    case 3:
+        threadK = 64;
+        threadN = 256;
+        blocksPerSm = 1;
+        break;
+    case 4:
+        threadK = 64;
+        threadN = 256;
+        blocksPerSm = 2;
+        break;
+    default: break;
+    }
+
+    int32_t* workspaceBasePtr = static_cast<int32_t*>(workspace.rawPointer());
+    int64_t paddedTokens = static_cast<int64_t>(divUp(static_cast<int32_t>(numTokens), static_cast<int32_t>(blockSize)))
+        * blockSize;
+    int64_t locksSize = std::min((outDim / marlin_moe_wna16::min_thread_n)
+            * static_cast<int64_t>(divUp(paddedTokens, blockSize)),
+        static_cast<int64_t>(sms * 4));
+    locksSize = static_cast<int64_t>(divUp(locksSize, static_cast<int64_t>(4))) * 4;
+
+    void* locksPtr = workspaceBasePtr;
+    void* cTmpPtr = workspaceBasePtr + locksSize;
+    CUDA_CHECK(cudaMemsetAsync(locksPtr, 0, locksSize * sizeof(int32_t), stream));
+
+    marlin_moe_wna16::marlin_mm(const_cast<void*>(input.rawPointer()), const_cast<void*>(weights.rawPointer()),
+        output.rawPointer(), cTmpPtr, nullptr, nullptr, const_cast<void*>(scales.rawPointer()), nullptr, nullptr,
+        nullptr, nullptr, nullptr,
+        nullptr, // sortedTokenIds: nullptr selects dense identity row mapping
+        nullptr, // expertIds
+        nullptr, // numTokensPostPadded
+        nullptr, // topkWeights
+        static_cast<int>(blockSize),
+        1,     // num_experts
+        1,     // top_k
+        false, // mul_topk_weights
+        static_cast<int>(numTokens), static_cast<int>(outDim), static_cast<int>(hiddenDim), locksPtr, aType, bType,
+        cType, sType,
+        false, // has_bias
+        false, // has_act_order
+        true,  // is_k_full
+        false, // has_zp
+        static_cast<int>(numGroups), groupSize, dev, stream,
+        threadK,
+        threadN,
+        sms,
+        blocksPerSm,
+        kUseAtomicAdd, kUseFp32Reduce,
+        false // is_zp_float
+    );
+}
+
 int64_t getMoeMarlinWorkspaceSize(int64_t numTokensPadded, int64_t outDim, int64_t moeBlockSize, int64_t numSMs)
 {
     // Locks size (INT32)
@@ -222,6 +386,20 @@ void moeAwqW4A16MarlinGemm(rt::Tensor const&, rt::Tensor&, rt::Tensor const&, rt
 {
     throw std::runtime_error(
         "INT4 MoE Marlin GEMM requires CUDA 11.8 or later. Please use CUDA 11.8+ for INT4 MoE support.");
+}
+
+void denseAwqW4A16MarlinGemm(
+    rt::Tensor const&, rt::Tensor&, rt::Tensor const&, rt::Tensor const&, rt::Tensor&, int64_t, cudaStream_t)
+{
+    throw std::runtime_error(
+        "INT4 dense Marlin GEMM requires CUDA 11.8 or later. Please use CUDA 11.8+ for INT4 support.");
+}
+
+void prepareDenseMarlinMetadata(
+    int32_t*, int32_t*, int32_t*, float*, int32_t, int32_t, int32_t, cudaStream_t)
+{
+    throw std::runtime_error(
+        "INT4 dense Marlin GEMM requires CUDA 11.8 or later. Please use CUDA 11.8+ for INT4 support.");
 }
 
 int64_t getMoeMarlinWorkspaceSize(int64_t, int64_t, int64_t, int64_t)

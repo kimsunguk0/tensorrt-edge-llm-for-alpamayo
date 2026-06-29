@@ -255,6 +255,18 @@ bool AlpamayoPostVlmRuntime::loadEgoHistory(LLMGenerationRequest const& request,
         return false;
     }
     auto const& first = request.requests.front();
+    if (!first.egoHistoryXYZ.empty())
+    {
+        check::check(!first.egoHistoryXYZShape.empty(), "Inline ego_history_xyz shape is empty");
+        check::check(!first.egoHistoryRot.empty(), "FM runtime requires inline ego_history_rot when inline xyz is used");
+        check::check(!first.egoHistoryRotShape.empty(), "Inline ego_history_rot shape is empty");
+        egoHistoryXyz = first.egoHistoryXYZ;
+        egoHistoryXyzShape = first.egoHistoryXYZShape;
+        egoHistoryRot = first.egoHistoryRot;
+        egoHistoryRotShape = first.egoHistoryRotShape;
+        return true;
+    }
+
     check::check(!first.egoHistoryXYZNpy.empty(), "FM runtime requires ego_history_xyz_npy in the request");
     check::check(!first.egoHistoryRotNpy.empty(), "FM runtime requires ego_history_rot_npy in the request");
 

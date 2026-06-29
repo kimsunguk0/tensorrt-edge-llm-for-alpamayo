@@ -46,6 +46,7 @@ inline std::string const kLLM_LAYER = "llm_layer";                         //!< 
 inline std::string const kMULTIMODAL_PROCESSING = "multimodal_processing"; //!< Multimodal processing stage (legacy)
 inline std::string const kAUDIO_ENCODER = "audio_encoder";                 //!< Audio encoder stage
 inline std::string const kVISION_ENCODER = "vision_encoder";               //!< Vision encoder stage
+inline std::string const kFLEX_ENCODER = "flex_encoder";                   //!< FLEX scene encoder stage
 inline std::string const kEAGLE_DRAFT_PREFILL = "eagle_draft_prefill";     //!< Eagle draft prefill stage
 inline std::string const kEAGLE_CONSTRUCT_DRAFT_TREE = "eagle_construct_draft_tree"; //!< Eagle draft tree construction
 inline std::string const kEAGLE_BASE_VERIFICATION = "eagle_base_verification";       //!< Eagle base verification stage

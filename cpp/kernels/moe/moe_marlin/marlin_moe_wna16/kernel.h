@@ -55,7 +55,8 @@ template <trt_edgellm::marlin_dtypes::ScalarTypeId const a_type_id, // A ScalarT
                                                                     // fetch pipeline
     int const group_blocks,                                         // number of consecutive 16x16 blocks
                                                                     // with a separate quantization scale
-    bool const is_zp_float                                          // is zero point of float16 type?
+    bool const is_zp_float,                                         // is zero point of float16 type?
+    bool const dense_identity                                       // skip MoE metadata and use identity row mapping
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 

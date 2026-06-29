@@ -866,13 +866,16 @@ bool LLMInferenceRuntime::handleRequest(
         kernel::embeddingLookup(mInputIds, mEmbeddingTable, mInputsEmbeds, stream);
     }
 
-    // Process deepstack features: perform embedding assembly if vision runner is available
-    // Note: Deepstack features are only provided by VisionRunner, not Qwen3OmniAudioRunner
+    // Process deepstack features. FLEX-compressed vision does not expose scene-token deepstack features,
+    // so missing feature tensors are represented as zero embeddings with the required engine shape.
     rt::OptionalInputTensors deepstackEmbeds{};
     rt::OptionalInputTensors deepstackFeatures{};
-    if (mEngineConfig.numDeepstackFeatures > 0 && mVisionRunner)
+    if (mEngineConfig.numDeepstackFeatures > 0)
     {
-        deepstackFeatures = mVisionRunner->getDeepstackFeatures();
+        if (mVisionRunner)
+        {
+            deepstackFeatures = mVisionRunner->getDeepstackFeatures();
+        }
 
         // Prepare multimodal indices for deepstack assembly (needed when imageTokenId < vocabSize)
         rt::OptionalInputTensor deepstackMultimodalIndices{std::nullopt};
@@ -881,16 +884,23 @@ bool LLMInferenceRuntime::handleRequest(
             deepstackMultimodalIndices = std::ref(mMultimodalIndices);
         }
 
-        for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
+        for (int32_t idx = 0; idx < mEngineConfig.numDeepstackFeatures; ++idx)
         {
-            rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
-
-            // Reshape and perform embedding assembly for this feature
             check::check(
                 mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
                 "Tensor reshape failed");
-            kernel::assembleDeepstackEmbedding(mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx],
-                stream, mEngineConfig.imageTokenId, deepstackMultimodalIndices);
+            if (idx < static_cast<int32_t>(deepstackFeatures.size()))
+            {
+                rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
+                kernel::assembleDeepstackEmbedding(mInputIds, featureTensor, mEngineConfig.vocabSize,
+                    mDeepstackEmbeds[idx], stream, mEngineConfig.imageTokenId, deepstackMultimodalIndices);
+            }
+            else
+            {
+                size_t const numBytes = mDeepstackEmbeds[idx].getShape().volume()
+                    * rt::utils::getTypeSize(mDeepstackEmbeds[idx].getDataType());
+                CUDA_CHECK(cudaMemsetAsync(mDeepstackEmbeds[idx].rawPointer(), 0, numBytes, stream));
+            }
 
             // Add to output vector (engine will bind by index)
             deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
@@ -1189,9 +1199,10 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
 
     // Process deepstack features: perform embedding lookup if vision runner is available
     rt::OptionalInputTensors deepstackEmbeds{};
-    if (mEngineConfig.numDeepstackFeatures > 0 && mVisionRunner)
+    if (mEngineConfig.numDeepstackFeatures > 0)
     {
-        rt::OptionalInputTensors deepstackFeatures = mVisionRunner->getDeepstackFeatures();
+        rt::OptionalInputTensors deepstackFeatures = mVisionRunner ? mVisionRunner->getDeepstackFeatures()
+                                                                   : rt::OptionalInputTensors{};
 
         rt::OptionalInputTensor deepstackMultimodalIndices{std::nullopt};
         if (mMultimodalIndices.getShape().volume() > 0)
@@ -1199,15 +1210,23 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
             deepstackMultimodalIndices = std::ref(mMultimodalIndices);
         }
 
-        for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
+        for (int32_t idx = 0; idx < mEngineConfig.numDeepstackFeatures; ++idx)
         {
-            rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
-
             check::check(
                 mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
                 "Tensor reshape failed");
-            kernel::assembleDeepstackEmbedding(mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx],
-                stream, mEngineConfig.imageTokenId, deepstackMultimodalIndices);
+            if (idx < static_cast<int32_t>(deepstackFeatures.size()))
+            {
+                rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
+                kernel::assembleDeepstackEmbedding(mInputIds, featureTensor, mEngineConfig.vocabSize,
+                    mDeepstackEmbeds[idx], stream, mEngineConfig.imageTokenId, deepstackMultimodalIndices);
+            }
+            else
+            {
+                size_t const numBytes = mDeepstackEmbeds[idx].getShape().volume()
+                    * rt::utils::getTypeSize(mDeepstackEmbeds[idx].getDataType());
+                CUDA_CHECK(cudaMemsetAsync(mDeepstackEmbeds[idx].rawPointer(), 0, numBytes, stream));
+            }
 
             deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
         }

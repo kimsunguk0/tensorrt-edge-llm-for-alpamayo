@@ -75,6 +75,33 @@ void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tens
     int64_t topK, bool mulTopkWeights, cudaStream_t stream);
 
 /*!
+ * @brief Dense W4A16 GEMM using the Marlin AWQ kernel.
+ *
+ * This is a dense identity wrapper around the Marlin kernel. Decode can keep
+ * using the existing GEMV path while prefill uses Marlin's prepacked GEMM
+ * schedule without MoE token metadata.
+ *
+ * @param input Input activations [numTokens, hiddenDim] (FP16)
+ * @param output Output tensor [numTokens, outDim] (FP16)
+ * @param weights Marlin-repacked INT4 weights [1, K/16, 2*N] as INT32 view
+ * @param scales Marlin-permuted scales [1, K/groupSize, N] (FP16)
+ * @param workspace Workspace buffer sized by getMoeMarlinWorkspaceSize()
+ * @param blockSize Dense processing block size, normally 32 for prefill
+ * @param stream CUDA stream
+ */
+void denseAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tensor const& weights,
+    rt::Tensor const& scales, rt::Tensor& workspace, int64_t blockSize, cudaStream_t stream);
+
+/*!
+ * @brief Fill identity metadata for dense Marlin GEMM.
+ *
+ * sortedTokenIds[i] = i for valid tokens and a sentinel >= M for padded slots;
+ * expertIds are all zero; numTokensPostPadded stores the padded token count.
+ */
+void prepareDenseMarlinMetadata(int32_t* sortedTokenIds, int32_t* expertIds, int32_t* numTokensPostPadded,
+    float* topkWeights, int32_t numTokens, int32_t paddedTokens, int32_t blockSize, cudaStream_t stream);
+
+/*!
  * @brief Get required workspace size for MoE Marlin GEMM
  *
  * Returns the total workspace size needed, which includes:

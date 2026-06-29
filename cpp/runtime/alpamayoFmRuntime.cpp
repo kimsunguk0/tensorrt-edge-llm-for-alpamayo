@@ -227,6 +227,19 @@ bool hasDeviceKvSnapshot(AlpamayoFmBranchSnapshot const& snapshot)
         && snapshot.kvCacheTensor.rawPointer() != nullptr;
 }
 
+bool hasIOTensor(nvinfer1::ICudaEngine const* engine, std::string const& name)
+{
+    for (int32_t i = 0; i < engine->getNbIOTensors(); ++i)
+    {
+        char const* tensorName = engine->getIOTensorName(i);
+        if (tensorName != nullptr && name == tensorName)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::vector<float> makeNormalX0(int32_t horizon, int32_t actionDim, uint64_t seed)
 {
     std::mt19937_64 rng(seed);
@@ -237,6 +250,77 @@ std::vector<float> makeNormalX0(int32_t horizon, int32_t actionDim, uint64_t see
         v = dist(rng);
     }
     return values;
+}
+
+std::vector<uint16_t> floatsToHalfWords(float const* src, size_t count)
+{
+    std::vector<uint16_t> words(count, 0);
+    for (size_t i = 0; i < count; ++i)
+    {
+        words[i] = static_cast<__half_raw>(__float2half(src[i])).x;
+    }
+    return words;
+}
+
+std::vector<float> halfWordsToFloats(uint16_t const* src, size_t count)
+{
+    std::vector<float> values(count, 0.0F);
+    for (size_t i = 0; i < count; ++i)
+    {
+        __half_raw raw{};
+        raw.x = src[i];
+        values[i] = __half2float(__half{raw});
+    }
+    return values;
+}
+
+void copyFloatVectorToDeviceTyped(void* dst, nvinfer1::DataType dtype, std::vector<float> const& values)
+{
+    if (dtype == nvinfer1::DataType::kFLOAT)
+    {
+        memcpyToDevice(dst, values.data(), values.size() * sizeof(float));
+        return;
+    }
+    if (dtype == nvinfer1::DataType::kHALF)
+    {
+        auto words = floatsToHalfWords(values.data(), values.size());
+        memcpyToDevice(dst, words.data(), words.size() * sizeof(uint16_t));
+        return;
+    }
+    throw std::runtime_error("Unsupported Alpamayo AE action dtype: " + dataTypeName(dtype));
+}
+
+void copyScalarToDeviceTyped(void* dst, nvinfer1::DataType dtype, float value)
+{
+    if (dtype == nvinfer1::DataType::kFLOAT)
+    {
+        memcpyToDevice(dst, &value, sizeof(float));
+        return;
+    }
+    if (dtype == nvinfer1::DataType::kHALF)
+    {
+        uint16_t word = static_cast<__half_raw>(__float2half(value)).x;
+        memcpyToDevice(dst, &word, sizeof(uint16_t));
+        return;
+    }
+    throw std::runtime_error("Unsupported Alpamayo AE timestep dtype: " + dataTypeName(dtype));
+}
+
+void copyDeviceTypedToFloatVector(std::vector<float>& dst, void const* src, nvinfer1::DataType dtype)
+{
+    if (dtype == nvinfer1::DataType::kFLOAT)
+    {
+        memcpyToHost(dst.data(), src, dst.size() * sizeof(float));
+        return;
+    }
+    if (dtype == nvinfer1::DataType::kHALF)
+    {
+        std::vector<uint16_t> words(dst.size(), 0);
+        memcpyToHost(words.data(), src, words.size() * sizeof(uint16_t));
+        dst = halfWordsToFloats(words.data(), words.size());
+        return;
+    }
+    throw std::runtime_error("Unsupported Alpamayo AE output dtype: " + dataTypeName(dtype));
 }
 
 std::vector<uint8_t> convertHalfBytesToBf16Bytes(std::vector<uint8_t> const& src)
@@ -324,6 +408,94 @@ void copyKvCachePrefixDeviceToDevice(
     }
     CUDA_CHECK(cudaMemcpy2DAsync(
         dst, dstPitch, src, srcPitch, copyWidth, static_cast<size_t>(outerCount), cudaMemcpyDeviceToDevice, stream));
+}
+
+void checkAeKvShapes(Coords const& srcShape, nvinfer1::Dims const& dstShape, int32_t activeLen)
+{
+    check::check(srcShape.getNumDims() == 6, "AE28 source KV snapshot rank must be 6");
+    check::check(dstShape.nbDims == 5, "AE28 past key/value rank must be 5");
+    check::check(srcShape[2] == 2, "AE28 source KV snapshot must contain key/value selector dimension");
+    check::check(srcShape[0] == dstShape.d[0] && srcShape[1] == dstShape.d[1] && srcShape[3] == dstShape.d[2]
+            && srcShape[5] == dstShape.d[4],
+        "AE28 source KV snapshot shape does not match past key/value engine shape");
+    check::check(activeLen >= 0 && activeLen <= dstShape.d[3], "AE28 active KV length exceeds past key/value length");
+    check::check(srcShape[4] >= activeLen, "AE28 source KV snapshot is shorter than active KV length");
+}
+
+void copySplitKvCachePrefixDeviceToDevice(void* dstKeys, void* dstValues, nvinfer1::Dims const& dstShape,
+    void const* src, Coords const& srcShape, int32_t activeLen, size_t elementBytes, cudaStream_t stream)
+{
+    checkAeKvShapes(srcShape, dstShape, activeLen);
+    int64_t const layers = dstShape.d[0];
+    int64_t const batch = dstShape.d[1];
+    int64_t const heads = dstShape.d[2];
+    int64_t const dstSeqLen = dstShape.d[3];
+    int64_t const srcSeqLen = srcShape[4];
+    int64_t const headDim = dstShape.d[4];
+    size_t const dstBytes = static_cast<size_t>(dimsVolume(dstShape)) * elementBytes;
+    size_t const copyBytes = static_cast<size_t>(activeLen) * headDim * elementBytes;
+
+    CUDA_CHECK(cudaMemsetAsync(dstKeys, 0, dstBytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(dstValues, 0, dstBytes, stream));
+    if (copyBytes == 0)
+    {
+        return;
+    }
+
+    auto const* srcBytes = static_cast<uint8_t const*>(src);
+    auto* dstKeyBytes = static_cast<uint8_t*>(dstKeys);
+    auto* dstValueBytes = static_cast<uint8_t*>(dstValues);
+    for (int64_t layer = 0; layer < layers; ++layer)
+    {
+        for (int64_t b = 0; b < batch; ++b)
+        {
+            for (int64_t head = 0; head < heads; ++head)
+            {
+                size_t const srcKeyOffset = static_cast<size_t>(
+                    (((((layer * batch + b) * 2 + 0) * heads + head) * srcSeqLen) * headDim)) * elementBytes;
+                size_t const srcValueOffset = static_cast<size_t>(
+                    (((((layer * batch + b) * 2 + 1) * heads + head) * srcSeqLen) * headDim)) * elementBytes;
+                size_t const dstOffset
+                    = static_cast<size_t>((((layer * batch + b) * heads + head) * dstSeqLen) * headDim) * elementBytes;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    dstKeyBytes + dstOffset, srcBytes + srcKeyOffset, copyBytes, cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    dstValueBytes + dstOffset, srcBytes + srcValueOffset, copyBytes, cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+    }
+}
+
+std::vector<uint8_t> splitKvCachePrefixHost(std::vector<uint8_t> const& src, Coords const& srcShape,
+    nvinfer1::Dims const& dstShape, int32_t activeLen, int32_t selector, size_t elementBytes)
+{
+    check::check(selector == 0 || selector == 1, "AE28 KV selector must be 0 or 1");
+    checkAeKvShapes(srcShape, dstShape, activeLen);
+    int64_t const layers = dstShape.d[0];
+    int64_t const batch = dstShape.d[1];
+    int64_t const heads = dstShape.d[2];
+    int64_t const dstSeqLen = dstShape.d[3];
+    int64_t const srcSeqLen = srcShape[4];
+    int64_t const headDim = dstShape.d[4];
+    size_t const srcExpectedBytes = static_cast<size_t>(srcShape.volume()) * elementBytes;
+    check::check(src.size() == srcExpectedBytes, "Unexpected AE28 source KV snapshot byte size");
+    size_t const copyBytes = static_cast<size_t>(activeLen) * headDim * elementBytes;
+    std::vector<uint8_t> dst(static_cast<size_t>(dimsVolume(dstShape)) * elementBytes, 0);
+    for (int64_t layer = 0; layer < layers; ++layer)
+    {
+        for (int64_t b = 0; b < batch; ++b)
+        {
+            for (int64_t head = 0; head < heads; ++head)
+            {
+                size_t const srcOffset = static_cast<size_t>(
+                    (((((layer * batch + b) * 2 + selector) * heads + head) * srcSeqLen) * headDim)) * elementBytes;
+                size_t const dstOffset
+                    = static_cast<size_t>((((layer * batch + b) * heads + head) * dstSeqLen) * headDim) * elementBytes;
+                std::memcpy(dst.data() + dstOffset, src.data() + srcOffset, copyBytes);
+            }
+        }
+    }
+    return dst;
 }
 
 std::vector<float> extractLastHistoryXYZ(std::vector<float> const& data, std::vector<int64_t> const& shape)
@@ -658,16 +830,26 @@ void actionToTrajExact(std::vector<float> const& action, int horizon, std::vecto
 
 struct AlpamayoFmRuntime::Impl
 {
+    enum class EngineKind
+    {
+        kLegacyFm,
+        kAe28,
+    };
+
     struct DeviceBranch
     {
         void* kvCachePtr{nullptr};
         void* attentionMaskPtr{nullptr};
         void* positionIdsPtr{nullptr};
+        void* pastKeysPtr{nullptr};
+        void* pastValuesPtr{nullptr};
     };
 
     struct BranchWorkspace
     {
         CudaBuffer kvCache;
+        CudaBuffer pastKeys;
+        CudaBuffer pastValues;
         CudaBuffer positionIds;
         std::vector<float> attentionMaskHost;
         std::vector<int64_t> positionIdsHost;
@@ -692,28 +874,70 @@ struct AlpamayoFmRuntime::Impl
         context.reset(engine->createExecutionContext());
         check::check(context != nullptr, "Failed to create FM execution context");
 
-        xDims = engine->getTensorShape("x");
-        nextXDims = engine->getTensorShape("next_x");
-        vDims = engine->getTensorShape("v");
-        futureDims = engine->getTensorShape("future_token_embeds");
-        kvDims = engine->getTensorShape("kv_cache");
-        kvDataType = engine->getTensorDataType("kv_cache");
-        maskDims = engine->getTensorShape("attention_mask");
-        posDims = engine->getTensorShape("position_ids");
+        if (hasIOTensor(engine.get(), "noisy_action") && hasIOTensor(engine.get(), "past_keys")
+            && hasIOTensor(engine.get(), "past_values"))
+        {
+            engineKind = EngineKind::kAe28;
+            xDims = engine->getTensorShape("noisy_action");
+            aeTimestepDims = engine->getTensorShape("timestep");
+            posDims = engine->getTensorShape("position_ids");
+            aePastKeyDims = engine->getTensorShape("past_keys");
+            aePastValueDims = engine->getTensorShape("past_values");
+            vDims = engine->getTensorShape("velocity");
+            kvDataType = engine->getTensorDataType("past_keys");
 
-        horizon = xDims.d[1];
-        actionDim = xDims.d[2];
-        maxSeqLen = kvDims.d[4];
-        nDiffusionTokens = posDims.d[2];
-        check::check(horizon > 0 && actionDim > 0 && maxSeqLen > 0 && nDiffusionTokens > 0,
-            "FM engine shapes must be static and positive");
+            check::check(aePastKeyDims.nbDims == 5 && aePastValueDims.nbDims == 5,
+                "AE28 past key/value shapes must be rank 5");
+            check::check(aePastKeyDims.d[0] == aePastValueDims.d[0] && aePastKeyDims.d[1] == aePastValueDims.d[1]
+                    && aePastKeyDims.d[2] == aePastValueDims.d[2] && aePastKeyDims.d[3] == aePastValueDims.d[3]
+                    && aePastKeyDims.d[4] == aePastValueDims.d[4],
+                "AE28 past key/value shapes must match");
 
-        xBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(xDims)) * dataTypeSize(engine->getTensorDataType("x")));
-        tBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(engine->getTensorShape("t"))) * dataTypeSize(engine->getTensorDataType("t")));
-        dtBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(engine->getTensorShape("dt"))) * dataTypeSize(engine->getTensorDataType("dt")));
-        nextXBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(nextXDims)) * dataTypeSize(engine->getTensorDataType("next_x")));
-        vBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(vDims)) * dataTypeSize(engine->getTensorDataType("v")));
-        futureBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(futureDims)) * dataTypeSize(engine->getTensorDataType("future_token_embeds")));
+            horizon = xDims.d[1];
+            actionDim = xDims.d[2];
+            maxSeqLen = aePastKeyDims.d[3];
+            nDiffusionTokens = posDims.d[2];
+            check::check(horizon > 0 && actionDim > 0 && maxSeqLen > 0 && nDiffusionTokens > 0,
+                "AE28 FM engine shapes must be static and positive");
+
+            xBuffer = CudaBuffer(
+                static_cast<size_t>(dimsVolume(xDims)) * dataTypeSize(engine->getTensorDataType("noisy_action")));
+            tBuffer = CudaBuffer(
+                static_cast<size_t>(dimsVolume(aeTimestepDims)) * dataTypeSize(engine->getTensorDataType("timestep")));
+            nextXBuffer = CudaBuffer(
+                static_cast<size_t>(dimsVolume(xDims)) * dataTypeSize(engine->getTensorDataType("noisy_action")));
+            vBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(vDims)) * dataTypeSize(engine->getTensorDataType("velocity")));
+        }
+        else
+        {
+            engineKind = EngineKind::kLegacyFm;
+            xDims = engine->getTensorShape("x");
+            nextXDims = engine->getTensorShape("next_x");
+            vDims = engine->getTensorShape("v");
+            futureDims = engine->getTensorShape("future_token_embeds");
+            kvDims = engine->getTensorShape("kv_cache");
+            kvDataType = engine->getTensorDataType("kv_cache");
+            maskDims = engine->getTensorShape("attention_mask");
+            posDims = engine->getTensorShape("position_ids");
+
+            horizon = xDims.d[1];
+            actionDim = xDims.d[2];
+            maxSeqLen = kvDims.d[4];
+            nDiffusionTokens = posDims.d[2];
+            check::check(horizon > 0 && actionDim > 0 && maxSeqLen > 0 && nDiffusionTokens > 0,
+                "FM engine shapes must be static and positive");
+
+            xBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(xDims)) * dataTypeSize(engine->getTensorDataType("x")));
+            tBuffer = CudaBuffer(
+                static_cast<size_t>(dimsVolume(engine->getTensorShape("t"))) * dataTypeSize(engine->getTensorDataType("t")));
+            dtBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(engine->getTensorShape("dt")))
+                * dataTypeSize(engine->getTensorDataType("dt")));
+            nextXBuffer = CudaBuffer(
+                static_cast<size_t>(dimsVolume(nextXDims)) * dataTypeSize(engine->getTensorDataType("next_x")));
+            vBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(vDims)) * dataTypeSize(engine->getTensorDataType("v")));
+            futureBuffer = CudaBuffer(static_cast<size_t>(dimsVolume(futureDims))
+                * dataTypeSize(engine->getTensorDataType("future_token_embeds")));
+        }
     }
 
     DeviceBranch makeDeviceBranch(AlpamayoFmBranchSnapshot const& snapshot, BranchWorkspace& workspace,
@@ -856,6 +1080,81 @@ struct AlpamayoFmRuntime::Impl
         return branch;
     }
 
+    DeviceBranch makeDeviceBranchAe(AlpamayoFmBranchSnapshot const& snapshot, BranchWorkspace& workspace,
+        AlpamayoFmRunResult::Timing& timing, cudaStream_t stream)
+    {
+        check::check(snapshot.kvCacheDataType == nvinfer1::DataType::kHALF,
+            "AE28 FM runtime supports FLOAT16 VLM KV snapshots only. Got " + dataTypeName(snapshot.kvCacheDataType));
+        check::check(kvDataType == nvinfer1::DataType::kHALF,
+            "AE28 past key/value inputs are expected to be FLOAT16. Got " + dataTypeName(kvDataType));
+        check::check(snapshot.activeLen > 0 && snapshot.activeLen <= maxSeqLen, "Invalid AE28 active KV length");
+
+        DeviceBranch branch;
+        size_t const pastKvBytes = static_cast<size_t>(dimsVolume(aePastKeyDims)) * dataTypeSize(kvDataType);
+        auto const kvAllocStart = SteadyClock::now();
+        bool const keysAllocated = workspace.pastKeys.ensureSize(pastKvBytes);
+        bool const valuesAllocated = workspace.pastValues.ensureSize(pastKvBytes);
+        if (keysAllocated || valuesAllocated)
+        {
+            timing.kvAllocMs += ::trt_edgellm::rt::elapsedMs(kvAllocStart, SteadyClock::now());
+        }
+
+        auto const kvCopyStart = SteadyClock::now();
+        if (hasDeviceKvSnapshot(snapshot))
+        {
+            copySplitKvCachePrefixDeviceToDevice(workspace.pastKeys.ptr, workspace.pastValues.ptr, aePastKeyDims,
+                snapshot.kvCacheTensor.rawPointer(), snapshot.kvCacheShape, snapshot.activeLen, sizeof(uint16_t), stream);
+        }
+        else
+        {
+            auto const kvConvertStart = SteadyClock::now();
+            std::vector<uint8_t> keyBytes = splitKvCachePrefixHost(
+                snapshot.kvCacheBytes, snapshot.kvCacheShape, aePastKeyDims, snapshot.activeLen, 0, sizeof(uint16_t));
+            std::vector<uint8_t> valueBytes = splitKvCachePrefixHost(
+                snapshot.kvCacheBytes, snapshot.kvCacheShape, aePastValueDims, snapshot.activeLen, 1, sizeof(uint16_t));
+            timing.kvConvertMs += ::trt_edgellm::rt::elapsedMs(kvConvertStart, SteadyClock::now());
+            memcpyToDevice(workspace.pastKeys.ptr, keyBytes.data(), keyBytes.size());
+            memcpyToDevice(workspace.pastValues.ptr, valueBytes.data(), valueBytes.size());
+        }
+        timing.kvCopyMs += ::trt_edgellm::rt::elapsedMs(kvCopyStart, SteadyClock::now());
+        branch.pastKeysPtr = workspace.pastKeys.ptr;
+        branch.pastValuesPtr = workspace.pastValues.ptr;
+
+        PositionIdsCacheKey const positionKey{snapshot.activeLen, snapshot.ropeDelta};
+        auto positionCacheIt = positionIdsCache.find(positionKey);
+        if (positionCacheIt == positionIdsCache.end())
+        {
+            auto const posBuildStart = SteadyClock::now();
+            size_t const positionIdsElems = static_cast<size_t>(dimsVolume(posDims));
+            workspace.positionIdsHost.assign(positionIdsElems, 0);
+            for (int32_t c = 0; c < posDims.d[0]; ++c)
+            {
+                for (int32_t i = 0; i < posDims.d[2]; ++i)
+                {
+                    size_t const idx = static_cast<size_t>(c) * posDims.d[1] * posDims.d[2] + i;
+                    workspace.positionIdsHost[idx] = snapshot.ropeDelta + snapshot.activeLen + i;
+                }
+            }
+            timing.positionBuildMs += ::trt_edgellm::rt::elapsedMs(posBuildStart, SteadyClock::now());
+
+            auto const [cacheIt, inserted] = positionIdsCache.try_emplace(positionKey);
+            (void) inserted;
+            auto const posAllocStart = SteadyClock::now();
+            bool const positionAllocated = cacheIt->second.ensureSize(positionIdsElems * sizeof(int64_t));
+            if (positionAllocated)
+            {
+                timing.positionAllocMs += ::trt_edgellm::rt::elapsedMs(posAllocStart, SteadyClock::now());
+            }
+
+            auto const posCopyStart = SteadyClock::now();
+            memcpyToDevice(cacheIt->second.ptr, workspace.positionIdsHost.data(), positionIdsElems * sizeof(int64_t));
+            timing.positionCopyMs += ::trt_edgellm::rt::elapsedMs(posCopyStart, SteadyClock::now());
+            positionCacheIt = cacheIt;
+        }
+        branch.positionIdsPtr = positionCacheIt->second.ptr;
+        return branch;
+    }
+
     bool enqueueOneStep(DeviceBranch const& branch, void* xPtr, void* nextXPtr, float t, float dt, cudaStream_t stream)
     {
         memcpyToDevice(tBuffer.ptr, &t, sizeof(float));
@@ -903,9 +1202,132 @@ struct AlpamayoFmRuntime::Impl
         return true;
     }
 
+    bool enqueueAeVelocity(DeviceBranch const& branch, void* xPtr, void* velocityPtr, float t, cudaStream_t stream)
+    {
+        copyScalarToDeviceTyped(tBuffer.ptr, engine->getTensorDataType("timestep"), t);
+
+        context->setInputShape("noisy_action", xDims);
+        context->setInputShape("timestep", aeTimestepDims);
+        context->setInputShape("position_ids", posDims);
+        context->setInputShape("past_keys", aePastKeyDims);
+        context->setInputShape("past_values", aePastValueDims);
+
+        check::check(context->setTensorAddress("noisy_action", xPtr), "Failed to bind AE28 input noisy_action");
+        check::check(context->setTensorAddress("timestep", tBuffer.ptr), "Failed to bind AE28 input timestep");
+        check::check(context->setTensorAddress("position_ids", branch.positionIdsPtr),
+            "Failed to bind AE28 input position_ids");
+        check::check(context->setTensorAddress("past_keys", branch.pastKeysPtr), "Failed to bind AE28 input past_keys");
+        check::check(context->setTensorAddress("past_values", branch.pastValuesPtr),
+            "Failed to bind AE28 input past_values");
+        check::check(context->setTensorAddress("velocity", velocityPtr), "Failed to bind AE28 output velocity");
+
+        check::check(context->enqueueV3(stream), "AE28 FM TensorRT enqueueV3 failed");
+        return true;
+    }
+
+    bool runAeVelocityToHost(DeviceBranch const& branch, std::vector<float> const& x, float t,
+        std::vector<float>& velocity, cudaStream_t stream, float* elapsedMsOut = nullptr)
+    {
+        auto const stepStart = SteadyClock::now();
+        check::check(static_cast<int32_t>(x.size()) == horizon * actionDim, "Input x size mismatch for AE28 one-step");
+        velocity.resize(static_cast<size_t>(horizon) * actionDim);
+
+        copyFloatVectorToDeviceTyped(xBuffer.ptr, engine->getTensorDataType("noisy_action"), x);
+        check::check(enqueueAeVelocity(branch, xBuffer.ptr, vBuffer.ptr, t, stream), "AE28 FM TensorRT enqueueV3 failed");
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        copyDeviceTypedToFloatVector(velocity, vBuffer.ptr, engine->getTensorDataType("velocity"));
+        if (elapsedMsOut != nullptr)
+        {
+            *elapsedMsOut = ::trt_edgellm::rt::elapsedMs(stepStart, SteadyClock::now());
+        }
+        return true;
+    }
+
+    bool runSingleBranchAe(AlpamayoFmBranchSnapshot const& snapshot, AlpamayoFmRunConfig const& config,
+        std::vector<float>& x0, std::vector<float>& xFinal, AlpamayoFmRunResult::Timing& timing, cudaStream_t stream)
+    {
+        auto const totalStart = SteadyClock::now();
+        auto const branchStart = SteadyClock::now();
+        DeviceBranch branch = makeDeviceBranchAe(snapshot, singleBranchWorkspace, timing, stream);
+        timing.branchPrepareMs = ::trt_edgellm::rt::elapsedMs(branchStart, SteadyClock::now());
+
+        auto const x0Start = SteadyClock::now();
+        x0 = makeNormalX0(horizon, actionDim, config.seed);
+        timing.x0InitMs = ::trt_edgellm::rt::elapsedMs(x0Start, SteadyClock::now());
+        xFinal = x0;
+        std::vector<float> velocity;
+        float const dt = 1.0F / static_cast<float>(config.numSteps);
+        auto const diffusionStart = SteadyClock::now();
+        for (int32_t step = 0; step < config.numSteps; ++step)
+        {
+            float const t = static_cast<float>(step) * dt;
+            float stepMs = 0.0F;
+            runAeVelocityToHost(branch, xFinal, t, velocity, stream, &stepMs);
+            timing.engineStepTotalMs += stepMs;
+            for (size_t i = 0; i < xFinal.size(); ++i)
+            {
+                xFinal[i] += dt * velocity[i];
+            }
+        }
+        timing.engineStepTotalMs = std::max(
+            timing.engineStepTotalMs, ::trt_edgellm::rt::elapsedMs(diffusionStart, SteadyClock::now()));
+        timing.numSteps = config.numSteps;
+        timing.numBranches = 1;
+        timing.engineStepAvgMs = config.numSteps > 0 ? timing.engineStepTotalMs / static_cast<float>(config.numSteps) : 0.0F;
+        timing.totalMs = ::trt_edgellm::rt::elapsedMs(totalStart, SteadyClock::now());
+        return true;
+    }
+
+    bool runDualBranchAe(AlpamayoFmBranchSnapshot const& guidedSnapshot, AlpamayoFmBranchSnapshot const& unguidedSnapshot,
+        AlpamayoFmRunConfig const& config, std::vector<float>& x0, std::vector<float>& xFinal,
+        AlpamayoFmRunResult::Timing& timing, cudaStream_t stream)
+    {
+        auto const totalStart = SteadyClock::now();
+        auto const branchStart = SteadyClock::now();
+        DeviceBranch guided = makeDeviceBranchAe(guidedSnapshot, guidedBranchWorkspace, timing, stream);
+        DeviceBranch unguided = makeDeviceBranchAe(unguidedSnapshot, unguidedBranchWorkspace, timing, stream);
+        timing.branchPrepareMs = ::trt_edgellm::rt::elapsedMs(branchStart, SteadyClock::now());
+
+        auto const x0Start = SteadyClock::now();
+        x0 = makeNormalX0(horizon, actionDim, config.seed);
+        timing.x0InitMs = ::trt_edgellm::rt::elapsedMs(x0Start, SteadyClock::now());
+        xFinal = x0;
+        std::vector<float> guidedVelocity;
+        std::vector<float> unguidedVelocity;
+        float const dt = 1.0F / static_cast<float>(config.numSteps);
+        auto const diffusionStart = SteadyClock::now();
+        for (int32_t step = 0; step < config.numSteps; ++step)
+        {
+            float const t = static_cast<float>(step) * dt;
+            float guidedStepMs = 0.0F;
+            float unguidedStepMs = 0.0F;
+            runAeVelocityToHost(guided, xFinal, t, guidedVelocity, stream, &guidedStepMs);
+            runAeVelocityToHost(unguided, xFinal, t, unguidedVelocity, stream, &unguidedStepMs);
+            timing.engineStepTotalMs += guidedStepMs + unguidedStepMs;
+            for (size_t i = 0; i < xFinal.size(); ++i)
+            {
+                float const velocity
+                    = (1.0F - config.guidanceWeight) * unguidedVelocity[i] + config.guidanceWeight * guidedVelocity[i];
+                xFinal[i] += dt * velocity;
+            }
+        }
+        timing.engineStepTotalMs = std::max(
+            timing.engineStepTotalMs, ::trt_edgellm::rt::elapsedMs(diffusionStart, SteadyClock::now()));
+        timing.numSteps = config.numSteps;
+        timing.numBranches = 2;
+        timing.engineStepAvgMs = config.numSteps > 0 ? timing.engineStepTotalMs / static_cast<float>(config.numSteps) : 0.0F;
+        timing.totalMs = ::trt_edgellm::rt::elapsedMs(totalStart, SteadyClock::now());
+        return true;
+    }
+
     bool runSingleBranch(AlpamayoFmBranchSnapshot const& snapshot, AlpamayoFmRunConfig const& config, std::vector<float>& x0,
         std::vector<float>& xFinal, AlpamayoFmRunResult::Timing& timing, cudaStream_t stream)
     {
+        if (engineKind == EngineKind::kAe28)
+        {
+            return runSingleBranchAe(snapshot, config, x0, xFinal, timing, stream);
+        }
+
         auto const totalStart = SteadyClock::now();
         auto const branchStart = SteadyClock::now();
         DeviceBranch branch = makeDeviceBranch(snapshot, singleBranchWorkspace, timing, stream);
@@ -940,6 +1362,11 @@ struct AlpamayoFmRuntime::Impl
         AlpamayoFmRunConfig const& config, std::vector<float>& x0, std::vector<float>& xFinal,
         AlpamayoFmRunResult::Timing& timing, cudaStream_t stream)
     {
+        if (engineKind == EngineKind::kAe28)
+        {
+            return runDualBranchAe(guidedSnapshot, unguidedSnapshot, config, x0, xFinal, timing, stream);
+        }
+
         auto const totalStart = SteadyClock::now();
         auto const branchStart = SteadyClock::now();
         DeviceBranch guided = makeDeviceBranch(guidedSnapshot, guidedBranchWorkspace, timing, stream);
@@ -982,6 +1409,7 @@ struct AlpamayoFmRuntime::Impl
     TrtPtr<nvinfer1::ICudaEngine> engine;
     TrtPtr<nvinfer1::IExecutionContext> context;
 
+    EngineKind engineKind{EngineKind::kLegacyFm};
     nvinfer1::Dims xDims{};
     nvinfer1::Dims nextXDims{};
     nvinfer1::Dims vDims{};
@@ -990,6 +1418,9 @@ struct AlpamayoFmRuntime::Impl
     nvinfer1::DataType kvDataType{nvinfer1::DataType::kHALF};
     nvinfer1::Dims maskDims{};
     nvinfer1::Dims posDims{};
+    nvinfer1::Dims aeTimestepDims{};
+    nvinfer1::Dims aePastKeyDims{};
+    nvinfer1::Dims aePastValueDims{};
     int32_t horizon{0};
     int32_t actionDim{0};
     int32_t maxSeqLen{0};
